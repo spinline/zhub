@@ -1,0 +1,33 @@
+[package]
+name = "zhub"
+version = "0.1.0"
+edition = "2024"
+description = "Ziggurat Zigbee yığını üzerinde hafif bir ev otomasyonu merkezi"
+license = "Apache-2.0"
+
+[dependencies]
+ziggurat-driver = { git = "https://github.com/zigpy/ziggurat", rev = "392d4c7fe5c497d553977492bc02cb305573b7fc" }
+ziggurat-phy = { git = "https://github.com/zigpy/ziggurat", rev = "392d4c7fe5c497d553977492bc02cb305573b7fc" }
+ziggurat-phy-spinel = { git = "https://github.com/zigpy/ziggurat", rev = "392d4c7fe5c497d553977492bc02cb305573b7fc" }
+ziggurat-spinel = { git = "https://github.com/zigpy/ziggurat", rev = "392d4c7fe5c497d553977492bc02cb305573b7fc" }
+ziggurat-protocol = { git = "https://github.com/zigpy/ziggurat", rev = "392d4c7fe5c497d553977492bc02cb305573b7fc" }
+
+anyhow = "1"
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+clap = { version = "4.6", features = ["derive"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+getrandom = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time", "sync", "net", "io-util", "signal", "fs"] }
+tokio-serial = "5.5"
+tokio-stream = { version = "0.1", features = ["sync"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = "s"
+panic = "abort"
+strip = true

@@ -1,0 +1,34 @@
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+use tokio::io::AsyncReadExt;
+use tokio_serial::{FlowControl, SerialPortBuilderExt};
+
+use ziggurat_phy_spinel::SpinelPhy;
+use ziggurat_spinel::client::SpinelClient;
+
+/// Portu açmak bazı dongle'larda (ör. Sonoff Dongle Plus MG24) DTR/RTS hatları
+/// üzerinden RCP'yi sıfırlıyor. Açılış sıfırlamasının bitmesini bekleyip artakalan
+/// baytları boşaltıyoruz; yoksa Spinel istemcisinin ilk komutu sıfırlamayla çakışıyor.
+const BOOT_SETTLE: Duration = Duration::from_secs(2);
+
+pub async fn open(device: &str, baudrate: u32) -> Result<Arc<SpinelPhy>> {
+    let mut port = tokio_serial::new(device, baudrate)
+        .flow_control(FlowControl::None)
+        .open_native_async()
+        .with_context(|| format!("{device} açılamadı"))?;
+
+    tokio::time::sleep(BOOT_SETTLE).await;
+    let mut scratch = [0u8; 256];
+    while let Ok(Ok(read)) =
+        tokio::time::timeout(Duration::from_millis(100), port.read(&mut scratch)).await
+    {
+        if read == 0 {
+            break;
+        }
+    }
+
+    let client = SpinelClient::new(Box::new(port));
+    Ok(Arc::new(SpinelPhy::new(Arc::new(client))))
+}
