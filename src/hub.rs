@@ -51,6 +51,8 @@ const SLEEPY_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_PERMIT_SECONDS: u8 = 254;
 /// Check-in yanıtında istenen hızlı yoklama süresi (çeyrek saniye): 20 sn
 const FAST_POLL_QUARTER_SECONDS: u16 = 80;
+/// Uyuyan cihaz bir şey gönderdikten sonra bu kadar saniye uyanık sayılır
+const AWAKE_WINDOW_SECONDS: u64 = 2;
 
 pub struct Options {
     pub device: String,
@@ -143,6 +145,8 @@ pub struct Hub {
     pending_settings: Mutex<HashMap<String, BTreeMap<&'static str, f64>>>,
     /// Uyanınca yeniden tanınacak uyuyan cihazlar
     wake_interviews: Mutex<HashSet<String>>,
+    /// Şu an ayar yazılan cihazlar: aynı cihaza aynı anda tek yazma gider
+    writing_settings: Mutex<HashSet<String>>,
 }
 
 fn now_unix() -> u64 {
@@ -212,6 +216,25 @@ pub fn capabilities(device: &Device) -> Vec<&'static str> {
         }
     }
     caps
+}
+
+/// Yazılan değer hâlâ kuyruktaki değerse kuyruktan düşer; yazma sürerken yeni bir
+/// değer girildiyse o kalır ve sonraki uyanışta yazılır
+fn settle_pending(
+    pending: &mut HashMap<String, BTreeMap<&'static str, f64>>,
+    ieee: &str,
+    key: &'static str,
+    written: f64,
+) {
+    let Some(entries) = pending.get_mut(ieee) else {
+        return;
+    };
+    if entries.get(key) == Some(&written) {
+        entries.remove(key);
+    }
+    if entries.is_empty() {
+        pending.remove(ieee);
+    }
 }
 
 /// Cihazın modele özel ayarları: ZCL öznitelikleri ya da Tuya DP'leri
@@ -444,6 +467,7 @@ impl Hub {
             interviews: Mutex::new(HashSet::new()),
             pending_settings: Mutex::new(HashMap::new()),
             wake_interviews: Mutex::new(HashSet::new()),
+            writing_settings: Mutex::new(HashSet::new()),
         });
 
         tokio::spawn(hub.clone().notification_loop());
@@ -1473,8 +1497,14 @@ impl Hub {
             .or_default()
             .insert(setting.key, snapped);
         self.emit_device(ieee);
-        // Cihaz tam şu an uyanıksa hemen gider; değilse bir sonraki raporu beklenir
-        self.flush_pending_settings(device.nwk);
+        // Uyuyan cihaza yazma ancak uyanıkken yetişir (dolaylı iletim 7,68 sn bekler).
+        // Cihaz az önce bir şey gönderdiyse şimdi dene; değilse bir sonraki uyanışı bekle.
+        if device
+            .last_seen
+            .is_some_and(|seen| now_unix().saturating_sub(seen) <= AWAKE_WINDOW_SECONDS)
+        {
+            self.flush_pending_settings(device.nwk);
+        }
         Ok(true)
     }
 
@@ -1499,34 +1529,37 @@ impl Hub {
         Ok(())
     }
 
-    /// Cihaz az önce bir şey gönderdiyse uyanıktır: bekleyen ayarları şimdi yaz
+    /// Cihaz az önce bir şey gönderdiyse uyanıktır: bekleyen ayarları şimdi yaz. Ayar,
+    /// cihaz onaylayana kadar kuyrukta kalır; başarısız yazma sonraki uyanışta yinelenir.
     fn flush_pending_settings(self: &Arc<Self>, nwk: u16) {
         let Some(device) = self.data.lock().unwrap().devices.values().find(|d| d.nwk == nwk).cloned() else {
             return;
         };
-        let Some(pending) = self.pending_settings.lock().unwrap().remove(&device.ieee) else {
+        let Some(pending) = self.pending_settings.lock().unwrap().get(&device.ieee).cloned() else {
             return;
         };
         let Some(profile) = profiles::profile(device.model.as_deref()) else {
             return;
         };
+        // Yazmanın yanıtı da buraya düşer; süren yazma varken ikincisini başlatma
+        if !self.writing_settings.lock().unwrap().insert(device.ieee.clone()) {
+            return;
+        }
         let hub = self.clone();
         tokio::spawn(async move {
             for (key, value) in pending {
                 let Some(setting) = profile.setting(key) else {
                     continue;
                 };
-                if let Err(e) = hub.write_setting(&device, setting, value).await {
-                    debug!("{} {key} yazılamadı, sonraki uyanışta yeniden denenecek: {e:#}", device.ieee);
-                    hub.pending_settings
-                        .lock()
-                        .unwrap()
-                        .entry(device.ieee.clone())
-                        .or_default()
-                        .entry(key)
-                        .or_insert(value);
+                match hub.write_setting(&device, setting, value).await {
+                    Ok(()) => settle_pending(&mut hub.pending_settings.lock().unwrap(), &device.ieee, key, value),
+                    Err(e) => warn!(
+                        "{} {key} yazılamadı, sonraki uyanışta yeniden denenecek: {e:#}",
+                        device.ieee
+                    ),
                 }
             }
+            hub.writing_settings.lock().unwrap().remove(&device.ieee);
             hub.emit_device(&device.ieee);
         });
     }
@@ -1757,6 +1790,21 @@ mod tests {
         thermostat.model = Some("TS0601".into());
         assert_eq!(default_name(&thermostat, &[]).as_deref(), Some("Termostat"));
         assert!(capabilities(&thermostat).contains(&"thermostat"));
+    }
+
+    #[test]
+    fn settled_write_leaves_newer_pending_value() {
+        let mut pending: HashMap<String, BTreeMap<&'static str, f64>> = HashMap::new();
+        let ieee = "38:39:8f:ff:fe:de:0d:70";
+        pending.entry(ieee.into()).or_default().insert("temperature_calibration", 1.0);
+
+        // Yazma sürerken kullanıcı değeri değiştirdi: eski yazma yenisini silmemeli
+        pending.get_mut(ieee).unwrap().insert("temperature_calibration", -0.5);
+        settle_pending(&mut pending, ieee, "temperature_calibration", 1.0);
+        assert_eq!(pending[ieee]["temperature_calibration"], -0.5);
+
+        settle_pending(&mut pending, ieee, "temperature_calibration", -0.5);
+        assert!(!pending.contains_key(ieee));
     }
 
     #[test]
