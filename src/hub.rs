@@ -174,6 +174,29 @@ pub fn capabilities(device: &Device) -> Vec<&'static str> {
     caps
 }
 
+/// Adı hâlâ "Cihaz xxxx" olan tanınmış cihazlara modelden ad verir
+fn apply_default_names(data: &mut Persisted) {
+    let ieees: Vec<String> = data.devices.keys().cloned().collect();
+    for ieee in ieees {
+        let taken: Vec<String> = data
+            .devices
+            .values()
+            .filter(|d| d.ieee != ieee)
+            .map(|d| d.name.clone())
+            .collect();
+        let Some(device) = data.devices.get_mut(&ieee) else {
+            continue;
+        };
+        let untouched = device.name == Device::new(device.ieee.clone(), device.nwk).name;
+        if device.interviewed
+            && untouched
+            && let Some(name) = default_name(device, &taken)
+        {
+            device.name = name;
+        }
+    }
+}
+
 /// Kullanıcı adı vermediyse modelden anlamlı bir ad; Tuya modelleri (TS0601 gibi)
 /// hiçbir şey söylemediği için profil adı tercih edilir
 fn default_name(device: &Device, taken: &[String]) -> Option<String> {
@@ -353,6 +376,8 @@ impl Hub {
             network.pan_id,
             data.devices.len()
         );
+
+        apply_default_names(&mut data);
 
         let (events, _) = broadcast::channel(256);
         let hub = Arc::new(Self {
@@ -1475,6 +1500,23 @@ mod tests {
         assert_eq!(device.state.battery, Some(100));
         assert_eq!(device.state.alarm, Some(true));
         assert_eq!(device.state.battery_low, Some(true));
+    }
+
+    #[test]
+    fn default_names_prefer_tuya_profile_and_stay_unique() {
+        let mut sensor = device_with(&[0x0000]);
+        sensor.model = Some("SNZB-02P".into());
+        assert_eq!(default_name(&sensor, &[]).as_deref(), Some("SNZB-02P"));
+        assert_eq!(
+            default_name(&sensor, &["SNZB-02P".into()]).as_deref(),
+            Some("SNZB-02P 0405")
+        );
+
+        let mut thermostat = device_with(&[0x0000, 0xEF00]);
+        thermostat.manufacturer = Some("_TZE200_g9a3awaj".into());
+        thermostat.model = Some("TS0601".into());
+        assert_eq!(default_name(&thermostat, &[]).as_deref(), Some("Termostat"));
+        assert!(capabilities(&thermostat).contains(&"thermostat"));
     }
 
     #[test]
