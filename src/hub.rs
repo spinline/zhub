@@ -28,7 +28,7 @@ use crate::store::{
     parse_eui64, parse_key,
 };
 use crate::zcl::{self, ReportConfig, Value, cluster, types};
-use crate::zdo;
+use crate::{tuya, zdo};
 
 /// Koordinatörün kendi uç noktası; bağlamalar ve raporlar buraya gelir
 pub const HUB_ENDPOINT: u8 = 1;
@@ -70,9 +70,12 @@ pub struct DeviceView {
     pub device: Device,
     pub capabilities: Vec<&'static str>,
     pub interviewing: bool,
+    /// Termostat hedef sıcaklığı için [en az, en çok, adım]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub setpoint_range: Option<[f64; 3]>,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "action", content = "value", rename_all = "snake_case")]
 pub enum Action {
     On,
@@ -80,6 +83,12 @@ pub enum Action {
     Toggle,
     Level(u8),
     ColorTemp(u16),
+    Setpoint(f64),
+    /// "heat" ya da "off"
+    SystemMode(String),
+    /// "manual" ya da "program"
+    Preset(String),
+    Frost(bool),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -159,7 +168,24 @@ pub fn capabilities(device: &Device) -> Vec<&'static str> {
     if device.has_cluster(cluster::POWER_CONFIG) && !device.router {
         caps.push("battery");
     }
+    if device.has_cluster(tuya::CLUSTER) && tuya::thermostat_profile(device.manufacturer.as_deref()).is_some() {
+        caps.push("thermostat");
+    }
     caps
+}
+
+/// Kullanıcı adı vermediyse modelden anlamlı bir ad; Tuya modelleri (TS0601 gibi)
+/// hiçbir şey söylemediği için profil adı tercih edilir
+fn default_name(device: &Device, taken: &[String]) -> Option<String> {
+    let base = match tuya::thermostat_profile(device.manufacturer.as_deref()) {
+        Some(profile) => profile.name.to_owned(),
+        None => device.model.clone()?,
+    };
+    if !taken.contains(&base) {
+        return Some(base);
+    }
+    let suffix = device.ieee.replace(':', "");
+    Some(format!("{base} {}", &suffix[suffix.len().saturating_sub(4)..]))
 }
 
 /// Bir özniteliği cihaz durumuna yansıtır
@@ -182,18 +208,18 @@ fn apply_attribute(device: &mut Device, cluster_id: u16, attribute: u16, value: 
         (cluster::TEMPERATURE, 0x0000) => {
             // 0x8000 "ölçüm yok" demek
             if let Some(v) = value.as_i64().filter(|&v| v != -0x8000) {
-                state.temperature = Some(v as f32 / 100.0);
+                state.temperature = Some(v as f64 / 100.0);
             }
         }
         (cluster::HUMIDITY, 0x0000) => {
             if let Some(v) = value.as_u64().filter(|&v| v != 0xFFFF) {
-                state.humidity = Some(v as f32 / 100.0);
+                state.humidity = Some(v as f64 / 100.0);
             }
         }
         (cluster::OCCUPANCY, 0x0000) => state.occupancy = value.as_u64().map(|v| v & 0x01 != 0),
         (cluster::POWER_CONFIG, 0x0020) => {
             if let Some(v) = value.as_u64().filter(|&v| v != 0xFF) {
-                state.voltage = Some(v as f32 / 10.0);
+                state.voltage = Some(v as f64 / 10.0);
             }
         }
         (cluster::POWER_CONFIG, 0x0021) => {
@@ -376,6 +402,8 @@ impl Hub {
         DeviceView {
             capabilities: capabilities(device),
             interviewing: self.interviews.lock().unwrap().contains(&device.ieee),
+            setpoint_range: tuya::thermostat_profile(device.manufacturer.as_deref())
+                .map(|p| [p.setpoint_min, p.setpoint_max, p.setpoint_step]),
             device: device.clone(),
         }
     }
@@ -521,19 +549,24 @@ impl Hub {
     }
 
     fn device_joined(self: &Arc<Self>, ieee: String, nwk: u16, rx_on_when_idle: bool, router: bool) {
-        let needs_interview = {
+        let (needs_interview, changed) = {
             let mut data = self.data.lock().unwrap();
+            let is_new = !data.devices.contains_key(&ieee);
             let device = data
                 .devices
                 .entry(ieee.clone())
                 .or_insert_with(|| Device::new(ieee.clone(), nwk));
+            let changed = is_new || device.nwk != nwk;
             device.nwk = nwk;
             device.rx_on_when_idle = rx_on_when_idle;
             device.router |= router;
             device.last_seen = Some(now_unix());
-            !device.interviewed
+            (!device.interviewed, changed)
         };
-        info!("Cihaz katıldı: {ieee} (nwk 0x{nwk:04x})");
+        // Katılım, Update-Device ve Device_annce aynı olayı üç kez bildirebiliyor
+        if changed {
+            info!("Cihaz katıldı: {ieee} (nwk 0x{nwk:04x})");
+        }
         self.emit_device(&ieee);
         self.dirty.notify_one();
         if needs_interview {
@@ -668,10 +701,70 @@ impl Hub {
             return;
         }
 
+        if cluster_id == tuya::CLUSTER && header.server_to_client() {
+            self.handle_tuya(source, src_ep, ieee.as_deref(), &header, payload);
+            return;
+        }
+
         debug!(
             "İşlenmeyen ZCL komutu: nwk 0x{source:04x} küme 0x{cluster_id:04x} komut 0x{:02x}",
             header.command
         );
+    }
+
+    fn handle_tuya(&self, nwk: u16, ep: u8, ieee: Option<&str>, header: &zcl::Header, payload: &[u8]) {
+        match header.command {
+            tuya::cmd::DATA_RESPONSE
+            | tuya::cmd::DATA_REPORT
+            | tuya::cmd::ACTIVE_STATUS_REPORT
+            | tuya::cmd::ACTIVE_STATUS_REPORT_ALT => {
+                let Some(ieee) = ieee else {
+                    return;
+                };
+                let datapoints = tuya::parse_datapoints(payload);
+                let profile = self
+                    .device(ieee)
+                    .and_then(|d| tuya::thermostat_profile(d.manufacturer.as_deref()));
+                self.update_device(ieee, |device| {
+                    for dp in &datapoints {
+                        let known = profile.is_some_and(|p| p.apply(&mut device.state, dp));
+                        if !known {
+                            // Yeni bir model eklerken DP haritasını çıkarmak için
+                            info!(
+                                "{ieee} Tuya DP {} (tür {}): {:02x?}",
+                                dp.id, dp.ty, dp.data
+                            );
+                        }
+                    }
+                });
+            }
+            tuya::cmd::MCU_SYNC_TIME => {
+                let since_2000 = ieee
+                    .and_then(|ieee| self.device(ieee))
+                    .and_then(|d| tuya::thermostat_profile(d.manufacturer.as_deref()))
+                    .is_none_or(|p| p.time_since_2000);
+                let body = tuya::time_sync_payload(now_unix(), tuya::utc_offset_seconds(), since_2000);
+                self.send_tuya(nwk, ep, tuya::cmd::MCU_SYNC_TIME, &body);
+            }
+            tuya::cmd::GATEWAY_CONNECTION_STATUS => {
+                // Ağ geçidi internete bağlı: bazı cihazlar bunu görmeden rapor göndermiyor
+                self.send_tuya(nwk, ep, tuya::cmd::GATEWAY_CONNECTION_STATUS, &[0x01, 0x00, 0x01]);
+            }
+            _ => {}
+        }
+        self.default_response(nwk, ep, tuya::CLUSTER, header);
+    }
+
+    fn send_tuya(&self, nwk: u16, ep: u8, command: u8, body: &[u8]) {
+        let frame = zcl::frame(
+            zcl::FC_CLUSTER_SPECIFIC | zcl::FC_DISABLE_DEFAULT_RESPONSE,
+            self.next_seq(),
+            command,
+            body,
+        );
+        if let Err(e) = self.send(nwk, HA_PROFILE, tuya::CLUSTER, HUB_ENDPOINT, ep, frame, true) {
+            warn!("Tuya komutu 0x{command:02x} gönderilemedi: {e:#}");
+        }
     }
 
     fn apply_records(&self, ieee: &str, cluster_id: u16, records: &[zcl::AttributeRecord]) {
@@ -913,7 +1006,27 @@ impl Hub {
         }
 
         self.configure(ieee).await;
-        self.update_device(ieee, |d| d.interviewed = true);
+
+        if let Some(ep) = device.endpoint_with(tuya::CLUSTER) {
+            // Bütün DP'leri bir kez iste; sonrası cihazın kendi raporlarıyla gelir
+            self.send_tuya(nwk, ep, tuya::cmd::DATA_QUERY, &[]);
+        }
+
+        let taken: Vec<String> = {
+            let data = self.data.lock().unwrap();
+            data.devices
+                .values()
+                .filter(|d| d.ieee != ieee)
+                .map(|d| d.name.clone())
+                .collect()
+        };
+        self.update_device(ieee, |d| {
+            d.interviewed = true;
+            let untouched = d.name == Device::new(d.ieee.clone(), d.nwk).name;
+            if untouched && let Some(name) = default_name(d, &taken) {
+                d.name = name;
+            }
+        });
         Ok(())
     }
 
@@ -1010,17 +1123,26 @@ impl Hub {
 
     pub async fn command(&self, ieee: &str, action: Action) -> Result<()> {
         let device = self.device(ieee).context("cihaz bulunamadı")?;
-        let (cluster_id, command, payload): (u16, u8, Vec<u8>) = match action {
+        if matches!(
+            action,
+            Action::Setpoint(_) | Action::SystemMode(_) | Action::Preset(_) | Action::Frost(_)
+        ) {
+            return self.thermostat_command(&device, action);
+        }
+        let (cluster_id, command, payload): (u16, u8, Vec<u8>) = match &action {
             Action::On => (cluster::ON_OFF, 0x01, vec![]),
             Action::Off => (cluster::ON_OFF, 0x00, vec![]),
             Action::Toggle => (cluster::ON_OFF, 0x02, vec![]),
             // Move to Level (with On/Off), yarım saniyelik geçiş
-            Action::Level(level) => (cluster::LEVEL, 0x04, vec![level.min(254), 5, 0]),
+            Action::Level(level) => (cluster::LEVEL, 0x04, vec![(*level).min(254), 5, 0]),
             // Move to Color Temperature
             Action::ColorTemp(mireds) => {
                 let mut payload = mireds.to_le_bytes().to_vec();
                 payload.extend_from_slice(&5u16.to_le_bytes());
                 (cluster::COLOR, 0x0A, payload)
+            }
+            Action::Setpoint(_) | Action::SystemMode(_) | Action::Preset(_) | Action::Frost(_) => {
+                unreachable!("termostat komutları yukarıda ayrıldı")
             }
         };
         let ep = device
@@ -1047,6 +1169,45 @@ impl Hub {
                 d.state.on = Some(level > 0);
             }
             Action::ColorTemp(mireds) => d.state.color_temp = Some(mireds),
+            _ => {}
+        });
+        Ok(())
+    }
+
+    /// Tuya termostatına DP yazar. Cihaz uyuyan uç cihaz olduğu için komut bir sonraki
+    /// yoklamasında teslim edilir; onayı cihazın kendi DP raporu getirir.
+    fn thermostat_command(&self, device: &Device, action: Action) -> Result<()> {
+        let profile = tuya::thermostat_profile(device.manufacturer.as_deref())
+            .context("bu cihaz için termostat tanımı yok")?;
+        let ep = device
+            .endpoint_with(tuya::CLUSTER)
+            .context("cihazda Tuya kümesi yok")?;
+        let dp = match &action {
+            Action::Setpoint(celsius) => profile.setpoint_dp(*celsius).with_context(|| {
+                format!(
+                    "hedef sıcaklık {}-{} °C arasında olmalı",
+                    profile.setpoint_min, profile.setpoint_max
+                )
+            })?,
+            Action::SystemMode(mode) => match mode.as_str() {
+                "heat" => profile.system_mode_dp(true),
+                "off" => profile.system_mode_dp(false),
+                _ => bail!("geçersiz mod: {mode}"),
+            },
+            Action::Preset(preset) => match preset.as_str() {
+                "manual" => profile.preset_dp(false),
+                "program" => profile.preset_dp(true),
+                _ => bail!("geçersiz ön ayar: {preset}"),
+            }
+            .context("cihazda ön ayar yok")?,
+            Action::Frost(on) => profile.frost_dp(*on).context("cihazda donma koruması yok")?,
+            _ => bail!("termostat komutu değil"),
+        };
+
+        let seq = u16::from(self.next_seq());
+        self.send_tuya(device.nwk, ep, tuya::cmd::DATA_REQUEST, &tuya::data_request(seq, &[dp.clone()]));
+        self.update_device(&device.ieee, |d| {
+            profile.apply(&mut d.state, &dp);
         });
         Ok(())
     }

@@ -63,9 +63,9 @@ pub struct DeviceState {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub color_temp: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub temperature: Option<f32>,
+    pub temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub humidity: Option<f32>,
+    pub humidity: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub occupancy: Option<bool>,
     /// IAS Zone alarm1 biti: kapı sensöründe açık, hareket sensöründe hareket
@@ -76,7 +76,20 @@ pub struct DeviceState {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub battery: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub voltage: Option<f32>,
+    pub voltage: Option<f64>,
+    /// Termostat: "heat" ya da "off"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub setpoint: Option<f64>,
+    /// Termostat şu an ısıtıyor mu
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub heating: Option<bool>,
+    /// Termostat: "manual" ya da "program"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preset: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frost: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

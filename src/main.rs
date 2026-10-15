@@ -1,6 +1,7 @@
 mod hub;
 mod radio;
 mod store;
+mod tuya;
 mod web;
 mod zcl;
 mod zdo;
