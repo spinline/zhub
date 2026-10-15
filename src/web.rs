@@ -58,7 +58,11 @@ fn ok() -> ApiResult {
 
 async fn index() -> impl IntoResponse {
     (
-        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            // Sayfa ikiliyle birlikte güncelleniyor; tarayıcı eskisini göstermesin
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
         INDEX_HTML,
     )
 }
