@@ -2,6 +2,9 @@
 //! numaralı "veri noktaları" (DP) olarak taşır. DP'lerin anlamı modele göre değişir;
 //! eşlemeler zigbee-herdsman-converters'taki tanımlardan alınmıştır.
 
+use crate::profiles::{Setting, Source};
+use crate::store::{Device, ScheduleSlot};
+
 pub const CLUSTER: u16 = 0xEF00;
 
 pub mod cmd {
@@ -146,7 +149,12 @@ fn parse_posix_tz_offset(tz: &str) -> Option<i64> {
     Some(-sign * (hours * 3600 + minutes * 60 + seconds))
 }
 
-#[derive(Debug, Clone, Copy)]
+pub mod dp_raw {
+    pub const RAW: u8 = 0;
+    pub const STRING: u8 = 3;
+}
+
+#[derive(Debug)]
 pub struct ThermostatProfile {
     pub name: &'static str,
     pub system_mode: u8,
@@ -157,14 +165,29 @@ pub struct ThermostatProfile {
     pub local_temperature: u8,
     pub running_state: Option<u8>,
     pub frost: Option<u8>,
+    pub battery: Option<u8>,
+    pub child_lock: Option<u8>,
+    pub fault: Option<u8>,
+    pub product_info: Option<u8>,
+    /// Çalışma haftası DP'si ve enum değerlerinin sırayla adları
+    pub working_week: Option<(u8, &'static [&'static str])>,
+    /// Haftalık program: 4 baytlık [saat, dakika, sıcaklık×bölen (BE)] dilimleri
+    pub schedule: Option<u8>,
     pub divisor: f64,
     pub setpoint_min: f64,
     pub setpoint_max: f64,
     pub setpoint_step: f64,
     pub time_since_2000: bool,
+    /// Sayısal yapılandırma DP'leri (düzeltme, sınırlar)
+    pub settings: &'static [Setting],
 }
 
-/// Tuya ZWT07 duvar termostatı (`_TZE200_g9a3awaj`)
+/// Hedef sıcaklığın alt/üst sınır ayarlarının anahtarları
+pub const MIN_LIMIT_KEY: &str = "min_temperature";
+pub const MAX_LIMIT_KEY: &str = "max_temperature";
+
+/// RTI-Tek T5Z / Tuya ZWT07 duvar termostatı (`_TZE200_g9a3awaj`). DP'ler
+/// zigbee-herdsman-converters ile tuya-local'in `rtitek_t5z_thermostat` tanımından.
 const ZWT07: ThermostatProfile = ThermostatProfile {
     name: "Termostat",
     system_mode: 1,
@@ -175,11 +198,49 @@ const ZWT07: ThermostatProfile = ThermostatProfile {
     local_temperature: 24,
     running_state: Some(36),
     frost: Some(10),
+    battery: Some(9),
+    child_lock: Some(40),
+    fault: Some(45),
+    product_info: Some(105),
+    working_week: Some((31, &["5_2", "6_1", "7"])),
+    schedule: Some(67),
     divisor: 10.0,
     setpoint_min: 5.0,
-    setpoint_max: 60.0,
+    setpoint_max: 95.0,
     setpoint_step: 0.5,
     time_since_2000: true,
+    settings: &[
+        Setting {
+            key: "temperature_calibration",
+            label: "Sıcaklık düzeltmesi",
+            source: Source::TuyaDp(109),
+            scale: 10.0,
+            min: -9.9,
+            max: 9.9,
+            step: 0.1,
+            unit: "°C",
+        },
+        Setting {
+            key: MIN_LIMIT_KEY,
+            label: "En düşük hedef",
+            source: Source::TuyaDp(18),
+            scale: 10.0,
+            min: 5.0,
+            max: 20.0,
+            step: 1.0,
+            unit: "°C",
+        },
+        Setting {
+            key: MAX_LIMIT_KEY,
+            label: "En yüksek hedef",
+            source: Source::TuyaDp(19),
+            scale: 10.0,
+            min: 21.0,
+            max: 95.0,
+            step: 1.0,
+            unit: "°C",
+        },
+    ],
 };
 
 pub fn thermostat_profile(manufacturer: Option<&str>) -> Option<&'static ThermostatProfile> {
@@ -190,12 +251,31 @@ pub fn thermostat_profile(manufacturer: Option<&str>) -> Option<&'static Thermos
 }
 
 impl ThermostatProfile {
-    /// Bir DP'yi cihaz durumuna yansıtır; profilde yoksa `false`
-    pub fn apply(&self, state: &mut crate::store::DeviceState, dp: &Datapoint) -> bool {
+    /// Bir DP'yi cihaza yansıtır; profilde yoksa `false`
+    pub fn apply(&self, device: &mut Device, dp: &Datapoint) -> bool {
+        // Sayı olmayan DP'ler
+        if Some(dp.id) == self.schedule && dp.ty == dp_raw::RAW {
+            device.state.schedule = Some(self.decode_schedule(&dp.data));
+            return true;
+        }
+        if Some(dp.id) == self.product_info && dp.ty == dp_raw::STRING {
+            let text = String::from_utf8_lossy(&dp.data).trim_end_matches('\0').trim().to_owned();
+            if !text.is_empty() {
+                device.firmware = Some(text);
+            }
+            return true;
+        }
+
         let Some(raw) = dp.as_int() else {
             return false;
         };
+        if let Some(setting) = self.settings.iter().find(|s| s.source == Source::TuyaDp(dp.id)) {
+            device.settings.insert(setting.key.to_owned(), setting.from_raw(raw));
+            return true;
+        }
+
         let scaled = || ((raw as f64 / self.divisor) * 100.0).round() / 100.0;
+        let state = &mut device.state;
         if dp.id == self.system_mode {
             state.system_mode = Some(if raw != 0 { "heat" } else { "off" }.to_owned());
         } else if Some(dp.id) == self.preset {
@@ -215,14 +295,45 @@ impl ThermostatProfile {
             state.heating = Some(raw != 0);
         } else if Some(dp.id) == self.frost {
             state.frost = Some(raw != 0);
+        } else if Some(dp.id) == self.battery {
+            state.battery = Some(raw.clamp(0, 100) as u8);
+        } else if Some(dp.id) == self.child_lock {
+            state.child_lock = Some(raw != 0);
+        } else if Some(dp.id) == self.fault {
+            state.fault = Some(raw as u32);
+        } else if let Some((id, names)) = self.working_week
+            && dp.id == id
+        {
+            state.working_week = usize::try_from(raw)
+                .ok()
+                .and_then(|i| names.get(i))
+                .map(|name| (*name).to_owned());
         } else {
             return false;
         }
         true
     }
 
-    pub fn setpoint_dp(&self, celsius: f64) -> Option<Datapoint> {
-        if !(self.setpoint_min..=self.setpoint_max).contains(&celsius) {
+    /// Hedef sıcaklığın geçerli aralığı: cihazdaki sınır ayarları, mutlak aralığın içinde
+    pub fn setpoint_range(&self, device: &Device) -> (f64, f64) {
+        let min = device
+            .settings
+            .get(MIN_LIMIT_KEY)
+            .copied()
+            .unwrap_or(self.setpoint_min)
+            .max(self.setpoint_min);
+        let max = device
+            .settings
+            .get(MAX_LIMIT_KEY)
+            .copied()
+            .unwrap_or(self.setpoint_max)
+            .min(self.setpoint_max);
+        (min, max)
+    }
+
+    pub fn setpoint_dp(&self, device: &Device, celsius: f64) -> Option<Datapoint> {
+        let (min, max) = self.setpoint_range(device);
+        if !celsius.is_finite() || !(min..=max).contains(&celsius) {
             return None;
         }
         let steps = (celsius / self.setpoint_step).round() * self.setpoint_step;
@@ -245,12 +356,72 @@ impl ThermostatProfile {
     pub fn frost_dp(&self, on: bool) -> Option<Datapoint> {
         self.frost.map(|id| Datapoint::bool(id, on))
     }
+
+    pub fn child_lock_dp(&self, on: bool) -> Option<Datapoint> {
+        self.child_lock.map(|id| Datapoint::bool(id, on))
+    }
+
+    pub fn working_week_dp(&self, name: &str) -> Option<Datapoint> {
+        let (id, names) = self.working_week?;
+        let index = names.iter().position(|n| *n == name)?;
+        Some(Datapoint::enumeration(id, index as u8))
+    }
+
+    pub fn decode_schedule(&self, data: &[u8]) -> Vec<ScheduleSlot> {
+        data.chunks_exact(4)
+            .map(|slot| ScheduleSlot {
+                time: format!("{:02}:{:02}", slot[0], slot[1]),
+                temperature: f64::from(u16::from_be_bytes([slot[2], slot[3]])) / self.divisor,
+            })
+            .collect()
+    }
+
+    /// Programı geri kodlar. Dilim sayısı cihazın bildirdiğiyle aynı kalmalı; cihazın
+    /// beklediği düzen (hafta içi/sonu dilimleri) bu sayıya bağlı.
+    pub fn schedule_dp(&self, device: &Device, slots: &[ScheduleSlot]) -> Result<Datapoint, String> {
+        let id = self.schedule.ok_or("cihazda haftalık program yok")?;
+        let expected = device.state.schedule.as_ref().map(Vec::len);
+        if expected != Some(slots.len()) {
+            return Err(format!(
+                "program {} dilim olmalı (cihazın bildirdiği düzen)",
+                expected.unwrap_or(0)
+            ));
+        }
+        let (min, max) = self.setpoint_range(device);
+        let mut data = Vec::with_capacity(slots.len() * 4);
+        for slot in slots {
+            let (hour, minute) = slot
+                .time
+                .split_once(':')
+                .and_then(|(h, m)| Some((h.parse::<u8>().ok()?, m.parse::<u8>().ok()?)))
+                .filter(|&(h, m)| h < 24 && m < 60)
+                .ok_or_else(|| format!("geçersiz saat: {}", slot.time))?;
+            if !slot.temperature.is_finite() || !(min..=max).contains(&slot.temperature) {
+                return Err(format!("sıcaklık {min}-{max} °C arasında olmalı"));
+            }
+            let raw = (slot.temperature / self.setpoint_step).round() * self.setpoint_step * self.divisor;
+            data.extend_from_slice(&[hour, minute]);
+            data.extend_from_slice(&(raw.round() as u16).to_be_bytes());
+        }
+        Ok(Datapoint {
+            id,
+            ty: dp_raw::RAW,
+            data,
+        })
+    }
+
+    /// Yapılandırma DP'si (VALUE türü) yazımı
+    pub fn setting_dp(&self, setting: &Setting, raw: i64) -> Option<Datapoint> {
+        let Source::TuyaDp(id) = setting.source else {
+            return None;
+        };
+        Some(Datapoint::value(id, i32::try_from(raw).ok()?))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::DeviceState;
 
     #[test]
     fn parses_multiple_datapoints() {
@@ -284,9 +455,15 @@ mod tests {
         assert_eq!(parse_datapoints(&payload), [dp]);
     }
 
+    fn thermostat() -> Device {
+        let mut device = Device::new("a4:c1:38:dd:3d:d3:35:0b".into(), 0x254a);
+        device.manufacturer = Some("_TZE200_g9a3awaj".into());
+        device
+    }
+
     #[test]
     fn zwt07_maps_datapoints_to_state() {
-        let mut state = DeviceState::default();
+        let mut device = thermostat();
         for dp in [
             Datapoint::value(24, 213),
             Datapoint::value(16, 225),
@@ -295,22 +472,96 @@ mod tests {
             Datapoint::enumeration(36, 1),
             Datapoint::bool(10, false),
         ] {
-            assert!(ZWT07.apply(&mut state, &dp));
+            assert!(ZWT07.apply(&mut device, &dp));
         }
+        let state = &device.state;
         assert_eq!(state.temperature, Some(21.3));
         assert_eq!(state.setpoint, Some(22.5));
         assert_eq!(state.system_mode.as_deref(), Some("heat"));
         assert_eq!(state.preset.as_deref(), Some("program"));
         assert_eq!(state.heating, Some(true));
         assert_eq!(state.frost, Some(false));
-        assert!(!ZWT07.apply(&mut state, &Datapoint::bool(99, true)));
+        assert!(!ZWT07.apply(&mut device, &Datapoint::bool(99, true)));
+    }
+
+    /// Termostatın DATA_QUERY'ye verdiği gerçek yanıtlar (zhub günlüğünden)
+    #[test]
+    fn zwt07_decodes_observed_datapoints() {
+        let observed = [
+            Datapoint { id: 109, ty: 2, data: vec![0, 0, 0, 0] },
+            Datapoint { id: 31, ty: 4, data: vec![0] },
+            Datapoint { id: 40, ty: 1, data: vec![1] },
+            Datapoint { id: 45, ty: 5, data: vec![0] },
+            Datapoint { id: 19, ty: 2, data: vec![0, 0, 0x01, 0xf4] },
+            Datapoint { id: 18, ty: 2, data: vec![0, 0, 0, 0x32] },
+            Datapoint {
+                id: 67,
+                ty: 0,
+                data: vec![
+                    0x06, 0x3b, 0x00, 0xbe, 0x08, 0x00, 0x00, 0x96, 0x0b, 0x1e, 0x00, 0x96, 0x0c, 0x1e,
+                    0x00, 0x96, 0x11, 0x00, 0x00, 0xdc, 0x16, 0x00, 0x00, 0x96, 0x08, 0x00, 0x00, 0x96,
+                    0x16, 0x00, 0x00, 0xa0,
+                ],
+            },
+            Datapoint { id: 9, ty: 2, data: vec![0, 0, 0, 0x63] },
+            Datapoint { id: 105, ty: 3, data: b"zt3l-t5\0".to_vec() },
+        ];
+        let mut device = thermostat();
+        for dp in &observed {
+            assert!(ZWT07.apply(&mut device, dp), "DP {} tanınmadı", dp.id);
+        }
+        assert_eq!(device.settings["temperature_calibration"], 0.0);
+        assert_eq!(device.settings[MIN_LIMIT_KEY], 5.0);
+        assert_eq!(device.settings[MAX_LIMIT_KEY], 50.0);
+        assert_eq!(device.state.working_week.as_deref(), Some("5_2"));
+        assert_eq!(device.state.child_lock, Some(true));
+        assert_eq!(device.state.fault, Some(0));
+        assert_eq!(device.state.battery, Some(99));
+        assert_eq!(device.firmware.as_deref(), Some("zt3l-t5"));
+
+        let schedule = device.state.schedule.clone().unwrap();
+        assert_eq!(schedule.len(), 8);
+        assert_eq!(schedule[0], ScheduleSlot { time: "06:59".into(), temperature: 19.0 });
+        assert_eq!(schedule[4], ScheduleSlot { time: "17:00".into(), temperature: 22.0 });
+        assert_eq!(schedule[7], ScheduleSlot { time: "22:00".into(), temperature: 16.0 });
+
+        // Değiştirilmeden geri kodlanan program cihazdan gelen baytlarla aynı olmalı
+        let encoded = ZWT07.schedule_dp(&device, &schedule).unwrap();
+        assert_eq!(encoded, observed[6]);
     }
 
     #[test]
-    fn setpoint_snaps_to_step_and_respects_range() {
-        assert_eq!(ZWT07.setpoint_dp(21.3), Some(Datapoint::value(16, 215)));
-        assert_eq!(ZWT07.setpoint_dp(4.0), None);
-        assert_eq!(ZWT07.setpoint_dp(61.0), None);
+    fn schedule_rejects_changed_layout_and_bad_values() {
+        let mut device = thermostat();
+        device.state.schedule = Some(vec![ScheduleSlot { time: "06:00".into(), temperature: 20.0 }; 2]);
+        let one = [ScheduleSlot { time: "06:00".into(), temperature: 20.0 }];
+        assert!(ZWT07.schedule_dp(&device, &one).is_err());
+        let bad_time = [
+            ScheduleSlot { time: "24:00".into(), temperature: 20.0 },
+            ScheduleSlot { time: "07:00".into(), temperature: 20.0 },
+        ];
+        assert!(ZWT07.schedule_dp(&device, &bad_time).is_err());
+        let too_hot = [
+            ScheduleSlot { time: "06:00".into(), temperature: 99.0 },
+            ScheduleSlot { time: "07:00".into(), temperature: 20.0 },
+        ];
+        assert!(ZWT07.schedule_dp(&device, &too_hot).is_err());
+    }
+
+    #[test]
+    fn setpoint_snaps_to_step_and_respects_device_limits() {
+        let mut device = thermostat();
+        assert_eq!(ZWT07.setpoint_dp(&device, 21.3), Some(Datapoint::value(16, 215)));
+        assert_eq!(ZWT07.setpoint_dp(&device, 4.0), None);
+        assert!(ZWT07.setpoint_dp(&device, 90.0).is_some());
+        device.settings.insert(MAX_LIMIT_KEY.into(), 50.0);
+        assert_eq!(ZWT07.setpoint_dp(&device, 60.0), None);
+    }
+
+    #[test]
+    fn working_week_round_trips() {
+        assert_eq!(ZWT07.working_week_dp("7"), Some(Datapoint::enumeration(31, 2)));
+        assert_eq!(ZWT07.working_week_dp("8"), None);
     }
 
     #[test]

@@ -83,6 +83,11 @@
   .setting { display: grid; grid-template-columns: 1fr 90px auto; align-items: center; gap: 8px; font-size: 13px; margin: 6px 0; }
   .setting input { font: inherit; width: 100%; padding: 6px 8px; border-radius: 8px; border: 1px solid var(--line); background: var(--card); color: var(--text); }
   .setting .note { grid-column: 1 / -1; color: var(--warn); font-size: 12px; }
+  .schedule { margin: 8px 0; }
+  .schedule h4 { font-size: 13px; margin: 10px 0 4px; color: var(--muted); font-weight: 600; }
+  .slot { display: grid; grid-template-columns: 22px 1fr 1fr; gap: 8px; align-items: center; margin: 4px 0; font-size: 13px; }
+  .slot input { font: inherit; width: 100%; padding: 5px 6px; border-radius: 8px; border: 1px solid var(--line); background: var(--card); color: var(--text); }
+  .slot span { color: var(--muted); }
   .menu { display: flex; gap: 8px; }
   .menu button { padding: 4px 10px; font-size: 13px; }
   .empty { color: var(--muted); padding: 24px; text-align: center; border: 1px dashed var(--line); border-radius: 14px; }
@@ -244,8 +249,16 @@ function buildCard(d) {
   preset.onchange = () => run(api(`/api/devices/${d.ieee}/command`, { action: "preset", value: preset.value }));
   const frost = el("input", { type: "checkbox" });
   frost.onchange = () => run(api(`/api/devices/${d.ieee}/command`, { action: "frost", value: frost.checked }));
-  const thermoRow = el("div", { className: "thermo", hidden: true }, minus, target, plus, preset,
-    el("label", { className: "check" }, frost, "Donma koruması"));
+  const childLock = el("input", { type: "checkbox" });
+  childLock.onchange = () => run(api(`/api/devices/${d.ieee}/command`, { action: "child_lock", value: childLock.checked }));
+  const week = el("select", { title: "Haftalık programın gün düzeni" },
+    el("option", { value: "5_2", textContent: "5+2 gün" }),
+    el("option", { value: "6_1", textContent: "6+1 gün" }),
+    el("option", { value: "7", textContent: "7 gün" }));
+  week.onchange = () => run(api(`/api/devices/${d.ieee}/command`, { action: "working_week", value: week.value }));
+  const thermoRow = el("div", { className: "thermo", hidden: true }, minus, target, plus, preset, week,
+    el("label", { className: "check" }, frost, "Donma koruması"),
+    el("label", { className: "check" }, childLock, "Çocuk kilidi"));
   const isPending = () => pendingSetpoint != null;
   card.append(levelRow, ctRow, thermoRow);
 
@@ -262,14 +275,15 @@ function buildCard(d) {
     if (confirm(`"${current.name}" ağdan çıkarılsın mı?`)) run(api(`/api/devices/${d.ieee}`, null, "DELETE"));
   };
   const info = el("dl", { className: "info" });
+  const scheduleBox = el("div");
   const settings = el("div");
   card.append(el("details", { className: "more" },
     el("summary", { textContent: "Ayrıntılar" }),
-    info, settings,
+    info, settings, scheduleBox,
     el("div", { className: "menu" }, reinterview, remove)));
 
-  return { info, settings, settingRows: new Map(), card, name, sub, sw, toggle, values, level, levelText, levelRow, ct, ctText, ctRow, chips,
-    thermoRow, showSetpoint, isPending, preset, frost };
+  return { info, settings, scheduleBox, settingRows: new Map(), card, name, sub, sw, toggle, values, level, levelText, levelRow, ct, ctText, ctRow, chips,
+    thermoRow, showSetpoint, isPending, preset, frost, childLock, week, schedule: el("div", { className: "schedule" }), scheduleInputs: [] };
 }
 
 function updateCard(parts, d) {
@@ -286,7 +300,10 @@ function updateCard(parts, d) {
     if (!parts.isPending()) parts.showSetpoint(s.setpoint);
     if (document.activeElement !== parts.preset && s.preset) parts.preset.value = s.preset;
     if (document.activeElement !== parts.frost) parts.frost.checked = !!s.frost;
+    if (document.activeElement !== parts.childLock) parts.childLock.checked = !!s.child_lock;
+    if (document.activeElement !== parts.week && s.working_week) parts.week.value = s.working_week;
   }
+  updateSchedule(parts, d);
 
   parts.levelRow.hidden = !c.includes("level");
   if (document.activeElement !== parts.level && s.level != null) {
@@ -318,6 +335,7 @@ function updateCard(parts, d) {
   updateSettings(parts, d);
 
   const chips = [];
+  if (s.fault) chips.push(el("span", { className: "chip warn", textContent: `Arıza kodu ${s.fault}` }));
   if (s.heating) chips.push(el("span", { className: "chip heat", textContent: "Isıtıyor" }));
   else if (thermostat && s.heating === false) chips.push(el("span", { className: "chip", textContent: "Beklemede" }));
   if (d.interviewing) chips.push(el("span", { className: "chip", textContent: "Tanınıyor…" }));
@@ -352,6 +370,39 @@ function updateSettings(parts, d) {
     if (document.activeElement !== row.input && current != null) row.input.value = current;
     row.note.hidden = !(d.pending_settings || []).includes(def.key);
   }
+}
+
+// Programın dilimleri cihazdan geldiği düzende; 5+2'de 8 dilim = 6 hafta içi + 2 hafta sonu
+function scheduleGroups(d) {
+  const n = d.state.schedule.length;
+  if (d.state.working_week === "5_2" && n === 8) return [["Hafta içi (Pzt–Cum)", 0, 6], ["Hafta sonu (Cmt–Paz)", 6, 8]];
+  return [["Program", 0, n]];
+}
+
+function updateSchedule(parts, d) {
+  const slots = d.state.schedule;
+  if (!slots) { parts.scheduleBox.replaceChildren(); parts.scheduleInputs = []; return; }
+  const editing = parts.scheduleInputs.some(({ time, temp }) => document.activeElement === time || document.activeElement === temp);
+  if (editing) return;
+  const [min, max] = d.setpoint_range || [5, 35];
+  const rows = [], inputs = [];
+  for (const [title, from, to] of scheduleGroups(d)) {
+    rows.push(el("h4", { textContent: title }));
+    for (let i = from; i < to; i++) {
+      const time = el("input", { type: "time", value: slots[i].time });
+      const temp = el("input", { type: "number", min, max, step: 0.5, value: slots[i].temperature });
+      inputs.push({ time, temp });
+      rows.push(el("div", { className: "slot" }, el("span", { textContent: `${i - from + 1}.` }), time, temp));
+    }
+  }
+  const save = el("button", { textContent: "Programı kaydet" });
+  save.onclick = () => {
+    const value = inputs.map(({ time, temp }) => ({ time: time.value, temperature: Number(temp.value) }));
+    run(api(`/api/devices/${d.ieee}/command`, { action: "schedule", value }).then(() => toast("Program gönderildi")));
+  };
+  parts.scheduleInputs = inputs;
+  parts.scheduleBox.replaceChildren(el("div", { className: "schedule" },
+    el("h4", { textContent: "Haftalık program (saat · °C)" }), ...rows, save));
 }
 
 function render() {

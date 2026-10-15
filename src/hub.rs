@@ -24,6 +24,7 @@ use ziggurat_phy_spinel::SpinelPhy;
 use ziggurat_protocol as proto;
 
 use crate::store::{
+    ScheduleSlot,
     self, Child, Device, LinkKey, NetworkData, Persisted, eui64_to_string, key_to_string,
     parse_eui64, parse_key,
 };
@@ -100,6 +101,25 @@ pub enum Action {
     /// "manual" ya da "program"
     Preset(String),
     Frost(bool),
+    ChildLock(bool),
+    /// "5_2", "6_1" ya da "7"
+    WorkingWeek(String),
+    Schedule(Vec<ScheduleSlot>),
+}
+
+impl Action {
+    fn is_thermostat(&self) -> bool {
+        matches!(
+            self,
+            Self::Setpoint(_)
+                | Self::SystemMode(_)
+                | Self::Preset(_)
+                | Self::Frost(_)
+                | Self::ChildLock(_)
+                | Self::WorkingWeek(_)
+                | Self::Schedule(_)
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -183,10 +203,23 @@ pub fn capabilities(device: &Device) -> Vec<&'static str> {
     if device.has_cluster(cluster::POWER_CONFIG) && !device.router {
         caps.push("battery");
     }
-    if device.has_cluster(tuya::CLUSTER) && tuya::thermostat_profile(device.manufacturer.as_deref()).is_some() {
+    if device.has_cluster(tuya::CLUSTER)
+        && let Some(profile) = tuya::thermostat_profile(device.manufacturer.as_deref())
+    {
         caps.push("thermostat");
+        if profile.battery.is_some() {
+            caps.push("battery");
+        }
     }
     caps
+}
+
+/// Cihazın modele özel ayarları: ZCL öznitelikleri ya da Tuya DP'leri
+fn device_settings(device: &Device) -> &'static [Setting] {
+    if let Some(profile) = profiles::profile(device.model.as_deref()) {
+        return profile.settings;
+    }
+    tuya::thermostat_profile(device.manufacturer.as_deref()).map_or(&[], |p| p.settings)
 }
 
 /// Adı hâlâ "Cihaz xxxx" olan tanınmış cihazlara modelden ad verir
@@ -449,10 +482,11 @@ impl Hub {
             interviewing: self.interviews.lock().unwrap().contains(&device.ieee),
             waiting_for_wake: self.wake_interviews.lock().unwrap().contains(&device.ieee),
             setpoint_range: tuya::thermostat_profile(device.manufacturer.as_deref())
-                .map(|p| [p.setpoint_min, p.setpoint_max, p.setpoint_step]),
-            settings_schema: profiles::profile(device.model.as_deref())
-                .map(|p| p.settings.to_vec())
-                .unwrap_or_default(),
+                .map(|p| {
+                    let (min, max) = p.setpoint_range(device);
+                    [min, max, p.setpoint_step]
+                }),
+            settings_schema: device_settings(device).to_vec(),
             pending_settings: self
                 .pending_settings
                 .lock()
@@ -804,7 +838,7 @@ impl Hub {
                     .and_then(|d| tuya::thermostat_profile(d.manufacturer.as_deref()));
                 self.update_device(ieee, |device| {
                     for dp in &datapoints {
-                        let known = profile.is_some_and(|p| p.apply(&mut device.state, dp));
+                        let known = profile.is_some_and(|p| p.apply(device, dp));
                         if !known {
                             // Yeni bir model eklerken DP haritasını çıkarmak için
                             info!(
@@ -856,7 +890,7 @@ impl Hub {
                     let setting = profile
                         .settings
                         .iter()
-                        .find(|s| s.cluster == cluster_id && s.attribute == record.id);
+                        .find(|s| s.is_attribute(cluster_id, record.id));
                     if let (Some(setting), Some(value)) = (setting, &record.value)
                         && let Some(decoded) = setting.decode(value)
                     {
@@ -1199,7 +1233,9 @@ impl Hub {
         // Ayarların güncel değerleri, kümeye göre gruplanmış tek okumayla
         let mut by_cluster: BTreeMap<u16, Vec<u16>> = BTreeMap::new();
         for setting in profile.settings {
-            by_cluster.entry(setting.cluster).or_default().push(setting.attribute);
+            if let profiles::Source::Attribute { cluster, attribute, .. } = setting.source {
+                by_cluster.entry(cluster).or_default().push(attribute);
+            }
         }
         for (cluster_id, attributes) in by_cluster {
             let Some(ep) = device.endpoint_with(cluster_id) else {
@@ -1254,10 +1290,7 @@ impl Hub {
 
     pub async fn command(&self, ieee: &str, action: Action) -> Result<()> {
         let device = self.device(ieee).context("cihaz bulunamadı")?;
-        if matches!(
-            action,
-            Action::Setpoint(_) | Action::SystemMode(_) | Action::Preset(_) | Action::Frost(_)
-        ) {
+        if action.is_thermostat() {
             return self.thermostat_command(&device, action);
         }
         let (cluster_id, command, payload): (u16, u8, Vec<u8>) = match &action {
@@ -1272,9 +1305,7 @@ impl Hub {
                 payload.extend_from_slice(&5u16.to_le_bytes());
                 (cluster::COLOR, 0x0A, payload)
             }
-            Action::Setpoint(_) | Action::SystemMode(_) | Action::Preset(_) | Action::Frost(_) => {
-                unreachable!("termostat komutları yukarıda ayrıldı")
-            }
+            _ => unreachable!("termostat komutları yukarıda ayrıldı"),
         };
         let ep = device
             .endpoint_with(cluster_id)
@@ -1314,11 +1345,9 @@ impl Hub {
             .endpoint_with(tuya::CLUSTER)
             .context("cihazda Tuya kümesi yok")?;
         let dp = match &action {
-            Action::Setpoint(celsius) => profile.setpoint_dp(*celsius).with_context(|| {
-                format!(
-                    "hedef sıcaklık {}-{} °C arasında olmalı",
-                    profile.setpoint_min, profile.setpoint_max
-                )
+            Action::Setpoint(celsius) => profile.setpoint_dp(device, *celsius).with_context(|| {
+                let (min, max) = profile.setpoint_range(device);
+                format!("hedef sıcaklık {min}-{max} °C arasında olmalı")
             })?,
             Action::SystemMode(mode) => match mode.as_str() {
                 "heat" => profile.system_mode_dp(true),
@@ -1332,13 +1361,18 @@ impl Hub {
             }
             .context("cihazda ön ayar yok")?,
             Action::Frost(on) => profile.frost_dp(*on).context("cihazda donma koruması yok")?,
+            Action::ChildLock(on) => profile.child_lock_dp(*on).context("cihazda çocuk kilidi yok")?,
+            Action::WorkingWeek(name) => profile
+                .working_week_dp(name)
+                .with_context(|| format!("geçersiz çalışma haftası: {name}"))?,
+            Action::Schedule(slots) => profile.schedule_dp(device, slots).map_err(|e| anyhow!(e))?,
             _ => bail!("termostat komutu değil"),
         };
 
         let seq = u16::from(self.next_seq());
         self.send_tuya(device.nwk, ep, tuya::cmd::DATA_REQUEST, &tuya::data_request(seq, &[dp.clone()]));
         self.update_device(&device.ieee, |d| {
-            profile.apply(&mut d.state, &dp);
+            profile.apply(d, &dp);
         });
         Ok(())
     }
@@ -1406,11 +1440,27 @@ impl Hub {
     /// sonraki uyanışında (rapor ya da check-in) yazılır; dönüş `true` ise bekliyor.
     pub async fn set_setting(self: &Arc<Self>, ieee: &str, key: &str, value: f64) -> Result<bool> {
         let device = self.device(ieee).context("cihaz bulunamadı")?;
-        let profile = profiles::profile(device.model.as_deref()).context("bu cihazın ayarı yok")?;
-        let setting = profile.setting(key).context("bilinmeyen ayar")?;
-        let (snapped, _) = setting.encode(value).with_context(|| {
+        let setting = device_settings(&device)
+            .iter()
+            .find(|s| s.key == key)
+            .context("bilinmeyen ayar")?;
+        let (snapped, raw) = setting.to_raw(value).with_context(|| {
             format!("{} {}…{} {} arasında olmalı", setting.label, setting.min, setting.max, setting.unit)
         })?;
+
+        if let profiles::Source::TuyaDp(_) = setting.source {
+            // Tuya cihazı komutları yoklamasında hemen alıyor; onayı DP raporu getirir
+            let profile = tuya::thermostat_profile(device.manufacturer.as_deref())
+                .context("bu cihaz için Tuya tanımı yok")?;
+            let ep = device.endpoint_with(tuya::CLUSTER).context("cihazda Tuya kümesi yok")?;
+            let dp = profile.setting_dp(setting, raw).context("geçersiz değer")?;
+            let seq = u16::from(self.next_seq());
+            self.send_tuya(device.nwk, ep, tuya::cmd::DATA_REQUEST, &tuya::data_request(seq, &[dp]));
+            self.update_device(ieee, |d| {
+                d.settings.insert(setting.key.to_owned(), snapped);
+            });
+            return Ok(false);
+        }
 
         if device.rx_on_when_idle {
             self.write_setting(&device, setting, snapped).await?;
@@ -1429,13 +1479,15 @@ impl Hub {
     }
 
     async fn write_setting(&self, device: &Device, setting: &Setting, value: f64) -> Result<()> {
-        let (_, bytes) = setting.encode(value).context("geçersiz değer")?;
-        let ep = device
-            .endpoint_with(setting.cluster)
-            .context("cihazda ayarın kümesi yok")?;
-        let payload = zcl::write_attribute_payload(setting.attribute, setting.ty, &bytes);
+        let profiles::Source::Attribute { cluster, attribute, ty } = setting.source else {
+            bail!("öznitelik ayarı değil");
+        };
+        let (_, raw) = setting.to_raw(value).context("geçersiz değer")?;
+        let bytes = setting.attribute_bytes(raw).context("geçersiz değer")?;
+        let ep = device.endpoint_with(cluster).context("cihazda ayarın kümesi yok")?;
+        let payload = zcl::write_attribute_payload(attribute, ty, &bytes);
         let (header, body) = self
-            .zcl_request(device.nwk, ep, setting.cluster, 0x00, zcl::cmd::WRITE_ATTRIBUTES, &payload)
+            .zcl_request(device.nwk, ep, cluster, 0x00, zcl::cmd::WRITE_ATTRIBUTES, &payload)
             .await?;
         if header.command != zcl::cmd::WRITE_ATTRIBUTES_RSP || !zcl::all_success(&body) {
             bail!("cihaz ayarı reddetti ({body:02x?})");

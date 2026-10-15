@@ -90,6 +90,24 @@ pub struct DeviceState {
     pub preset: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub frost: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub child_lock: Option<bool>,
+    /// Termostatın arıza bit alanı; 0 arıza yok
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fault: Option<u32>,
+    /// Haftalık programın gün düzeni: "5_2", "6_1" ya da "7"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub working_week: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<Vec<ScheduleSlot>>,
+}
+
+/// Haftalık programın bir dilimi: bu saatten itibaren hedef sıcaklık
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScheduleSlot {
+    /// "SS:DD"
+    pub time: String,
+    pub temperature: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

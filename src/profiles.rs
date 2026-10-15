@@ -5,16 +5,20 @@ use serde::Serialize;
 
 use crate::zcl::{Value, cluster, types};
 
+/// Ayarın cihazdaki yeri
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    Attribute { cluster: u16, attribute: u16, ty: u8 },
+    /// Tuya'nın `0xEF00` kümesindeki sayısal (VALUE) veri noktası
+    TuyaDp(u8),
+}
+
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct Setting {
     pub key: &'static str,
     pub label: &'static str,
     #[serde(skip)]
-    pub cluster: u16,
-    #[serde(skip)]
-    pub attribute: u16,
-    #[serde(skip)]
-    pub ty: u8,
+    pub source: Source,
     /// Ham değer = gösterilen değer × ölçek
     #[serde(skip)]
     pub scale: f64,
@@ -26,24 +30,37 @@ pub struct Setting {
 
 impl Setting {
     pub fn decode(&self, value: &Value) -> Option<f64> {
-        let raw = value.as_i64()?;
-        Some((raw as f64 / self.scale * 100.0).round() / 100.0)
+        Some(self.from_raw(value.as_i64()?))
     }
 
-    /// Değeri adıma yuvarlar ve öznitelik türünde kodlar; aralık dışıysa `None`
-    pub fn encode(&self, value: f64) -> Option<(f64, Vec<u8>)> {
+    pub fn from_raw(&self, raw: i64) -> f64 {
+        (raw as f64 / self.scale * 100.0).round() / 100.0
+    }
+
+    /// Değeri adıma yuvarlar ve ham tamsayıya çevirir; aralık dışıysa `None`
+    pub fn to_raw(&self, value: f64) -> Option<(f64, i64)> {
         if !value.is_finite() || !(self.min..=self.max).contains(&value) {
             return None;
         }
         let snapped = (value / self.step).round() * self.step;
-        let raw = (snapped * self.scale).round() as i64;
-        let bytes = match self.ty {
+        Some(((snapped * 100.0).round() / 100.0, (snapped * self.scale).round() as i64))
+    }
+
+    /// Öznitelik kaynaklı ayarın yazılacak baytları
+    pub fn attribute_bytes(&self, raw: i64) -> Option<Vec<u8>> {
+        let Source::Attribute { ty, .. } = self.source else {
+            return None;
+        };
+        Some(match ty {
             types::INT16 => i16::try_from(raw).ok()?.to_le_bytes().to_vec(),
             types::UINT16 => u16::try_from(raw).ok()?.to_le_bytes().to_vec(),
             types::UINT8 => vec![u8::try_from(raw).ok()?],
             _ => return None,
-        };
-        Some(((snapped * 100.0).round() / 100.0, bytes))
+        })
+    }
+
+    pub fn is_attribute(&self, cluster_id: u16, attribute_id: u16) -> bool {
+        matches!(self.source, Source::Attribute { cluster, attribute, .. } if cluster == cluster_id && attribute == attribute_id)
     }
 }
 
@@ -68,9 +85,11 @@ const SNZB_02P: Profile = Profile {
         Setting {
             key: "temperature_calibration",
             label: "Sıcaklık düzeltmesi",
-            cluster: SONOFF_CLUSTER,
-            attribute: 0x2003,
-            ty: types::INT16,
+            source: Source::Attribute {
+                cluster: SONOFF_CLUSTER,
+                attribute: 0x2003,
+                ty: types::INT16,
+            },
             scale: 100.0,
             min: -50.0,
             max: 50.0,
@@ -80,9 +99,11 @@ const SNZB_02P: Profile = Profile {
         Setting {
             key: "humidity_calibration",
             label: "Nem düzeltmesi",
-            cluster: SONOFF_CLUSTER,
-            attribute: 0x2004,
-            ty: types::INT16,
+            source: Source::Attribute {
+                cluster: SONOFF_CLUSTER,
+                attribute: 0x2004,
+                ty: types::INT16,
+            },
             scale: 100.0,
             min: -50.0,
             max: 50.0,
@@ -107,16 +128,16 @@ mod tests {
     #[test]
     fn calibration_round_trips_through_int16() {
         let setting = SNZB_02P.setting("temperature_calibration").unwrap();
-        let (snapped, bytes) = setting.encode(-1.26).unwrap();
+        let (snapped, raw) = setting.to_raw(-1.26).unwrap();
         assert_eq!(snapped, -1.3);
-        assert_eq!(bytes, (-130i16).to_le_bytes());
+        assert_eq!(setting.attribute_bytes(raw).unwrap(), (-130i16).to_le_bytes());
         assert_eq!(setting.decode(&Value::Int(-130)), Some(-1.3));
     }
 
     #[test]
     fn rejects_out_of_range_values() {
         let setting = SNZB_02P.setting("humidity_calibration").unwrap();
-        assert!(setting.encode(50.5).is_none());
-        assert!(setting.encode(f64::NAN).is_none());
+        assert!(setting.to_raw(50.5).is_none());
+        assert!(setting.to_raw(f64::NAN).is_none());
     }
 }
