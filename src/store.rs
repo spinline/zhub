@@ -118,6 +118,11 @@ pub struct Device {
     #[serde(default)]
     pub state: DeviceState,
     #[serde(default)]
+    pub firmware: Option<String>,
+    /// Modele özel ayarların cihazdan okunan değerleri
+    #[serde(default)]
+    pub settings: BTreeMap<String, f64>,
+    #[serde(default)]
     pub last_seen: Option<u64>,
     #[serde(default)]
     pub lqi: Option<u8>,
@@ -145,6 +150,8 @@ impl Device {
             color_temp_min: None,
             color_temp_max: None,
             state: DeviceState::default(),
+            firmware: None,
+            settings: BTreeMap::new(),
             last_seen: None,
             lqi: None,
         }

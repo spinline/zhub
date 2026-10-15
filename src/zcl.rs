@@ -20,6 +20,7 @@ pub mod cmd {
 pub mod cluster {
     pub const BASIC: u16 = 0x0000;
     pub const POWER_CONFIG: u16 = 0x0001;
+    pub const POLL_CONTROL: u16 = 0x0020;
     pub const ON_OFF: u16 = 0x0006;
     pub const LEVEL: u16 = 0x0008;
     pub const COLOR: u16 = 0x0300;

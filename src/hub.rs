@@ -1,7 +1,7 @@
 //! Zigbee merkezi: yığını ayağa kaldırır, gelen trafiği işler, katılan cihazları tanır
 //! ve kullanıcının komutlarını gönderir.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -28,6 +28,7 @@ use crate::store::{
     parse_eui64, parse_key,
 };
 use crate::zcl::{self, ReportConfig, Value, cluster, types};
+use crate::profiles::{self, Setting};
 use crate::{tuya, zdo};
 
 /// Koordinatörün kendi uç noktası; bağlamalar ve raporlar buraya gelir
@@ -47,6 +48,8 @@ const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 /// Uyuyan cihaz isteği ancak bir sonraki yoklamada alır
 const SLEEPY_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_PERMIT_SECONDS: u8 = 254;
+/// Check-in yanıtında istenen hızlı yoklama süresi (çeyrek saniye): 20 sn
+const FAST_POLL_QUARTER_SECONDS: u16 = 80;
 
 pub struct Options {
     pub device: String,
@@ -70,9 +73,17 @@ pub struct DeviceView {
     pub device: Device,
     pub capabilities: Vec<&'static str>,
     pub interviewing: bool,
+    /// Uyuyan cihaz uyanınca tanınacak
+    pub waiting_for_wake: bool,
     /// Termostat hedef sıcaklığı için [en az, en çok, adım]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub setpoint_range: Option<[f64; 3]>,
+    /// Modele özel ayarların tanımı
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub settings_schema: Vec<Setting>,
+    /// Cihaz uyanınca yazılacak ayarlar
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub pending_settings: Vec<&'static str>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -108,6 +119,10 @@ pub struct Hub {
     events: broadcast::Sender<Event>,
     permit_until: Mutex<Option<Instant>>,
     interviews: Mutex<HashSet<String>>,
+    /// Uyuyan cihazlara, uyandıklarında yazılacak ayarlar: ieee → (anahtar → değer)
+    pending_settings: Mutex<HashMap<String, BTreeMap<&'static str, f64>>>,
+    /// Uyanınca yeniden tanınacak uyuyan cihazlar
+    wake_interviews: Mutex<HashSet<String>>,
 }
 
 fn now_unix() -> u64 {
@@ -217,6 +232,9 @@ fn apply_attribute(device: &mut Device, cluster_id: u16, attribute: u16, value: 
     match (cluster_id, attribute) {
         (cluster::BASIC, 0x0004) => device.manufacturer = value.as_str().map(str::to_owned),
         (cluster::BASIC, 0x0005) => device.model = value.as_str().map(str::to_owned),
+        (cluster::BASIC, 0x4000) => {
+            device.firmware = value.as_str().filter(|s| !s.is_empty()).map(str::to_owned);
+        }
         (cluster::ON_OFF, 0x0000) => state.on = value.as_u64().map(|v| v != 0),
         (cluster::LEVEL, 0x0000) => state.level = value.as_u64().and_then(|v| u8::try_from(v).ok()),
         (cluster::COLOR, 0x0007) => {
@@ -391,6 +409,8 @@ impl Hub {
             events,
             permit_until: Mutex::new(None),
             interviews: Mutex::new(HashSet::new()),
+            pending_settings: Mutex::new(HashMap::new()),
+            wake_interviews: Mutex::new(HashSet::new()),
         });
 
         tokio::spawn(hub.clone().notification_loop());
@@ -427,8 +447,19 @@ impl Hub {
         DeviceView {
             capabilities: capabilities(device),
             interviewing: self.interviews.lock().unwrap().contains(&device.ieee),
+            waiting_for_wake: self.wake_interviews.lock().unwrap().contains(&device.ieee),
             setpoint_range: tuya::thermostat_profile(device.manufacturer.as_deref())
                 .map(|p| [p.setpoint_min, p.setpoint_max, p.setpoint_step]),
+            settings_schema: profiles::profile(device.model.as_deref())
+                .map(|p| p.settings.to_vec())
+                .unwrap_or_default(),
+            pending_settings: self
+                .pending_settings
+                .lock()
+                .unwrap()
+                .get(&device.ieee)
+                .map(|m| m.keys().copied().collect())
+                .unwrap_or_default(),
             device: device.clone(),
         }
     }
@@ -506,6 +537,8 @@ impl Hub {
                 ..
             } => {
                 self.touch(source.0, lqi);
+                self.flush_pending_settings(source.0);
+                self.start_wake_interview(source.0);
                 if profile_id == ZDO_PROFILE {
                     self.handle_zdo(source.0, destination.0, cluster_id, &data);
                 } else {
@@ -726,6 +759,25 @@ impl Hub {
             return;
         }
 
+        if cluster_id == cluster::POLL_CONTROL && header.server_to_client() && header.command == 0x00 {
+            // Check-in: bekleyen ayar varsa cihaz hızlı yoklamaya geçsin ki yazma yetişsin
+            let has_pending = ieee
+                .as_ref()
+                .is_some_and(|ieee| self.pending_settings.lock().unwrap().contains_key(ieee));
+            let mut body = vec![u8::from(has_pending)];
+            body.extend_from_slice(&FAST_POLL_QUARTER_SECONDS.to_le_bytes());
+            let frame = zcl::frame(
+                zcl::FC_CLUSTER_SPECIFIC | zcl::FC_DISABLE_DEFAULT_RESPONSE,
+                header.seq,
+                0x00,
+                &body,
+            );
+            if let Err(e) = self.send(source, HA_PROFILE, cluster::POLL_CONTROL, HUB_ENDPOINT, src_ep, frame, false) {
+                debug!("Check-in yanıtı gönderilemedi: {e:#}");
+            }
+            return;
+        }
+
         if cluster_id == tuya::CLUSTER && header.server_to_client() {
             self.handle_tuya(source, src_ep, ieee.as_deref(), &header, payload);
             return;
@@ -797,6 +849,19 @@ impl Hub {
             for record in records {
                 if let Some(value) = &record.value {
                     apply_attribute(device, cluster_id, record.id, value);
+                }
+            }
+            if let Some(profile) = profiles::profile(device.model.as_deref()) {
+                for record in records {
+                    let setting = profile
+                        .settings
+                        .iter()
+                        .find(|s| s.cluster == cluster_id && s.attribute == record.id);
+                    if let (Some(setting), Some(value)) = (setting, &record.value)
+                        && let Some(decoded) = setting.decode(value)
+                    {
+                        device.settings.insert(setting.key.to_owned(), decoded);
+                    }
                 }
             }
         });
@@ -957,13 +1022,30 @@ impl Hub {
 
     // ---- Cihaz tanıma ----
 
+    /// Katılımdan sonra cihaz anahtar alışverişini bitirsin diye kısa bir bekleme
     pub fn spawn_interview(self: &Arc<Self>, ieee: String) {
+        self.spawn_interview_after(ieee, Duration::from_secs(2));
+    }
+
+    /// Uyuyan cihaz az önce bir şey gönderdi: uyanıkken hemen tanı
+    fn start_wake_interview(self: &Arc<Self>, nwk: u16) {
+        let Some(ieee) = self.ieee_for_nwk(nwk) else {
+            return;
+        };
+        if self.wake_interviews.lock().unwrap().remove(&ieee) {
+            info!("{ieee} uyandı, tanınıyor");
+            self.spawn_interview_after(ieee, Duration::ZERO);
+        }
+    }
+
+    fn spawn_interview_after(self: &Arc<Self>, ieee: String, delay: Duration) {
         if !self.interviews.lock().unwrap().insert(ieee.clone()) {
             return;
         }
         self.emit_device(&ieee);
         let hub = self.clone();
         tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
             let result = hub.interview(&ieee).await;
             hub.interviews.lock().unwrap().remove(&ieee);
             match result {
@@ -975,8 +1057,6 @@ impl Hub {
     }
 
     async fn interview(self: &Arc<Self>, ieee: &str) -> Result<()> {
-        // Cihaz katıldıktan sonra anahtar alışverişini bitirsin
-        tokio::time::sleep(Duration::from_secs(2)).await;
         let nwk = self.device(ieee).context("cihaz listede yok")?.nwk;
         info!("{ieee} tanınıyor");
 
@@ -1023,7 +1103,7 @@ impl Hub {
             // Tuya cihazları bu öznitelikleri tek istekte okumadan veri göndermiyor;
             // diğer cihazlar için de zararsız
             if let Err(e) = self
-                .read_attributes(nwk, ep, cluster::BASIC, &[0x0004, 0x0000, 0x0001, 0x0005, 0x0007, 0xFFFE])
+                .read_attributes(nwk, ep, cluster::BASIC, &[0x0004, 0x0000, 0x0001, 0x0005, 0x0007, 0xFFFE, 0x4000])
                 .await
             {
                 warn!("{ieee} temel bilgileri okunamadı: {e:#}");
@@ -1076,20 +1156,7 @@ impl Hub {
                     continue;
                 };
 
-                let bind = retry("Bind", || async move {
-                    let rsp = self
-                        .zdo_request(
-                            nwk,
-                            zdo::cluster::BIND_REQ,
-                            zdo::bind_req(device_ieee.0, endpoint.id, cluster_id, self.ieee.0, HUB_ENDPOINT),
-                        )
-                        .await?;
-                    zdo::parse_status_rsp(&rsp)
-                })
-                .await;
-                if let Err(e) = bind {
-                    warn!("{ieee} küme 0x{cluster_id:04x} bağlanamadı: {e:#}");
-                }
+                self.bind(ieee, nwk, device_ieee, endpoint.id, cluster_id).await;
 
                 match self
                     .zcl_request(
@@ -1119,6 +1186,45 @@ impl Hub {
                     debug!("{ieee} küme 0x{cluster_id:04x} okunamadı: {e:#}");
                 }
             }
+        }
+
+        let Some(profile) = profiles::profile(device.model.as_deref()) else {
+            return;
+        };
+        for &cluster_id in profile.binds {
+            if let Some(ep) = device.endpoint_with(cluster_id) {
+                self.bind(ieee, nwk, device_ieee, ep, cluster_id).await;
+            }
+        }
+        // Ayarların güncel değerleri, kümeye göre gruplanmış tek okumayla
+        let mut by_cluster: BTreeMap<u16, Vec<u16>> = BTreeMap::new();
+        for setting in profile.settings {
+            by_cluster.entry(setting.cluster).or_default().push(setting.attribute);
+        }
+        for (cluster_id, attributes) in by_cluster {
+            let Some(ep) = device.endpoint_with(cluster_id) else {
+                continue;
+            };
+            if let Err(e) = self.read_attributes(nwk, ep, cluster_id, &attributes).await {
+                debug!("{ieee} ayarları okunamadı: {e:#}");
+            }
+        }
+    }
+
+    async fn bind(&self, ieee: &str, nwk: u16, device_ieee: Eui64, ep: u8, cluster_id: u16) {
+        let bind = retry("Bind", || async move {
+            let rsp = self
+                .zdo_request(
+                    nwk,
+                    zdo::cluster::BIND_REQ,
+                    zdo::bind_req(device_ieee.0, ep, cluster_id, self.ieee.0, HUB_ENDPOINT),
+                )
+                .await?;
+            zdo::parse_status_rsp(&rsp)
+        })
+        .await;
+        if let Err(e) = bind {
+            warn!("{ieee} küme 0x{cluster_id:04x} bağlanamadı: {e:#}");
         }
     }
 
@@ -1237,12 +1343,17 @@ impl Hub {
         Ok(())
     }
 
-    pub fn reinterview(self: &Arc<Self>, ieee: &str) -> Result<()> {
-        if self.device(ieee).is_none() {
-            bail!("cihaz bulunamadı");
+    /// Şebekeli cihaz hemen, uyuyan cihaz bir sonraki uyanışında tanınır; dönüş
+    /// `true` ise uyanış bekleniyor
+    pub fn reinterview(self: &Arc<Self>, ieee: &str) -> Result<bool> {
+        let device = self.device(ieee).context("cihaz bulunamadı")?;
+        if device.rx_on_when_idle {
+            self.spawn_interview_after(ieee.to_owned(), Duration::ZERO);
+            return Ok(false);
         }
-        self.spawn_interview(ieee.to_owned());
-        Ok(())
+        self.wake_interviews.lock().unwrap().insert(ieee.to_owned());
+        self.emit_device(ieee);
+        Ok(true)
     }
 
     pub fn permit_join(self: &Arc<Self>, seconds: u8) -> Result<()> {
@@ -1289,6 +1400,83 @@ impl Hub {
             .lock()
             .unwrap()
             .map_or(0, |until| until.saturating_duration_since(Instant::now()).as_secs())
+    }
+
+    /// Modele özel bir ayarı yazar. Uyuyan cihazda ayar kuyruğa alınır ve cihaz bir
+    /// sonraki uyanışında (rapor ya da check-in) yazılır; dönüş `true` ise bekliyor.
+    pub async fn set_setting(self: &Arc<Self>, ieee: &str, key: &str, value: f64) -> Result<bool> {
+        let device = self.device(ieee).context("cihaz bulunamadı")?;
+        let profile = profiles::profile(device.model.as_deref()).context("bu cihazın ayarı yok")?;
+        let setting = profile.setting(key).context("bilinmeyen ayar")?;
+        let (snapped, _) = setting.encode(value).with_context(|| {
+            format!("{} {}…{} {} arasında olmalı", setting.label, setting.min, setting.max, setting.unit)
+        })?;
+
+        if device.rx_on_when_idle {
+            self.write_setting(&device, setting, snapped).await?;
+            return Ok(false);
+        }
+        self.pending_settings
+            .lock()
+            .unwrap()
+            .entry(ieee.to_owned())
+            .or_default()
+            .insert(setting.key, snapped);
+        self.emit_device(ieee);
+        // Cihaz tam şu an uyanıksa hemen gider; değilse bir sonraki raporu beklenir
+        self.flush_pending_settings(device.nwk);
+        Ok(true)
+    }
+
+    async fn write_setting(&self, device: &Device, setting: &Setting, value: f64) -> Result<()> {
+        let (_, bytes) = setting.encode(value).context("geçersiz değer")?;
+        let ep = device
+            .endpoint_with(setting.cluster)
+            .context("cihazda ayarın kümesi yok")?;
+        let payload = zcl::write_attribute_payload(setting.attribute, setting.ty, &bytes);
+        let (header, body) = self
+            .zcl_request(device.nwk, ep, setting.cluster, 0x00, zcl::cmd::WRITE_ATTRIBUTES, &payload)
+            .await?;
+        if header.command != zcl::cmd::WRITE_ATTRIBUTES_RSP || !zcl::all_success(&body) {
+            bail!("cihaz ayarı reddetti ({body:02x?})");
+        }
+        info!("{} {} = {value} {}", device.ieee, setting.key, setting.unit);
+        self.update_device(&device.ieee, |d| {
+            d.settings.insert(setting.key.to_owned(), value);
+        });
+        Ok(())
+    }
+
+    /// Cihaz az önce bir şey gönderdiyse uyanıktır: bekleyen ayarları şimdi yaz
+    fn flush_pending_settings(self: &Arc<Self>, nwk: u16) {
+        let Some(device) = self.data.lock().unwrap().devices.values().find(|d| d.nwk == nwk).cloned() else {
+            return;
+        };
+        let Some(pending) = self.pending_settings.lock().unwrap().remove(&device.ieee) else {
+            return;
+        };
+        let Some(profile) = profiles::profile(device.model.as_deref()) else {
+            return;
+        };
+        let hub = self.clone();
+        tokio::spawn(async move {
+            for (key, value) in pending {
+                let Some(setting) = profile.setting(key) else {
+                    continue;
+                };
+                if let Err(e) = hub.write_setting(&device, setting, value).await {
+                    debug!("{} {key} yazılamadı, sonraki uyanışta yeniden denenecek: {e:#}", device.ieee);
+                    hub.pending_settings
+                        .lock()
+                        .unwrap()
+                        .entry(device.ieee.clone())
+                        .or_default()
+                        .entry(key)
+                        .or_insert(value);
+                }
+            }
+            hub.emit_device(&device.ieee);
+        });
     }
 
     pub fn rename(&self, ieee: &str, name: &str) -> Result<()> {

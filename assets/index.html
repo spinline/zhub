@@ -75,6 +75,14 @@
   .thermo select { font: inherit; padding: 6px 8px; border-radius: 10px; border: 1px solid var(--line); background: var(--card); color: var(--text); }
   .chip.heat { color: #fff; background: var(--warn); }
   label.check { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); }
+  details.more { border-top: 1px solid var(--line); padding-top: 8px; }
+  details.more summary { cursor: pointer; color: var(--muted); font-size: 13px; }
+  .info { display: grid; grid-template-columns: auto 1fr; gap: 2px 12px; font-size: 13px; margin: 8px 0; }
+  .info dt { color: var(--muted); }
+  .info dd { margin: 0; overflow-wrap: anywhere; }
+  .setting { display: grid; grid-template-columns: 1fr 90px auto; align-items: center; gap: 8px; font-size: 13px; margin: 6px 0; }
+  .setting input { font: inherit; width: 100%; padding: 6px 8px; border-radius: 8px; border: 1px solid var(--line); background: var(--card); color: var(--text); }
+  .setting .note { grid-column: 1 / -1; color: var(--warn); font-size: 12px; }
   .menu { display: flex; gap: 8px; }
   .menu button { padding: 4px 10px; font-size: 13px; }
   .empty { color: var(--muted); padding: 24px; text-align: center; border: 1px dashed var(--line); border-radius: 14px; }
@@ -245,15 +253,22 @@ function buildCard(d) {
   card.append(chips);
 
   const reinterview = el("button", { textContent: "Yeniden tanı" });
-  reinterview.onclick = () => run(api(`/api/devices/${d.ieee}/interview`).then(() => toast("Cihaz yeniden tanınıyor; pilli cihazsa bir düğmesine basarak uyandır.")));
+  reinterview.onclick = () => run(api(`/api/devices/${d.ieee}/interview`).then(r => toast(r.waiting_for_wake
+    ? "Pilli cihaz: düğmesine kısa basarak uyandır, tanıma o an başlayacak."
+    : "Cihaz yeniden tanınıyor.")));
   const remove = el("button", { textContent: "Kaldır" });
   remove.onclick = () => {
     const current = devices.get(d.ieee);
     if (confirm(`"${current.name}" ağdan çıkarılsın mı?`)) run(api(`/api/devices/${d.ieee}`, null, "DELETE"));
   };
-  card.append(el("div", { className: "menu" }, reinterview, remove));
+  const info = el("dl", { className: "info" });
+  const settings = el("div");
+  card.append(el("details", { className: "more" },
+    el("summary", { textContent: "Ayrıntılar" }),
+    info, settings,
+    el("div", { className: "menu" }, reinterview, remove)));
 
-  return { card, name, sub, sw, toggle, values, level, levelText, levelRow, ct, ctText, ctRow, chips,
+  return { info, settings, settingRows: new Map(), card, name, sub, sw, toggle, values, level, levelText, levelRow, ct, ctText, ctRow, chips,
     thermoRow, showSetpoint, isPending, preset, frost };
 }
 
@@ -289,16 +304,54 @@ function updateCard(parts, d) {
 
   parts.values.replaceChildren(...sensorValues(d));
 
+  const kind = d.router ? "Yönlendirici (şebeke)" : d.rx_on_when_idle ? "Uç cihaz" : "Pilli uç cihaz (uyuyan)";
+  const rows = [
+    ["IEEE", d.ieee],
+    ["Ağ adresi", "0x" + d.nwk.toString(16).padStart(4, "0")],
+    ["Üretici", d.manufacturer],
+    ["Model", d.model],
+    ["Yazılım", d.firmware],
+    ["Tür", kind],
+    ["Pil voltajı", s.voltage != null ? `${s.voltage.toFixed(1)} V` : null],
+  ].filter(([, v]) => v != null && v !== "");
+  parts.info.replaceChildren(...rows.flatMap(([k, v]) => [el("dt", { textContent: k }), el("dd", { textContent: v })]));
+  updateSettings(parts, d);
+
   const chips = [];
   if (s.heating) chips.push(el("span", { className: "chip heat", textContent: "Isıtıyor" }));
   else if (thermostat && s.heating === false) chips.push(el("span", { className: "chip", textContent: "Beklemede" }));
   if (d.interviewing) chips.push(el("span", { className: "chip", textContent: "Tanınıyor…" }));
+  else if (d.waiting_for_wake) chips.push(el("span", { className: "chip warn", textContent: "Uyanınca tanınacak" }));
   else if (!d.interviewed) chips.push(el("span", { className: "chip warn", textContent: "Tanınamadı" }));
   if (s.battery != null) chips.push(el("span", { className: "chip" + (s.battery < 15 ? " warn" : ""), textContent: `Pil %${s.battery}` }));
   if (s.battery_low) chips.push(el("span", { className: "chip warn", textContent: "Pil zayıf" }));
   if (d.lqi != null) chips.push(el("span", { className: "chip", textContent: `Sinyal ${d.lqi}` }));
   chips.push(el("span", { className: "chip", textContent: ago(d.last_seen) }));
   parts.chips.replaceChildren(...chips);
+}
+
+function updateSettings(parts, d) {
+  for (const def of d.settings_schema || []) {
+    let row = parts.settingRows.get(def.key);
+    if (!row) {
+      const input = el("input", { type: "number", min: def.min, max: def.max, step: def.step });
+      const save = el("button", { textContent: "Kaydet" });
+      const note = el("div", { className: "note", hidden: true, textContent: "Cihaz uyanınca uygulanacak (hemen uygulamak için cihazın düğmesine kısa bas)." });
+      save.onclick = () => {
+        const value = Number(input.value);
+        run(api(`/api/devices/${d.ieee}/setting`, { key: def.key, value }).then(r => {
+          if (!r.pending) toast(`${def.label} kaydedildi`);
+        }));
+      };
+      row = { input, note };
+      parts.settingRows.set(def.key, row);
+      parts.settings.append(el("div", { className: "setting" },
+        el("span", { textContent: `${def.label} (${def.unit})` }), input, save, note));
+    }
+    const current = d.settings?.[def.key];
+    if (document.activeElement !== row.input && current != null) row.input.value = current;
+    row.note.hidden = !(d.pending_settings || []).includes(def.key);
+  }
 }
 
 function render() {

@@ -1,4 +1,5 @@
 mod hub;
+mod profiles;
 mod radio;
 mod store;
 mod tuya;

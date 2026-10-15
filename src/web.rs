@@ -28,6 +28,7 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .route("/api/devices/{ieee}", axum::routing::delete(remove))
         .route("/api/devices/{ieee}/command", post(command))
         .route("/api/devices/{ieee}/rename", post(rename))
+        .route("/api/devices/{ieee}/setting", post(setting))
         .route("/api/devices/{ieee}/interview", post(interview))
         .with_state(hub)
 }
@@ -118,9 +119,24 @@ async fn rename(
     ok()
 }
 
+#[derive(Deserialize)]
+struct SettingBody {
+    key: String,
+    value: f64,
+}
+
+async fn setting(
+    State(hub): State<Arc<Hub>>,
+    Path(ieee): Path<String>,
+    Json(body): Json<SettingBody>,
+) -> ApiResult {
+    let pending = hub.set_setting(&ieee, &body.key, body.value).await?;
+    Ok(Json(json!({ "ok": true, "pending": pending })))
+}
+
 async fn interview(State(hub): State<Arc<Hub>>, Path(ieee): Path<String>) -> ApiResult {
-    hub.reinterview(&ieee)?;
-    ok()
+    let waiting = hub.reinterview(&ieee)?;
+    Ok(Json(json!({ "ok": true, "waiting_for_wake": waiting })))
 }
 
 async fn remove(State(hub): State<Arc<Hub>>, Path(ieee): Path<String>) -> ApiResult {
