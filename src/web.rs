@@ -176,7 +176,17 @@ async fn interview(State(hub): State<Arc<Hub>>, Path(ieee): Path<String>) -> Api
     Ok(Json(json!({ "ok": true, "waiting_for_wake": waiting })))
 }
 
-async fn remove(State(hub): State<Arc<Hub>>, Path(ieee): Path<String>) -> ApiResult {
-    hub.remove(&ieee).await?;
+#[derive(Deserialize)]
+struct RemoveQuery {
+    #[serde(default)]
+    force: bool,
+}
+
+async fn remove(
+    State(hub): State<Arc<Hub>>,
+    Path(ieee): Path<String>,
+    Query(query): Query<RemoveQuery>,
+) -> ApiResult {
+    hub.remove(&ieee, query.force).await?;
     ok()
 }

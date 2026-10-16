@@ -131,7 +131,18 @@
     width: min(720px, calc(100% - 24px)); max-height: calc(100% - 24px); padding: 0;
     border: 1px solid var(--line); border-radius: 16px; background: var(--card); color: var(--text);
   }
-  dialog#detail::backdrop { background: rgba(0, 0, 0, .45); }
+  dialog#detail::backdrop, dialog#removeDlg::backdrop { background: rgba(0, 0, 0, .45); }
+  dialog#removeDlg {
+    width: min(440px, calc(100% - 24px)); padding: 18px;
+    border: 1px solid var(--line); border-radius: 16px; background: var(--card); color: var(--text);
+  }
+  dialog#removeDlg h3 { margin: 0 0 4px; font-size: 18px; }
+  dialog#removeDlg .sub { margin-bottom: 12px; }
+  .option { display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; padding: 10px 0; border-top: 1px solid var(--line); cursor: pointer; }
+  .option input { margin: 3px 0 0; }
+  .option b { font-weight: 500; }
+  .option .desc { grid-column: 2; color: var(--muted); font-size: 12px; line-height: 1.4; }
+  dialog#removeDlg .actions { justify-content: flex-end; }
   .dlg-head { display: flex; align-items: center; gap: 12px; padding: 16px 18px 8px; }
   .dlg-head .names { flex: 1; }
   .dlg-head .name { font-size: 18px; }
@@ -241,6 +252,25 @@
   </div>
   <nav class="tabs" id="dlgTabs"></nav>
   <div class="panel" id="dlgPanel"></div>
+</dialog>
+
+<dialog id="removeDlg">
+  <h3>Remove device</h3>
+  <div class="sub" id="removeName"></div>
+  <label class="option">
+    <input type="radio" name="removeMode" value="normal" checked>
+    <b>Remove</b>
+    <div class="desc">The device is asked to leave the network and is deleted once it confirms. Battery devices sleep: press the device's button so it wakes up and answers.</div>
+  </label>
+  <label class="option">
+    <input type="radio" name="removeMode" value="force">
+    <b>Force remove</b>
+    <div class="desc">Only deletes the device from the hub, without asking it to leave. Use it when the device is gone or does not answer. A device still on the network may show up again when it rejoins.</div>
+  </label>
+  <div class="actions">
+    <button id="removeCancel">Cancel</button>
+    <button id="removeOk" class="danger">Remove</button>
+  </div>
 </dialog>
 
 <div id="toast"></div>
@@ -710,6 +740,31 @@ function renderDetail() {
   detail.view.update(d);
 }
 
+// Zigbee2MQTT's remove dialog: a normal removal or a forced one
+function openRemove(ieee) {
+  const d = devices.get(ieee);
+  $("#removeName").textContent = `${d.name} · ${d.ieee}`;
+  document.querySelector('input[name="removeMode"][value="normal"]').checked = true;
+  const ok = $("#removeOk");
+  ok.disabled = false;
+  ok.textContent = "Remove";
+  ok.onclick = () => {
+    const force = document.querySelector('input[name="removeMode"]:checked').value === "force";
+    ok.disabled = true;
+    ok.textContent = force ? "Removing…" : "Waiting for the device…";
+    run(api(`/api/devices/${ieee}${force ? "?force=true" : ""}`, null, "DELETE")
+      .then(() => {
+        $("#removeDlg").close();
+        $("#detail").close();
+        toast(force ? "Removed from the hub" : "The device left the network");
+      })
+      .finally(() => { ok.disabled = false; ok.textContent = "Remove"; }));
+  };
+  $("#removeDlg").showModal();
+}
+
+$("#removeCancel").onclick = () => $("#removeDlg").close();
+
 function aboutTab(d) {
   const ieee = d.ieee;
   const info = el("dl", { className: "info" });
@@ -724,12 +779,7 @@ function aboutTab(d) {
     ? "Battery device: press its button briefly to wake it up; the interview starts then."
     : "Interviewing the device.")));
   const remove = el("button", { textContent: "Remove", className: "danger" });
-  remove.onclick = () => {
-    const current = devices.get(ieee);
-    if (confirm(`Remove "${current.name}" from the network?`)) {
-      run(api(`/api/devices/${ieee}`, null, "DELETE").then(() => $("#detail").close()));
-    }
-  };
+  remove.onclick = () => openRemove(ieee);
   return {
     node: el("div", {}, info, el("div", { className: "actions" }, rename, interview, remove)),
     update(d) {

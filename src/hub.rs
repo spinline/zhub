@@ -59,6 +59,8 @@ const EAGER_WRITE_WINDOW: Duration = Duration::from_secs(60);
 const EAGER_WRITE_WAIT: Duration = Duration::from_secs(10);
 /// How long a write waits for another write to the same device to finish
 const SLOT_WAIT: Duration = Duration::from_secs(3);
+/// How long a sleepy device is asked to leave before the removal gives up
+const SLEEPY_REMOVE_WINDOW: Duration = Duration::from_secs(30);
 /// Attributes per read request, so the response fits in one frame
 const READ_CHUNK: usize = 4;
 const SECONDS_1970_TO_2000: u64 = 946_684_800;
@@ -1177,6 +1179,11 @@ impl Hub {
     }
 
     async fn zdo_request(&self, nwk: u16, cluster_id: u16, payload: Vec<u8>) -> Result<Vec<u8>> {
+        self.zdo_request_within(nwk, cluster_id, payload, None).await
+    }
+
+    /// `wait` overrides the reply timeout
+    async fn zdo_request_within(&self, nwk: u16, cluster_id: u16, payload: Vec<u8>, wait: Option<Duration>) -> Result<Vec<u8>> {
         let tsn = self.next_seq();
         let mut data = vec![tsn];
         data.extend(payload);
@@ -1184,7 +1191,7 @@ impl Hub {
             cluster: cluster_id | zdo::cluster::RESPONSE,
             tsn,
         };
-        self.request(key, nwk, ZDO_PROFILE, cluster_id, 0, 0, data, None)
+        self.request(key, nwk, ZDO_PROFILE, cluster_id, 0, 0, data, wait)
             .await
     }
 
@@ -1958,31 +1965,42 @@ impl Hub {
     }
 
     /// Asks the device to leave the network and deletes its records
-    pub async fn remove(self: &Arc<Self>, ieee: &str) -> Result<()> {
+    /// As in Zigbee2MQTT: a normal removal asks the device to leave and forgets it once
+    /// it confirms; `force` only forgets it (for a device that is gone or silent). A
+    /// sleepy device gets the request repeated for a while, so a button press that wakes
+    /// it lets it answer.
+    pub async fn remove(self: &Arc<Self>, ieee: &str, force: bool) -> Result<()> {
         let device = self.device(ieee).context("device not found")?;
-        let device_ieee = parse_eui64(ieee)?;
-        let leave = {
-            let hub = self.clone();
-            let ieee = ieee.to_owned();
-            async move {
-                match hub
-                    .zdo_request(device.nwk, zdo::cluster::MGMT_LEAVE_REQ, zdo::mgmt_leave_req(device_ieee.0))
-                    .await
-                {
-                    Ok(_) => info!("{ieee} left the network"),
-                    Err(e) => warn!("{ieee} did not answer the leave request: {e:#}"),
+        if !force {
+            let device_ieee = parse_eui64(ieee)?;
+            let (window, wait) = if device.rx_on_when_idle {
+                (Duration::ZERO, None)
+            } else {
+                (SLEEPY_REMOVE_WINDOW, Some(EAGER_WRITE_WAIT))
+            };
+            let started = Instant::now();
+            loop {
+                let answer = self
+                    .zdo_request_within(device.nwk, zdo::cluster::MGMT_LEAVE_REQ, zdo::mgmt_leave_req(device_ieee.0), wait)
+                    .await;
+                match answer {
+                    Ok(rsp) => {
+                        zdo::parse_status_rsp(&rsp)
+                            .map_err(|e| anyhow!("the device refused to leave ({e:#}); use force remove to delete it anyway"))?;
+                        break;
+                    }
+                    Err(e) if e.is::<NoReply>() && started.elapsed() < window => {}
+                    Err(e) if e.is::<NoReply>() => bail!(
+                        "the device did not confirm leaving. Wake it up (battery devices: press its button) and try \
+                         again, or use force remove"
+                    ),
+                    Err(e) => return Err(e),
                 }
             }
-        };
-        if device.rx_on_when_idle {
-            leave.await;
-        } else {
-            // A sleepy device may answer only at its next poll, or never: do not keep
-            // the user waiting for it
-            tokio::spawn(leave);
+            info!("{ieee} left the network");
         }
         self.forget(ieee);
-        info!("{ieee} removed");
+        info!("{ieee} removed{}", if force { " (forced)" } else { "" });
         Ok(())
     }
 
