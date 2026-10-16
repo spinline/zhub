@@ -1,4 +1,5 @@
 mod hub;
+mod hue_reset;
 mod profiles;
 mod radio;
 mod sniff;

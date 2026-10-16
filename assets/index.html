@@ -114,6 +114,17 @@
   <div id="sensors" class="grid"></div>
   <h2 id="otherTitle" hidden>Diğer</h2>
   <div id="other" class="grid"></div>
+  <h2>Araçlar</h2>
+  <div class="grid">
+    <div class="card">
+      <b>Hue lambayı seri numarasıyla sıfırla</b>
+      <div class="sub" style="white-space:normal">Lambanın üzerindeki 6 haneli numara (0-9, A-F). Birden fazlası için virgülle ayır. Lamba açık olmalı; sıfırlanınca kendiliğinden ağa katılır. İşlem ~20 sn sürer.</div>
+      <div class="setting" style="grid-template-columns:1fr auto">
+        <input id="hueSerials" placeholder="ör. A1B2C3" autocomplete="off">
+        <button id="hueReset">Sıfırla</button>
+      </div>
+    </div>
+  </div>
 </main>
 <div id="toast"></div>
 <script>
@@ -452,6 +463,16 @@ $("#permit").onclick = () => {
   run(api("/api/permit_join", { seconds: open ? 0 : 180 }).then(() => {
     if (!open) toast("Eşleştirme açık. Cihazı eşleştirme moduna al.");
   }));
+};
+
+$("#hueReset").onclick = () => {
+  const serials = $("#hueSerials").value.split(/[\s,]+/).filter(Boolean);
+  const button = $("#hueReset");
+  button.disabled = true;
+  button.textContent = "Gönderiliyor…";
+  run(api("/api/hue_reset", { serials })
+    .then(() => toast("Sıfırlama isteği gönderildi; lamba yanıp sönüp ağa katılmalı."))
+    .finally(() => { button.disabled = false; button.textContent = "Sıfırla"; }));
 };
 
 async function load() {

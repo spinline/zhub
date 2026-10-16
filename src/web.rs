@@ -25,6 +25,7 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .route("/api/state", get(state))
         .route("/api/events", get(events))
         .route("/api/permit_join", post(permit_join))
+        .route("/api/hue_reset", post(hue_reset))
         .route("/api/devices/{ieee}", axum::routing::delete(remove))
         .route("/api/devices/{ieee}/command", post(command))
         .route("/api/devices/{ieee}/rename", post(rename))
@@ -84,6 +85,16 @@ async fn events(
         SseEvent::default().json_data(event).ok().map(Ok)
     });
     Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(20)))
+}
+
+#[derive(Deserialize)]
+struct HueReset {
+    serials: Vec<String>,
+}
+
+async fn hue_reset(State(hub): State<Arc<Hub>>, Json(body): Json<HueReset>) -> ApiResult {
+    hub.hue_factory_reset(&body.serials).await?;
+    ok()
 }
 
 #[derive(Deserialize)]

@@ -20,6 +20,7 @@ use ziggurat_driver::zigbee_stack::{
 };
 use ziggurat_driver::ziggurat_ieee_802154::types::{Eui64, Nwk, PanId};
 use ziggurat_driver::ziggurat_zigbee::constants::WELL_KNOWN_LINK_KEY;
+use ziggurat_phy::{ExclusiveRadio, RadioPhy, TxFrame};
 use ziggurat_phy_spinel::SpinelPhy;
 use ziggurat_protocol as proto;
 
@@ -134,6 +135,8 @@ enum PendingKey {
 
 pub struct Hub {
     stack: Arc<ZigbeeStack<SpinelPhy>>,
+    /// Ham çerçeve ve kanal işleri için (Hue sıfırlama); normal trafik yığından geçer
+    phy: Arc<SpinelPhy>,
     ieee: Eui64,
     state_path: PathBuf,
     data: Mutex<Persisted>,
@@ -425,7 +428,7 @@ impl Hub {
 
         let ieee = parse_eui64(&network.ieee)?;
         let stack = ZigbeeStack::new(
-            phy,
+            phy.clone(),
             network_config(&network)?,
             Tunables::default(),
             TokioSpawner::default(),
@@ -467,6 +470,7 @@ impl Hub {
         let (events, _) = broadcast::channel(256);
         let hub = Arc::new(Self {
             stack,
+            phy,
             ieee,
             state_path: opts.state_path,
             data: Mutex::new(data),
@@ -1412,6 +1416,61 @@ impl Hub {
             profile.apply(d, &dp);
         });
         Ok(())
+    }
+
+    /// Hue lambalarını seri numarasıyla fabrika ayarına döndürür: önce eşleştirmeyi açar
+    /// (sıfırlanan lamba hemen katılabilsin), sonra her kanalda inter-PAN istek yayınlar
+    /// ve ağın kanalına döner. Bu sırada (~20 sn) ağ trafiği bekler.
+    pub async fn hue_factory_reset(self: &Arc<Self>, serials: &[String]) -> Result<()> {
+        if serials.is_empty() || serials.len() > 8 {
+            bail!("1-8 seri numarası girilmeli");
+        }
+        let numbers = serials
+            .iter()
+            .map(|s| crate::hue_reset::parse_serial(s))
+            .collect::<Result<Vec<_>>>()?;
+        let network = self.data.lock().unwrap().network.clone().context("ağ yok")?;
+        let extended_pan_id = parse_eui64(&network.extended_pan_id)?;
+
+        self.permit_join(MAX_PERMIT_SECONDS)?;
+        info!("Hue sıfırlama isteği: {serials:?}");
+
+        let radio = self.phy.lock().await;
+        let mut result = Ok(());
+        for (i, &channel) in crate::hue_reset::CHANNELS.iter().enumerate() {
+            if let Err(e) = radio.set_channel(channel).await {
+                result = Err(anyhow!("kanal {channel}'e geçilemedi: {e}"));
+                break;
+            }
+            let psdu = crate::hue_reset::reset_frame(
+                i as u8,
+                network.pan_id,
+                &self.ieee,
+                &extended_pan_id,
+                &numbers,
+            );
+            // Yayın onaylanmaz; kaçmasın diye her kanalda iki kez
+            for _ in 0..2 {
+                let frame = TxFrame {
+                    psdu: psdu.clone(),
+                    channel: None,
+                    csma_ca: true,
+                    max_frame_retries: 0,
+                    max_csma_backoffs: 4,
+                    security_processed: true,
+                };
+                if let Err(e) = radio.transmit(frame).await {
+                    warn!("Hue sıfırlama kanal {channel}: gönderilemedi: {e}");
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        }
+        // Ne olursa olsun ağın kanalına dön
+        let restore = radio.set_channel(network.channel).await;
+        drop(radio);
+        restore.map_err(|e| anyhow!("ağ kanalına ({}) dönülemedi: {e}", network.channel))?;
+        info!("Hue sıfırlama isteği bütün kanallarda gönderildi");
+        result
     }
 
     /// Şebekeli cihaz hemen, uyuyan cihaz bir sonraki uyanışında tanınır; dönüş
