@@ -24,14 +24,47 @@
     margin: 0; background: var(--bg); color: var(--text);
     font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   }
-  header {
-    position: sticky; top: 0; z-index: 2; background: var(--bg);
-    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
-    padding: 16px; border-bottom: 1px solid var(--line);
+  /* Zigbee2MQTT-like layout: menu on the left, a drawer on phones */
+  .layout { display: flex; min-height: 100vh; }
+  aside#sidebar {
+    position: sticky; top: 0; height: 100vh; width: 220px; flex: none; z-index: 20;
+    background: var(--card); border-right: 1px solid var(--line);
+    display: flex; flex-direction: column; gap: 14px; padding: 16px 12px;
   }
-  header h1 { font-size: 20px; margin: 0; flex: 1; }
+  aside .brand { font-size: 18px; font-weight: 700; padding: 0 8px; }
+  aside #permit { width: 100%; }
+  aside nav { display: flex; flex-direction: column; gap: 2px; }
+  aside nav a {
+    display: flex; align-items: center; gap: 10px; padding: 9px 10px; border-radius: 10px;
+    color: var(--muted); text-decoration: none;
+  }
+  aside nav a svg { width: 18px; height: 18px; flex: none; }
+  aside nav a:hover { background: var(--chip); }
+  aside nav a.active { background: var(--accent-soft); color: var(--text); font-weight: 600; }
+  aside .foot { margin-top: auto; padding: 0 8px; }
   #conn { font-size: 13px; color: var(--muted); }
   #conn.off { color: var(--warn); }
+  #scrim { display: none; }
+  .content { flex: 1; min-width: 0; }
+  .topbar {
+    position: sticky; top: 0; z-index: 5; background: var(--bg);
+    display: flex; align-items: center; gap: 10px; padding: 12px 16px; border-bottom: 1px solid var(--line);
+  }
+  .topbar h1 { font-size: 18px; margin: 0; flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #menuBtn { display: none; padding: 4px 10px; font-size: 18px; line-height: 1; }
+  #permitBadge { display: none; }
+  @media (max-width: 800px) {
+    aside#sidebar {
+      position: fixed; left: 0; top: 0; transform: translateX(-100%); transition: transform .2s;
+      box-shadow: 0 0 24px rgba(0, 0, 0, .35);
+    }
+    body.menu-open aside#sidebar { transform: none; }
+    body.menu-open #scrim { display: block; position: fixed; inset: 0; z-index: 19; background: rgba(0, 0, 0, .45); }
+    #menuBtn { display: block; }
+    /* while joining is open the drawer is closed: show it up here */
+    #permitBadge { display: block; padding: 5px 10px; font-size: 13px; }
+    .topbar { padding: 10px 12px; }
+  }
   button {
     font: inherit; border: 1px solid var(--line); background: var(--card); color: var(--text);
     border-radius: 10px; padding: 8px 14px; cursor: pointer;
@@ -115,27 +148,14 @@
   .cluster-list { font-size: 13px; }
   .cluster-list code { background: var(--chip); border-radius: 6px; padding: 1px 6px; margin: 2px; display: inline-block; }
 
-  header h1 { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
-  @media (max-width: 520px) {
-    header { gap: 8px; padding: 12px; }
-    header h1 { font-size: 16px; }
-    /* only a lost connection is worth the room */
-    #conn:not(.off) { display: none; }
-    header #permit { padding: 7px 10px; }
-    .wide-only { display: none; }
-    nav.pages { gap: 0; }
-    nav.pages button { padding: 6px 7px; }
-  }
-  nav.pages { display: flex; gap: 4px; }
-  nav.pages button { border: 0; background: none; color: var(--muted); padding: 6px 10px; }
-  nav.pages button.active { color: var(--text); background: var(--chip); }
   .settings { display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); align-items: start; }
   .settings .card h3 { margin: 0; font-size: 15px; }
   .settings .wide { grid-column: 1 / -1; }
   .log-tools { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; font-size: 13px; color: var(--muted); }
   pre.log {
     margin: 0; background: var(--bg); border: 1px solid var(--line); border-radius: 10px; padding: 10px;
-    font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; max-height: 420px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere;
+    font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; height: calc(100vh - 210px); min-height: 240px;
+    overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere;
   }
   pre.log .warn { color: var(--warn); }
 
@@ -148,12 +168,24 @@
 </style>
 </head>
 <body>
-<header>
-  <h1><span class="wide-only">Zigbee </span>Hub</h1>
-  <nav class="pages"><button data-page="devices">Devices</button><button data-page="settings">Settings</button></nav>
-  <span id="conn">connecting…</span>
+<div class="layout">
+<aside id="sidebar">
+  <div class="brand">Zigbee Hub</div>
   <button id="permit" class="primary">Permit join</button>
-</header>
+  <nav id="menu">
+    <a href="#devices" data-page="devices"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>Devices</a>
+    <a href="#settings" data-page="settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>Settings</a>
+    <a href="#logs" data-page="logs"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M14 3v6h6"/><path d="M8 13h8M8 17h6"/></svg>Logs</a>
+  </nav>
+  <div class="foot"><span id="conn">connecting…</span></div>
+</aside>
+<div id="scrim"></div>
+<div class="content">
+<div class="topbar">
+  <button id="menuBtn" aria-label="Menu">☰</button>
+  <h1 id="pageTitle">Devices</h1>
+  <button id="permitBadge" class="primary" hidden></button>
+</div>
 <main id="pageDevices">
   <h2 id="climateTitle" hidden>Climate</h2>
   <div id="climate" class="grid"></div>
@@ -187,17 +219,20 @@
         </div>
       </div>
     </div>
-    <div class="card wide">
-      <h3>Logs</h3>
-      <div class="log-tools">
-        <label>Level <select id="logLevel"></select></label>
-        <label><input type="checkbox" id="logPause"> Pause</label>
-        <span id="logNote"></span>
-      </div>
-      <pre class="log" id="log"></pre>
-    </div>
   </div>
 </main>
+<main id="pageLogs" hidden>
+  <div class="card">
+    <div class="log-tools">
+      <label>Level <select id="logLevel"></select></label>
+      <label><input type="checkbox" id="logPause"> Pause</label>
+      <span id="logNote"></span>
+    </div>
+    <pre class="log" id="log"></pre>
+  </div>
+</main>
+</div>
+</div>
 
 <dialog id="detail">
   <div class="dlg-head">
@@ -790,16 +825,21 @@ function render() {
 }
 
 function renderPermit() {
-  const button = $("#permit");
+  const button = $("#permit"), badge = $("#permitBadge");
   const left = Math.max(0, Math.round((permitUntil - Date.now()) / 1000));
+  const clock = `${Math.floor(left / 60)}:${String(left % 60).padStart(2, "0")}`;
   if (left > 0) {
-    button.textContent = `Joining open · ${Math.floor(left / 60)}:${String(left % 60).padStart(2, "0")} (stop)`;
+    button.textContent = `Joining open · ${clock} (stop)`;
     button.classList.remove("primary");
   } else {
     button.textContent = "Permit join";
     button.classList.add("primary");
   }
+  badge.hidden = left === 0;
+  badge.textContent = `Joining ${clock} ✕`;
 }
+
+$("#permitBadge").onclick = () => $("#permit").onclick();
 
 $("#permit").onclick = () => {
   const open = permitUntil > Date.now();
@@ -822,18 +862,24 @@ $("#hueReset").onclick = () => {
 
 let page = "devices";
 
+const PAGES = { devices: "Devices", settings: "Settings", logs: "Logs" };
+
 function showPage() {
-  page = location.hash === "#settings" ? "settings" : "devices";
+  const wanted = location.hash.slice(1);
+  page = PAGES[wanted] ? wanted : "devices";
   $("#pageDevices").hidden = page !== "devices";
   $("#pageSettings").hidden = page !== "settings";
-  for (const b of document.querySelectorAll("nav.pages button")) b.classList.toggle("active", b.dataset.page === page);
-  if (page === "settings") { run(loadSettings()); pollLogs(); }
+  $("#pageLogs").hidden = page !== "logs";
+  $("#pageTitle").textContent = PAGES[page];
+  for (const a of document.querySelectorAll("#menu a")) a.classList.toggle("active", a.dataset.page === page);
+  document.body.classList.remove("menu-open");
+  if (page !== "devices") run(loadSettings());
+  pollLogs();
 }
 
-for (const b of document.querySelectorAll("nav.pages button")) {
-  b.onclick = () => { location.hash = b.dataset.page === "settings" ? "#settings" : ""; };
-}
 window.addEventListener("hashchange", showPage);
+$("#menuBtn").onclick = () => document.body.classList.toggle("menu-open");
+$("#scrim").onclick = () => document.body.classList.remove("menu-open");
 
 const LOG_LEVELS = [
   ["info,ziggurat_driver=warn", "Info (recommended)"],
@@ -935,7 +981,7 @@ async function fetchLogs() {
 
 function pollLogs() {
   clearTimeout(logTimer);
-  if (page !== "settings") return;
+  if (page !== "logs") return;
   const next = () => { logTimer = setTimeout(pollLogs, 2000); };
   if ($("#logPause").checked) { next(); return; }
   fetchLogs().then(() => { $("#logNote").textContent = ""; }, () => { $("#logNote").textContent = "not reachable"; }).finally(next);
@@ -949,7 +995,7 @@ async function load() {
   permitUntil = Date.now() + state.permit_join * 1000;
   if (state.settings) hubSettings = state.settings;
   render();
-  if (page === "settings") run(loadSettings());
+  if (page !== "devices") run(loadSettings());
   renderPermit();
 }
 
