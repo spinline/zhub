@@ -16,7 +16,7 @@ use serde::Serialize;
 use serde_json::{Value as Json, json};
 
 use crate::store::Device;
-use crate::zcl::cluster;
+use crate::zcl::{self, cluster};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -202,6 +202,57 @@ impl Command {
     }
 }
 
+/// Commands a device sends, such as button presses, decoded to an action name
+/// (Zigbee2MQTT's `action`)
+#[derive(Debug, Clone, Copy)]
+pub enum Action {
+    /// Signify's Hue notification (0xFC00 command 0x00): button id → name, then
+    /// press / hold / press_release / hold_release
+    HueButtons(&'static [(u8, &'static str)]),
+    /// On/Off Toggle → "toggle"
+    Toggle,
+    /// Level Move (with On/Off) → brightness_move_up/down; Stop → brightness_stop
+    BrightnessMove,
+}
+
+const HUE_NOTIFICATION_CLUSTER: u16 = 0xFC00;
+
+impl Action {
+    pub fn decode(&self, cluster_id: u16, header: &zcl::Header, payload: &[u8]) -> Option<String> {
+        match *self {
+            Self::HueButtons(buttons) => {
+                if cluster_id != HUE_NOTIFICATION_CLUSTER || header.command != 0x00 {
+                    return None;
+                }
+                // button (u8), unknown (u24), type (u8), …
+                let button = buttons.iter().find(|(id, _)| Some(id) == payload.first())?.1;
+                let kind = match payload.get(4)? {
+                    0 => "press",
+                    1 => "hold",
+                    2 => "press_release",
+                    3 => "hold_release",
+                    _ => return None,
+                };
+                Some(format!("{button}_{kind}"))
+            }
+            Self::Toggle => (cluster_id == cluster::ON_OFF && header.command == 0x02).then(|| "toggle".to_owned()),
+            Self::BrightnessMove => {
+                if cluster_id != cluster::LEVEL {
+                    return None;
+                }
+                match header.command {
+                    0x01 | 0x05 => {
+                        let direction = if *payload.first()? == 1 { "down" } else { "up" };
+                        Some(format!("brightness_move_{direction}"))
+                    }
+                    0x03 | 0x07 => Some("brightness_stop".to_owned()),
+                    _ => None,
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum Source {
     Attr {
@@ -211,6 +262,8 @@ pub enum Source {
         conv: Conv,
         write: Write,
         report: Option<Report>,
+        /// Manufacturer-specific attributes are read and written with this code
+        manufacturer: Option<u16>,
     },
     Tuya {
         dp: u8,
@@ -220,6 +273,8 @@ pub enum Source {
     /// Tuya's raw weekly schedule (4-byte slots)
     TuyaSchedule { dp: u8, divisor: f64 },
     Command(Command),
+    /// Commands the device sends; the last one is kept as the feature's value
+    Actions(&'static [Action]),
 }
 
 impl Source {
@@ -229,6 +284,7 @@ impl Source {
             Self::Tuya { conv, .. } => matches!(conv, Conv::Number { .. } | Conv::Bool { .. } | Conv::Enum(_)),
             Self::TuyaSchedule { .. } => true,
             Self::Command(_) => return Access::Write,
+            Self::Actions(_) => false,
         };
         if writable { Access::ReadWrite } else { Access::Read }
     }
@@ -236,7 +292,7 @@ impl Source {
     const fn conv(&self) -> Option<Conv> {
         match *self {
             Self::Attr { conv, .. } | Self::Tuya { conv, .. } => Some(conv),
-            Self::TuyaSchedule { .. } | Self::Command(_) => None,
+            Self::TuyaSchedule { .. } | Self::Command(_) | Self::Actions(_) => None,
         }
     }
 }
@@ -441,7 +497,9 @@ pub struct DefinitionInfo {
 }
 
 const DEFINITIONS: &[&Definition] = &[
+    &philips::LTA005,
     &philips::LTA009,
+    &philips::RDM001,
     &sonoff::SNZB_02D,
     &sonoff::SNZB_02P,
     &sonoff::TRVZB,
@@ -491,7 +549,8 @@ pub fn time_base(device: &Device) -> TimeBase {
     definition(device).map_or(TimeBase::Zigbee2000, |def| def.time_base)
 }
 
-/// Extra clusters to bind (reported clusters are derived from the features)
+/// Extra clusters to bind, input or output (reported clusters are derived from the
+/// features)
 pub fn extra_binds(device: &Device) -> &'static [u16] {
     definition(device).map_or(&[], |def| def.binds)
 }
@@ -556,6 +615,26 @@ mod tests {
         let device = Device::new("00:00:00:00:00:00:00:01".into(), 1);
         let temperature = &common::TEMPERATURE;
         assert!(temperature.validate(&device, json!(20)).is_err());
+    }
+
+    fn header(command: u8) -> zcl::Header {
+        zcl::Header::parse(&[0x01, 0x10, command]).unwrap().0
+    }
+
+    #[test]
+    fn actions_decode_like_zigbee2mqtt() {
+        let hue = Action::HueButtons(&[(1, "left"), (2, "right")]);
+        // Observed Hue notification layout: button, 3 unknown bytes, type, …
+        let payload = [0x02, 0x00, 0x00, 0x30, 0x02, 0x21, 0x01, 0x00];
+        assert_eq!(hue.decode(0xFC00, &header(0x00), &payload).as_deref(), Some("right_press_release"));
+        assert_eq!(hue.decode(0xFC00, &header(0x00), &[0x03, 0, 0, 0, 0]), None);
+        assert_eq!(hue.decode(cluster::ON_OFF, &header(0x00), &payload), None);
+        assert_eq!(Action::Toggle.decode(cluster::ON_OFF, &header(0x02), &[]).as_deref(), Some("toggle"));
+        assert_eq!(Action::Toggle.decode(cluster::ON_OFF, &header(0x01), &[]), None);
+        let mv = Action::BrightnessMove;
+        assert_eq!(mv.decode(cluster::LEVEL, &header(0x05), &[0x01, 0x40]).as_deref(), Some("brightness_move_down"));
+        assert_eq!(mv.decode(cluster::LEVEL, &header(0x01), &[0x00, 0x40]).as_deref(), Some("brightness_move_up"));
+        assert_eq!(mv.decode(cluster::LEVEL, &header(0x07), &[]).as_deref(), Some("brightness_stop"));
     }
 
     /// Every feature of every definition should explain itself in the UI

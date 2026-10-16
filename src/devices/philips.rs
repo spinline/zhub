@@ -4,10 +4,16 @@
 use anyhow::{Result, bail};
 
 use super::common::{self, level_config};
-use super::{Card, Command, CommandFrame, Definition, Feature, Fingerprint, Kind, Place, Preset, Source, TimeBase};
+use super::{
+    Action, Card, Command, CommandFrame, Conv, Definition, Feature, Fingerprint, Kind, Place, Preset, Source, TimeBase,
+    Write,
+};
+use crate::zcl::{cluster, types};
 
 /// Signify's manufacturer-specific cluster carrying Hue effects
 const HUE_EFFECT_CLUSTER: u16 = 0xFC03;
+/// Signify's cluster the Hue switches send their button notifications on
+const HUE_NOTIFICATION_CLUSTER: u16 = 0xFC00;
 const SIGNIFY: u16 = 0x100B;
 
 /// ZCL Trigger Effect identifiers
@@ -105,48 +111,77 @@ const EFFECT: Feature = Feature::new(
 )
 .describe("Triggers an effect on the light (e.g. make light blink for a few seconds)");
 
-// ---- LTA009: Hue white ambiance E27 1100lm with Bluetooth ----
+// ---- White ambiance lights ----
 
-const COLOR_TEMP_PRESETS: &[Preset] = &[
-    Preset {
-        name: "coolest",
-        raw: 153,
-        description: "Coolest temperature supported",
-    },
-    Preset {
-        name: "cool",
-        raw: 250,
-        description: "Cool temperature (250 mireds / 4000 Kelvin)",
-    },
-    Preset {
-        name: "neutral",
-        raw: 370,
-        description: "Neutral temperature (370 mireds / 2700 Kelvin)",
-    },
-    Preset {
-        name: "warm",
-        raw: 454,
-        description: "Warm temperature (454 mireds / 2200 Kelvin)",
-    },
-    Preset {
-        name: "warmest",
-        raw: 454,
-        description: "Warmest temperature supported",
-    },
-];
+/// Zigbee2MQTT's color temperature presets for a range; for these lights all five fall
+/// inside it
+const fn color_temp_presets(coolest: i64, warmest: i64) -> [Preset; 5] {
+    [
+        Preset {
+            name: "coolest",
+            raw: coolest,
+            description: "Coolest temperature supported",
+        },
+        Preset {
+            name: "cool",
+            raw: 250,
+            description: "Cool temperature (250 mireds / 4000 Kelvin)",
+        },
+        Preset {
+            name: "neutral",
+            raw: 370,
+            description: "Neutral temperature (370 mireds / 2700 Kelvin)",
+        },
+        Preset {
+            name: "warm",
+            raw: 454,
+            description: "Warm temperature (454 mireds / 2200 Kelvin)",
+        },
+        Preset {
+            name: "warmest",
+            raw: warmest,
+            description: "Warmest temperature supported",
+        },
+    ]
+}
 
-const COLOR_TEMP_STARTUP_PRESETS: &[Preset] = &[
-    COLOR_TEMP_PRESETS[0],
-    COLOR_TEMP_PRESETS[1],
-    COLOR_TEMP_PRESETS[2],
-    COLOR_TEMP_PRESETS[3],
-    COLOR_TEMP_PRESETS[4],
-    Preset {
-        name: "previous",
-        raw: 0xFFFF,
-        description: "Restore previous color_temp on cold power on",
-    },
-];
+const fn startup_presets(presets: [Preset; 5]) -> [Preset; 6] {
+    [
+        presets[0],
+        presets[1],
+        presets[2],
+        presets[3],
+        presets[4],
+        Preset {
+            name: "previous",
+            raw: 0xFFFF,
+            description: "Restore previous color_temp on cold power on",
+        },
+    ]
+}
+
+/// `philips.m.light({colorTemp: {range}})` + `m.identify()`
+const fn white_ambiance(min: f64, max: f64, presets: &'static [Preset], startup: &'static [Preset]) -> [Feature; 11] {
+    [
+        common::ON_OFF,
+        common::brightness(2.0),
+        common::color_temp(min, max, presets),
+        common::COLOR_TEMP_MIN,
+        common::COLOR_TEMP_MAX,
+        common::color_temp_startup(min, max, startup),
+        common::POWER_ON_BEHAVIOR,
+        // Not exposed by Zigbee2MQTT for these models, but the lights report them (the
+        // transition times and on_level they do not support)
+        level_config::CURRENT_LEVEL_STARTUP,
+        level_config::EXECUTE_IF_OFF,
+        EFFECT,
+        common::IDENTIFY,
+    ]
+}
+
+static LTA009_PRESETS: [Preset; 5] = color_temp_presets(153, 454);
+static LTA009_STARTUP: [Preset; 6] = startup_presets(color_temp_presets(153, 454));
+static LTA009_FEATURES: [Feature; 11] = white_ambiance(153.0, 454.0, &LTA009_PRESETS, &LTA009_STARTUP);
 
 pub static LTA009: Definition = Definition {
     fingerprint: &[Fingerprint::Model("LTA009")],
@@ -154,22 +189,93 @@ pub static LTA009: Definition = Definition {
     description: "Hue white ambiance E27 1100lm with Bluetooth",
     name: None,
     card: Card::Light,
-    features: &[
-        common::ON_OFF,
-        common::brightness(2.0),
-        common::color_temp(153.0, 454.0, COLOR_TEMP_PRESETS),
-        common::COLOR_TEMP_MIN,
-        common::COLOR_TEMP_MAX,
-        common::color_temp_startup(153.0, 454.0, COLOR_TEMP_STARTUP_PRESETS),
-        common::POWER_ON_BEHAVIOR,
-        // Not exposed by Zigbee2MQTT for this model, but the light reports them (the
-        // transition times and on_level it does not support)
-        level_config::CURRENT_LEVEL_STARTUP,
-        level_config::EXECUTE_IF_OFF,
-        EFFECT,
-        common::IDENTIFY,
-    ],
+    features: &LTA009_FEATURES,
     binds: &[],
+    time_base: TimeBase::Zigbee2000,
+    tuya_time_since_2000: false,
+};
+
+static LTA005_PRESETS: [Preset; 5] = color_temp_presets(222, 454);
+static LTA005_STARTUP: [Preset; 6] = startup_presets(color_temp_presets(222, 454));
+static LTA005_FEATURES: [Feature; 11] = white_ambiance(222.0, 454.0, &LTA005_PRESETS, &LTA005_STARTUP);
+
+pub static LTA005: Definition = Definition {
+    fingerprint: &[Fingerprint::Model("LTA005")],
+    vendor: "Philips",
+    description: "Hue White Ambiance E27 filament screw globe",
+    name: None,
+    card: Card::Light,
+    features: &LTA005_FEATURES,
+    binds: &[],
+    time_base: TimeBase::Zigbee2000,
+    tuya_time_since_2000: false,
+};
+
+// ---- RDM001: Hue wall switch module ----
+
+/// Signify's basic cluster attribute: how the connected switches are wired
+const DEVICE_MODE: Feature = Feature::new(
+    "device_mode",
+    "Device mode",
+    Kind::Enum {
+        values: &["single_rocker", "single_push_button", "dual_rocker", "dual_push_button"],
+    },
+    Place::Config,
+    Source::Attr {
+        cluster: cluster::BASIC,
+        attr: 0x0034,
+        ty: types::ENUM8,
+        conv: Conv::Enum(&[
+            (0, "single_rocker"),
+            (1, "single_push_button"),
+            (2, "dual_rocker"),
+            (3, "dual_push_button"),
+        ]),
+        write: Write::Attribute,
+        report: None,
+        manufacturer: Some(SIGNIFY),
+    },
+)
+// Zigbee2MQTT has no description for this one
+.describe("The switches connected to the module: one or two, rockers or push buttons");
+
+pub static RDM001: Definition = Definition {
+    fingerprint: &[
+        Fingerprint::Model("RDM001"),
+        Fingerprint::Model("9290030171"),
+        Fingerprint::Model("RDM004"),
+    ],
+    vendor: "Philips",
+    description: "Hue wall switch module",
+    name: None,
+    card: Card::Sensor,
+    features: &[
+        common::BATTERY,
+        common::action(
+            &[
+                "left_press",
+                "left_press_release",
+                "right_press",
+                "right_press_release",
+                "left_hold",
+                "left_hold_release",
+                "right_hold",
+                "right_hold_release",
+                "toggle",
+                "brightness_move_up",
+                "brightness_move_down",
+                "brightness_stop",
+            ],
+            &[
+                Action::HueButtons(&[(1, "left"), (2, "right")]),
+                Action::Toggle,
+                Action::BrightnessMove,
+            ],
+        ),
+        DEVICE_MODE,
+    ],
+    // As Zigbee2MQTT: the switch's On/Off commands and Hue notifications come to the hub
+    binds: &[cluster::ON_OFF, HUE_NOTIFICATION_CLUSTER],
     time_base: TimeBase::Zigbee2000,
     tuya_time_since_2000: false,
 };
@@ -251,6 +357,28 @@ mod tests {
         assert_eq!(off.encode(&off.validate(&device, json!(2.5)).unwrap()).unwrap(), 25);
         assert_eq!(off.encode(&json!("disabled")).unwrap(), 0xFFFF);
         assert!(off.validate(&device, json!(6553.5)).is_err());
+    }
+
+    #[test]
+    fn filament_globe_has_its_own_range() {
+        let mut device = lamp();
+        device.model = Some("LTA005".into());
+        assert!(std::ptr::eq(definition(&device).unwrap(), &LTA005));
+        let ct = features(&device).into_iter().find(|f| f.key == "color_temp").unwrap();
+        assert_eq!(ct.validate(&device, json!("coolest")).unwrap(), json!(222.0));
+        assert!(ct.validate(&device, json!(153)).is_err());
+    }
+
+    #[test]
+    fn wall_switch_mode_is_manufacturer_specific() {
+        let mut device = lamp();
+        device.model = Some("RDM001".into());
+        let mode = features(&device).into_iter().find(|f| f.key == "device_mode").unwrap();
+        let Source::Attr { manufacturer, .. } = mode.source else { panic!() };
+        assert_eq!(manufacturer, Some(SIGNIFY));
+        assert_eq!(mode.encode(&json!("dual_rocker")).unwrap(), 2);
+        let action = features(&device).into_iter().find(|f| f.key == "action").unwrap();
+        assert_eq!(action.access, Access::Read);
     }
 
     #[test]

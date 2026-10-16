@@ -15,6 +15,7 @@ const fn fc11(attr: u16, ty: u8, conv: Conv, write: Write) -> Source {
         conv,
         write,
         report: None,
+        manufacturer: None,
     }
 }
 

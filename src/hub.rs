@@ -119,6 +119,8 @@ pub struct Hub {
     wake_interviews: Mutex<HashSet<String>>,
     /// Devices being written to right now: one write at a time per device
     writing: Mutex<HashSet<String>>,
+    /// The last action frame per device (cluster, ZCL sequence), to drop repeats
+    last_action_seq: Mutex<HashMap<String, (u16, u8)>>,
 }
 
 fn now_unix() -> u64 {
@@ -214,7 +216,7 @@ fn apply_default_names(data: &mut Persisted) {
 }
 
 /// Applies ZCL attribute records to the device state through its definition's features
-fn apply_zcl_records(device: &mut Device, cluster_id: u16, records: &[zcl::AttributeRecord]) {
+fn apply_zcl_records(device: &mut Device, cluster_id: u16, manufacturer: Option<u16>, records: &[zcl::AttributeRecord]) {
     if cluster_id == cluster::BASIC {
         for record in records {
             let text = record.value.as_ref().and_then(Value::as_str).filter(|s| !s.is_empty());
@@ -228,10 +230,18 @@ fn apply_zcl_records(device: &mut Device, cluster_id: u16, records: &[zcl::Attri
     }
     // If the model was just learned the definition may have changed: fetch features now
     for feature in devices::features(device) {
-        let Source::Attr { cluster, attr, conv, .. } = feature.source else {
+        let Source::Attr {
+            cluster,
+            attr,
+            conv,
+            manufacturer: code,
+            ..
+        } = feature.source
+        else {
             continue;
         };
-        if cluster != cluster_id {
+        // A manufacturer-specific attribute id only means that attribute with the code
+        if cluster != cluster_id || code.is_some_and(|code| manufacturer != Some(code)) {
             continue;
         }
         for record in records.iter().filter(|r| r.id == attr) {
@@ -263,7 +273,7 @@ fn apply_tuya_datapoints<'a>(device: &mut Device, datapoints: &'a [tuya::Datapoi
                     None => conv.decode_text(&String::from_utf8_lossy(&dp.data)),
                 },
                 Source::TuyaSchedule { divisor, .. } => Some(tuya::decode_schedule(&dp.data, divisor)),
-                Source::Attr { .. } | Source::Command(_) => None,
+                Source::Attr { .. } | Source::Command(_) | Source::Actions(_) => None,
             };
             if let Some(value) = value {
                 device.state.insert(feature.key.to_owned(), value);
@@ -414,6 +424,7 @@ impl Hub {
             pending_writes: Mutex::new(HashMap::new()),
             wake_interviews: Mutex::new(HashSet::new()),
             writing: Mutex::new(HashSet::new()),
+            last_action_seq: Mutex::new(HashMap::new()),
         });
 
         tokio::spawn(hub.clone().notification_loop());
@@ -725,13 +736,13 @@ impl Hub {
                 }
                 zcl::cmd::REPORT_ATTRIBUTES => {
                     if let Some(ieee) = &ieee {
-                        self.apply_records(ieee, cluster_id, &zcl::parse_report(payload));
+                        self.apply_records(ieee, cluster_id, header.manufacturer, &zcl::parse_report(payload));
                     }
                     self.default_response(source, src_ep, cluster_id, &header);
                 }
                 zcl::cmd::READ_ATTRIBUTES_RSP => {
                     if let Some(ieee) = &ieee {
-                        self.apply_records(ieee, cluster_id, &zcl::parse_read_response(payload));
+                        self.apply_records(ieee, cluster_id, header.manufacturer, &zcl::parse_read_response(payload));
                     }
                 }
                 _ => {}
@@ -757,7 +768,7 @@ impl Hub {
                             status: zcl::STATUS_SUCCESS,
                             value: Some(Value::Uint(u64::from(status))),
                         };
-                        self.apply_records(ieee, cluster::IAS_ZONE, &[record]);
+                        self.apply_records(ieee, cluster::IAS_ZONE, None, &[record]);
                     }
                     self.default_response(source, src_ep, cluster_id, &header);
                 }
@@ -800,10 +811,45 @@ impl Hub {
             return;
         }
 
+        if let Some(ieee) = &ieee
+            && self.handle_action(ieee, cluster_id, &header, payload)
+        {
+            self.default_response(source, src_ep, cluster_id, &header);
+            return;
+        }
+
         debug!(
             "Unhandled ZCL command: nwk 0x{source:04x} cluster 0x{cluster_id:04x} command 0x{:02x}",
             header.command
         );
+    }
+
+    /// A command the device sent (a button press): becomes the value of its action
+    /// feature. Returns whether a definition knew the command.
+    fn handle_action(&self, ieee: &str, cluster_id: u16, header: &zcl::Header, payload: &[u8]) -> bool {
+        let Some(device) = self.device(ieee) else {
+            return false;
+        };
+        let decoded = devices::features(&device).into_iter().find_map(|feature| match feature.source {
+            Source::Actions(actions) => actions
+                .iter()
+                .find_map(|action| action.decode(cluster_id, header, payload))
+                .map(|name| (feature.key, name)),
+            _ => None,
+        });
+        let Some((key, name)) = decoded else {
+            return false;
+        };
+        // The same frame can arrive twice (e.g. a retry); as Zigbee2MQTT, act once
+        let repeat = self.last_action_seq.lock().unwrap().insert(ieee.to_owned(), (cluster_id, header.seq))
+            == Some((cluster_id, header.seq));
+        if !repeat {
+            info!("{ieee} {key} = {name}");
+            self.update_device(ieee, |d| {
+                d.state.insert(key.to_owned(), json!(name));
+            });
+        }
+        true
     }
 
     fn answer_time_read(&self, nwk: u16, src_ep: u8, dst_ep: u8, header: &zcl::Header, payload: &[u8], ieee: Option<&str>) {
@@ -871,8 +917,8 @@ impl Hub {
         }
     }
 
-    fn apply_records(&self, ieee: &str, cluster_id: u16, records: &[zcl::AttributeRecord]) {
-        self.update_device(ieee, |device| apply_zcl_records(device, cluster_id, records));
+    fn apply_records(&self, ieee: &str, cluster_id: u16, manufacturer: Option<u16>, records: &[zcl::AttributeRecord]) {
+        self.update_device(ieee, |device| apply_zcl_records(device, cluster_id, manufacturer, records));
     }
 
     fn default_response(&self, nwk: u16, ep: u8, cluster_id: u16, header: &zcl::Header) {
@@ -1025,14 +1071,16 @@ impl Hub {
         nwk: u16,
         ep: u8,
         cluster_id: u16,
+        manufacturer: Option<u16>,
         ids: &[u16],
     ) -> Result<Vec<zcl::AttributeRecord>> {
         let (header, body) = self
-            .zcl_request(
+            .zcl_request_with(
                 nwk,
                 ep,
                 cluster_id,
                 0x00,
+                manufacturer,
                 zcl::cmd::READ_ATTRIBUTES,
                 &zcl::read_attributes_payload(ids),
             )
@@ -1126,7 +1174,7 @@ impl Hub {
             // Tuya devices do not send data until these are read in a single request;
             // harmless for other devices
             if let Err(e) = self
-                .read_attributes(nwk, ep, cluster::BASIC, &[0x0004, 0x0000, 0x0001, 0x0005, 0x0007, 0xFFFE, 0x4000])
+                .read_attributes(nwk, ep, cluster::BASIC, None, &[0x0004, 0x0000, 0x0001, 0x0005, 0x0007, 0xFFFE, 0x4000])
                 .await
             {
                 warn!("{ieee} cannot read basic info: {e:#}");
@@ -1171,18 +1219,27 @@ impl Hub {
         let nwk = device.nwk;
         let features = devices::features(&device);
 
-        let mut reports: BTreeMap<u16, Vec<ReportConfig>> = BTreeMap::new();
-        let mut reads: BTreeMap<u16, Vec<u16>> = BTreeMap::new();
+        // Manufacturer-specific attributes go in requests of their own
+        let mut reports: BTreeMap<(u16, Option<u16>), Vec<ReportConfig>> = BTreeMap::new();
+        let mut reads: BTreeMap<(u16, Option<u16>), Vec<u16>> = BTreeMap::new();
         for feature in &features {
-            let Source::Attr { cluster, attr, ty, report, .. } = feature.source else {
+            let Source::Attr {
+                cluster,
+                attr,
+                ty,
+                report,
+                manufacturer,
+                ..
+            } = feature.source
+            else {
                 continue;
             };
-            let attrs = reads.entry(cluster).or_default();
+            let attrs = reads.entry((cluster, manufacturer)).or_default();
             if !attrs.contains(&attr) {
                 attrs.push(attr);
             }
             if let Some(report) = report {
-                reports.entry(cluster).or_default().push(ReportConfig {
+                reports.entry((cluster, manufacturer)).or_default().push(ReportConfig {
                     attribute: attr,
                     ty,
                     min_interval: report.min,
@@ -1192,17 +1249,21 @@ impl Hub {
             }
         }
 
-        for (&cluster_id, configs) in &reports {
+        let mut bound = HashSet::new();
+        for (&(cluster_id, manufacturer), configs) in &reports {
             let Some(ep) = device.endpoint_with(cluster_id) else {
                 continue;
             };
-            self.bind(ieee, nwk, device_ieee, ep, cluster_id).await;
+            if bound.insert(cluster_id) {
+                self.bind(ieee, nwk, device_ieee, ep, cluster_id).await;
+            }
             match self
-                .zcl_request(
+                .zcl_request_with(
                     nwk,
                     ep,
                     cluster_id,
                     0x00,
+                    manufacturer,
                     zcl::cmd::CONFIGURE_REPORTING,
                     &zcl::configure_reporting_payload(configs),
                 )
@@ -1219,7 +1280,7 @@ impl Hub {
         }
 
         for &cluster_id in devices::extra_binds(&device) {
-            if let Some(ep) = device.endpoint_with(cluster_id) {
+            if let Some(ep) = device.endpoint_with_any(cluster_id) {
                 self.bind(ieee, nwk, device_ieee, ep, cluster_id).await;
             }
         }
@@ -1229,12 +1290,12 @@ impl Hub {
             self.enroll(ieee, nwk, ep).await;
         }
 
-        for (cluster_id, attrs) in reads {
+        for ((cluster_id, manufacturer), attrs) in reads {
             let Some(ep) = device.endpoint_with(cluster_id) else {
                 continue;
             };
             for chunk in attrs.chunks(READ_CHUNK) {
-                if let Err(e) = self.read_attributes(nwk, ep, cluster_id, chunk).await {
+                if let Err(e) = self.read_attributes(nwk, ep, cluster_id, manufacturer, chunk).await {
                     debug!("{ieee} cluster 0x{cluster_id:04x} {chunk:04x?} not read: {e:#}");
                 }
             }
@@ -1317,6 +1378,8 @@ impl Hub {
                 self.light_command(&device, feature, cluster, write, &value).await?;
                 Ok(false)
             }
+            // Validation already refuses these
+            Source::Actions(_) => bail!("{} is read-only", feature.label),
             Source::Command(command) => {
                 for frame in command.frames(&value)? {
                     self.cluster_command(&device, frame).await?;
@@ -1431,7 +1494,14 @@ impl Hub {
     }
 
     async fn write_attribute(&self, device: &Device, feature: &Feature, value: &Json) -> Result<()> {
-        let Source::Attr { cluster, attr, ty, .. } = feature.source else {
+        let Source::Attr {
+            cluster,
+            attr,
+            ty,
+            manufacturer,
+            ..
+        } = feature.source
+        else {
             bail!("not an attribute");
         };
         let raw = feature.encode(value)?;
@@ -1439,7 +1509,7 @@ impl Hub {
         let ep = device.endpoint_with(cluster).context("the device lacks the attribute's cluster")?;
         let payload = zcl::write_attribute_payload(attr, ty, &bytes);
         let (header, body) = self
-            .zcl_request(device.nwk, ep, cluster, 0x00, zcl::cmd::WRITE_ATTRIBUTES, &payload)
+            .zcl_request_with(device.nwk, ep, cluster, 0x00, manufacturer, zcl::cmd::WRITE_ATTRIBUTES, &payload)
             .await?;
         if header.command != zcl::cmd::WRITE_ATTRIBUTES_RSP || !zcl::all_success(&body) {
             bail!("the device rejected the value ({body:02x?})");
@@ -1793,10 +1863,10 @@ mod tests {
     #[test]
     fn applies_standard_sensor_attributes() {
         let mut device = device_with(&[0x0001, 0x0402, 0x0405, 0x0500]);
-        apply_zcl_records(&mut device, cluster::TEMPERATURE, &[record(0, Value::Int(2153))]);
-        apply_zcl_records(&mut device, cluster::HUMIDITY, &[record(0, Value::Uint(4512))]);
-        apply_zcl_records(&mut device, cluster::POWER_CONFIG, &[record(0x0021, Value::Uint(200))]);
-        apply_zcl_records(&mut device, cluster::IAS_ZONE, &[record(0x0002, Value::Uint(0x0009))]);
+        apply_zcl_records(&mut device, cluster::TEMPERATURE, None, &[record(0, Value::Int(2153))]);
+        apply_zcl_records(&mut device, cluster::HUMIDITY, None, &[record(0, Value::Uint(4512))]);
+        apply_zcl_records(&mut device, cluster::POWER_CONFIG, None, &[record(0x0021, Value::Uint(200))]);
+        apply_zcl_records(&mut device, cluster::IAS_ZONE, None, &[record(0x0002, Value::Uint(0x0009))]);
         assert_eq!(device.state["temperature"], json!(21.53));
         assert_eq!(device.state["humidity"], json!(45.12));
         assert_eq!(device.state["battery"], json!(100));
@@ -1805,9 +1875,20 @@ mod tests {
     }
 
     #[test]
+    fn manufacturer_attributes_need_their_code() {
+        let mut device = device_with(&[0x0000, 0x0001]);
+        device.model = Some("RDM001".into());
+        // genBasic 0x0034 without Signify's code is some other attribute
+        apply_zcl_records(&mut device, cluster::BASIC, None, &[record(0x0034, Value::Uint(2))]);
+        assert_eq!(device.state.get("device_mode"), None);
+        apply_zcl_records(&mut device, cluster::BASIC, Some(0x100B), &[record(0x0034, Value::Uint(2))]);
+        assert_eq!(device.state["device_mode"], json!("dual_rocker"));
+    }
+
+    #[test]
     fn ignores_invalid_temperature() {
         let mut device = device_with(&[0x0402]);
-        apply_zcl_records(&mut device, cluster::TEMPERATURE, &[record(0, Value::Int(-0x8000))]);
+        apply_zcl_records(&mut device, cluster::TEMPERATURE, None, &[record(0, Value::Int(-0x8000))]);
         assert!(!device.state.contains_key("temperature"));
     }
 
@@ -1815,14 +1896,14 @@ mod tests {
     fn learning_the_model_switches_to_its_definition() {
         let mut device = device_with(&[0x0000, 0x0001, 0x0006, 0x0201, 0xFC11]);
         let basic = [record(0x0004, Value::Str("SONOFF".into())), record(0x0005, Value::Str("TRVZB".into()))];
-        apply_zcl_records(&mut device, cluster::BASIC, &basic);
-        apply_zcl_records(&mut device, cluster::THERMOSTAT, &[record(0x0012, Value::Int(2150)), record(0x001C, Value::Uint(4))]);
-        apply_zcl_records(&mut device, 0xFC11, &[record(0x0000, Value::Bool(true))]);
+        apply_zcl_records(&mut device, cluster::BASIC, None, &basic);
+        apply_zcl_records(&mut device, cluster::THERMOSTAT, None, &[record(0x0012, Value::Int(2150)), record(0x001C, Value::Uint(4))]);
+        apply_zcl_records(&mut device, 0xFC11, None, &[record(0x0000, Value::Bool(true))]);
         assert_eq!(device.state["setpoint"], json!(21.5));
         assert_eq!(device.state["system_mode"], json!("heat"));
         assert_eq!(device.state["child_lock"], json!(true));
         // The On/Off cluster, absent from the definition, is no longer a feature
-        apply_zcl_records(&mut device, cluster::ON_OFF, &[record(0, Value::Bool(true))]);
+        apply_zcl_records(&mut device, cluster::ON_OFF, None, &[record(0, Value::Bool(true))]);
         assert!(!device.state.contains_key("on"));
     }
 

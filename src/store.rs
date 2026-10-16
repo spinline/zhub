@@ -151,6 +151,16 @@ impl Device {
             .map(|ep| ep.id)
     }
 
+    /// The endpoint with the cluster as input (server) or output (client)
+    pub fn endpoint_with_any(&self, cluster: u16) -> Option<u8> {
+        self.endpoint_with(cluster).or_else(|| {
+            self.endpoints
+                .iter()
+                .find(|ep| ep.out_clusters.contains(&cluster))
+                .map(|ep| ep.id)
+        })
+    }
+
     pub fn has_cluster(&self, cluster: u16) -> bool {
         self.endpoint_with(cluster).is_some()
     }

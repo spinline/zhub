@@ -2,7 +2,7 @@
 //! Devices without a definition get one built from these, based on their clusters.
 //! Descriptions are taken from Zigbee2MQTT's exposes.
 
-use super::{Command, CommandFrame, Conv, Feature, Kind, Place, Preset, Report, Source, Write};
+use super::{Action, Command, CommandFrame, Conv, Feature, Kind, Place, Preset, Report, Source, Write};
 use crate::store::Device;
 use crate::zcl::{cluster, types};
 
@@ -14,6 +14,7 @@ const fn attr(cluster: u16, attr: u16, ty: u8, conv: Conv, write: Write, report:
         conv,
         write,
         report,
+        manufacturer: None,
     }
 }
 
@@ -254,6 +255,19 @@ pub fn trigger_effect_frame(effect: u8) -> CommandFrame {
         command: 0x40,
         payload: vec![effect, 0x00],
     }
+}
+
+// ---- Remotes ----
+
+pub const fn action(values: &'static [&'static str], actions: &'static [Action]) -> Feature {
+    Feature::new(
+        "action",
+        "Action",
+        Kind::Enum { values },
+        Place::Card,
+        Source::Actions(actions),
+    )
+    .describe("Triggered action (e.g. a button click)")
 }
 
 // ---- Measurements ----
