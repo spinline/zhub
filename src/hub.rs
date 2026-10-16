@@ -56,6 +56,8 @@ const FAST_POLL_QUARTER_SECONDS: u16 = 80;
 /// attempt (the parent keeps the frame 7.68 s, then the device answers)
 const EAGER_WRITE_WINDOW: Duration = Duration::from_secs(60);
 const EAGER_WRITE_WAIT: Duration = Duration::from_secs(10);
+/// How long a write waits for another write to the same device to finish
+const SLOT_WAIT: Duration = Duration::from_secs(3);
 /// Attributes per read request, so the response fits in one frame
 const READ_CHUNK: usize = 4;
 const SECONDS_1970_TO_2000: u64 = 946_684_800;
@@ -1392,6 +1394,30 @@ impl Hub {
                     self.write_attribute(&device, feature, &value).await?;
                     return Ok(false);
                 }
+                // Most sleepy devices (TRVZB) take it at their next poll, within a second
+                // or so: try once and answer like a mains device; queue only if it
+                // does not arrive
+                if self.take_writing_slot(ieee, SLOT_WAIT).await {
+                    let first = self.write_attribute_within(&device, feature, &value, Some(EAGER_WRITE_WAIT)).await;
+                    self.writing.lock().unwrap().remove(ieee);
+                    match first {
+                        Ok(()) => {
+                            // The newer value wins over one still queued
+                            let mut pending = self.pending_writes.lock().unwrap();
+                            if let Some(values) = pending.get_mut(ieee) {
+                                values.remove(key);
+                                if values.is_empty() {
+                                    pending.remove(ieee);
+                                }
+                            }
+                            drop(pending);
+                            self.emit_device(ieee);
+                            return Ok(false);
+                        }
+                        Err(e) if !e.is::<NoReply>() => return Err(e),
+                        Err(_) => {}
+                    }
+                }
                 self.pending_writes
                     .lock()
                     .unwrap()
@@ -1711,6 +1737,20 @@ impl Hub {
             }
         }
         failures
+    }
+
+    /// Waits up to `wait` for the device's write slot (one write at a time per device)
+    async fn take_writing_slot(&self, ieee: &str, wait: Duration) -> bool {
+        let started = Instant::now();
+        loop {
+            if self.writing.lock().unwrap().insert(ieee.to_owned()) {
+                return true;
+            }
+            if started.elapsed() >= wait {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 
     /// A sleepy device takes a frame when it next polls its parent, and the frame waits

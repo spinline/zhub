@@ -261,7 +261,7 @@ function range(f, d) {
 
 function setValue(ieee, key, value) {
   return api(`/api/devices/${ieee}/set`, { key, value }).then(r => {
-    if (r.pending) toast("Sent to the battery device; it applies when the device next checks in (usually within seconds).");
+    if (r.pending) toast("The device did not answer yet; the value is sent again until it does.");
     return r;
   });
 }
