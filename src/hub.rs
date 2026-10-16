@@ -1776,16 +1776,31 @@ impl Hub {
     }
 
     /// Asks the device to leave the network and deletes its records
-    pub async fn remove(&self, ieee: &str) -> Result<()> {
+    pub async fn remove(self: &Arc<Self>, ieee: &str) -> Result<()> {
         let device = self.device(ieee).context("device not found")?;
         let device_ieee = parse_eui64(ieee)?;
-        if let Err(e) = self
-            .zdo_request(device.nwk, zdo::cluster::MGMT_LEAVE_REQ, zdo::mgmt_leave_req(device_ieee.0))
-            .await
-        {
-            warn!("{ieee} did not answer the leave request: {e:#}");
+        let leave = {
+            let hub = self.clone();
+            let ieee = ieee.to_owned();
+            async move {
+                match hub
+                    .zdo_request(device.nwk, zdo::cluster::MGMT_LEAVE_REQ, zdo::mgmt_leave_req(device_ieee.0))
+                    .await
+                {
+                    Ok(_) => info!("{ieee} left the network"),
+                    Err(e) => warn!("{ieee} did not answer the leave request: {e:#}"),
+                }
+            }
+        };
+        if device.rx_on_when_idle {
+            leave.await;
+        } else {
+            // A sleepy device may answer only at its next poll, or never: do not keep
+            // the user waiting for it
+            tokio::spawn(leave);
         }
         self.forget(ieee);
+        info!("{ieee} removed");
         Ok(())
     }
 
