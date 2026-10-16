@@ -4,7 +4,7 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -26,6 +26,11 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .route("/api/events", get(events))
         .route("/api/permit_join", post(permit_join))
         .route("/api/hue_reset", post(hue_reset))
+        .route("/api/hub", get(hub_info))
+        .route("/api/hub/settings", post(settings))
+        .route("/api/hub/tx_power", post(tx_power))
+        .route("/api/hub/restart", post(restart))
+        .route("/api/logs", get(logs))
         .route("/api/devices/{ieee}", axum::routing::delete(remove))
         .route("/api/devices/{ieee}/set", post(set))
         .route("/api/devices/{ieee}/rename", post(rename))
@@ -72,7 +77,42 @@ async fn state(State(hub): State<Arc<Hub>>) -> ApiResult {
     Ok(Json(json!({
         "devices": hub.devices(),
         "permit_join": hub.permit_remaining(),
+        "settings": hub.settings(),
     })))
+}
+
+async fn hub_info(State(hub): State<Arc<Hub>>) -> ApiResult {
+    Ok(Json(json!(hub.info())))
+}
+
+async fn settings(State(hub): State<Arc<Hub>>, Json(body): Json<crate::store::Settings>) -> ApiResult {
+    hub.update_settings(body)?;
+    ok()
+}
+
+#[derive(Deserialize)]
+struct TxPower {
+    dbm: i8,
+}
+
+async fn tx_power(State(hub): State<Arc<Hub>>, Json(body): Json<TxPower>) -> ApiResult {
+    let actual = hub.set_tx_power(body.dbm).await?;
+    Ok(Json(json!({ "ok": true, "tx_power": actual })))
+}
+
+async fn restart(State(hub): State<Arc<Hub>>) -> ApiResult {
+    hub.request_restart();
+    ok()
+}
+
+#[derive(Deserialize)]
+struct LogsQuery {
+    #[serde(default)]
+    after: u64,
+}
+
+async fn logs(State(hub): State<Arc<Hub>>, Query(query): Query<LogsQuery>) -> ApiResult {
+    Ok(Json(json!({ "lines": hub.log_lines(query.after) })))
 }
 
 async fn events(

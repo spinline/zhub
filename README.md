@@ -15,6 +15,11 @@ Zigbee2MQTT needed: a single static binary with an embedded web UI.
   including weekly schedules where supported.
 - Hue lights can be factory reset by serial number (like the Hue Bridge).
 - Web UI at `http://<router>:8099` (no authentication; local network only).
+- Settings page: hub and radio firmware info, network parameters, transmit power,
+  availability limits (cards show Offline), permit join duration, log level with a live
+  log viewer, restart, Hue reset.
+- Values for sleepy devices are written at once and repeated until taken; ones still
+  waiting survive a restart (kept in the state file).
 
 ## Architecture
 

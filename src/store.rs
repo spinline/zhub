@@ -30,6 +30,48 @@ pub struct NetworkData {
     pub tx_power: i8,
 }
 
+/// Hub settings edited in the UI
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Settings {
+    /// Minutes without a frame before a mains-powered device counts as offline
+    pub availability_mains_minutes: u32,
+    /// The same for battery devices, which report rarely
+    pub availability_battery_minutes: u32,
+    /// How long "Permit join" keeps joining open
+    pub permit_join_seconds: u8,
+    /// Log filter; when absent the command line's applies
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log_level: Option<String>,
+}
+
+/// Zigbee2MQTT's availability defaults: 10 minutes and 25 hours
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            availability_mains_minutes: 10,
+            availability_battery_minutes: 1500,
+            permit_join_seconds: 180,
+            log_level: None,
+        }
+    }
+}
+
+impl Settings {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if !(1..=1440).contains(&self.availability_mains_minutes) {
+            anyhow::bail!("mains devices: 1-1440 minutes");
+        }
+        if !(1..=10080).contains(&self.availability_battery_minutes) {
+            anyhow::bail!("battery devices: 1-10080 minutes");
+        }
+        if self.permit_join_seconds == 0 || self.permit_join_seconds == 255 {
+            anyhow::bail!("permit join: 1-254 seconds");
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LinkKey {
     pub ieee: String,
@@ -170,11 +212,16 @@ impl Device {
 pub struct Persisted {
     pub network: Option<NetworkData>,
     #[serde(default)]
+    pub settings: Settings,
+    #[serde(default)]
     pub link_keys: Vec<LinkKey>,
     #[serde(default)]
     pub children: Vec<Child>,
     #[serde(default)]
     pub devices: BTreeMap<String, Device>,
+    /// Values queued for sleepy devices: ieee → (feature → value)
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub pending_writes: BTreeMap<String, BTreeMap<String, Json>>,
 }
 
 impl Persisted {

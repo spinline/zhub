@@ -13,7 +13,7 @@ ziggurat-spinel = { git = "https://github.com/zigpy/ziggurat", rev = "913a5c247b
 ziggurat-protocol = { git = "https://github.com/zigpy/ziggurat", rev = "913a5c247b611ac1ffa0bb7f9feaa9e59d656336" }
 
 anyhow = "1"
-axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
 clap = { version = "4.6", features = ["derive"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 getrandom = "0.3"

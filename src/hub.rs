@@ -23,6 +23,7 @@ use ziggurat_driver::ziggurat_ieee_802154::types::{Eui64, Nwk, PanId};
 use ziggurat_driver::ziggurat_zigbee::constants::WELL_KNOWN_LINK_KEY;
 use ziggurat_phy::{ExclusiveRadio, RadioPhy, TxFrame};
 use ziggurat_phy_spinel::SpinelPhy;
+use ziggurat_spinel::client::SpinelClient;
 use ziggurat_protocol as proto;
 
 use crate::devices::{self, Card, CommandFrame, Feature, Kind, Source, TimeBase, Write};
@@ -70,6 +71,7 @@ pub struct Options {
     pub tx_power: i8,
     /// Diagnostics: put the radio in promiscuous mode and log MAC command frames
     pub sniff: bool,
+    pub logging: Arc<crate::logging::Logging>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -78,6 +80,8 @@ pub enum Event {
     Device { device: DeviceView },
     Removed { ieee: String },
     PermitJoin { remaining: u64 },
+    /// The hub settings changed (the UI reloads them)
+    Settings,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -127,7 +131,38 @@ pub struct Hub {
     eager_writes: Mutex<HashSet<String>>,
     /// The last action frame per device (cluster, ZCL sequence), to drop repeats
     last_action_seq: Mutex<HashMap<String, (u16, u8)>>,
+    /// For radio properties the stack does not manage at runtime (TX power)
+    spinel: Arc<SpinelClient>,
+    /// The RCP firmware's version string
+    ncp_version: Option<String>,
+    started: Instant,
+    serial_port: String,
+    baudrate: u32,
+    logging: Arc<crate::logging::Logging>,
+    /// Asks main to shut down; the service script starts zhub again
+    restart: Notify,
 }
+
+/// What the settings page shows about the hub
+#[derive(Debug, Serialize)]
+pub struct HubInfo {
+    pub version: &'static str,
+    pub uptime_seconds: u64,
+    pub radio_firmware: Option<String>,
+    pub ieee: String,
+    pub devices: usize,
+    pub channel: u8,
+    pub pan_id: u16,
+    pub extended_pan_id: String,
+    pub tx_power: i8,
+    pub serial_port: String,
+    pub baudrate: u32,
+    pub log_level: String,
+    pub settings: store::Settings,
+}
+
+/// Transmit power the MG24 RCP accepts (dBm)
+const TX_POWER_RANGE: std::ops::RangeInclusive<i8> = -10..=20;
 
 /// The device did not answer a request in time
 #[derive(Debug)]
@@ -367,6 +402,22 @@ impl Hub {
             .await
             .map_err(|e| anyhow!("cannot read the radio address: {e}"))?;
         info!("Radio ready: {}", eui64_to_string(&radio_ieee));
+        let ncp_version = match spinel.prop_value_get(ziggurat_spinel::SpinelPropertyId::NcpVersion).await {
+            Ok(bytes) => {
+                let text = String::from_utf8_lossy(&bytes).trim_end_matches('\0').trim().to_owned();
+                info!("Radio firmware: {text}");
+                Some(text)
+            }
+            Err(e) => {
+                warn!("cannot read the radio firmware version: {e:?}");
+                None
+            }
+        };
+        if let Some(level) = &data.settings.log_level
+            && let Err(e) = opts.logging.set_level(level)
+        {
+            warn!("saved log level not applied: {e:#}");
+        }
 
         let mut network = match data.network.take() {
             Some(network) => network,
@@ -425,6 +476,11 @@ impl Hub {
         );
 
         apply_default_names(&mut data);
+        // Writes the previous run could not deliver yet
+        let pending_writes: HashMap<_, _> = std::mem::take(&mut data.pending_writes).into_iter().collect();
+        if !pending_writes.is_empty() {
+            info!("{} device(s) have writes waiting from before the restart", pending_writes.len());
+        }
 
         let (events, _) = broadcast::channel(256);
         let hub = Arc::new(Self {
@@ -439,11 +495,18 @@ impl Hub {
             events,
             permit_until: Mutex::new(None),
             interviews: Mutex::new(HashSet::new()),
-            pending_writes: Mutex::new(HashMap::new()),
+            pending_writes: Mutex::new(pending_writes),
             wake_interviews: Mutex::new(HashSet::new()),
             writing: Mutex::new(HashSet::new()),
             eager_writes: Mutex::new(HashSet::new()),
             last_action_seq: Mutex::new(HashMap::new()),
+            spinel,
+            ncp_version,
+            started: Instant::now(),
+            serial_port: opts.device,
+            baudrate: opts.baudrate,
+            logging: opts.logging,
+            restart: Notify::new(),
         });
 
         tokio::spawn(hub.clone().notification_loop());
@@ -465,6 +528,80 @@ impl Hub {
         }
 
         Ok(hub)
+    }
+
+    // ---- Hub settings ----
+
+    pub fn info(&self) -> HubInfo {
+        let data = self.data.lock().unwrap();
+        let network = data.network.as_ref();
+        HubInfo {
+            version: env!("CARGO_PKG_VERSION"),
+            uptime_seconds: self.started.elapsed().as_secs(),
+            radio_firmware: self.ncp_version.clone(),
+            ieee: eui64_to_string(&self.ieee),
+            devices: data.devices.len(),
+            channel: network.map_or(0, |n| n.channel),
+            pan_id: network.map_or(0, |n| n.pan_id),
+            extended_pan_id: network.map(|n| n.extended_pan_id.clone()).unwrap_or_default(),
+            tx_power: network.map_or(0, |n| n.tx_power),
+            serial_port: self.serial_port.clone(),
+            baudrate: self.baudrate,
+            log_level: self.logging.level(),
+            settings: data.settings.clone(),
+        }
+    }
+
+    pub fn settings(&self) -> store::Settings {
+        self.data.lock().unwrap().settings.clone()
+    }
+
+    pub fn update_settings(&self, settings: store::Settings) -> Result<()> {
+        settings.validate()?;
+        if let Some(level) = &settings.log_level {
+            self.logging.set_level(level)?;
+        }
+        info!("Settings changed: {settings:?}");
+        self.data.lock().unwrap().settings = settings;
+        self.dirty.notify_one();
+        let _ = self.events.send(Event::Settings);
+        Ok(())
+    }
+
+    /// Changes the radio's transmit power now and keeps it for the next start. The
+    /// stack's own copy (used if the radio resets) changes only with a restart.
+    pub async fn set_tx_power(&self, dbm: i8) -> Result<i8> {
+        if !TX_POWER_RANGE.contains(&dbm) {
+            bail!("transmit power must be {}..{} dBm", TX_POWER_RANGE.start(), TX_POWER_RANGE.end());
+        }
+        self.spinel
+            .prop_value_set(ziggurat_spinel::SpinelPropertyId::PhyTxPower, vec![dbm as u8])
+            .await
+            .map_err(|e| anyhow!("the radio refused the transmit power: {e:?}"))?;
+        // The radio may round to a level it supports
+        let actual = match self.spinel.prop_value_get(ziggurat_spinel::SpinelPropertyId::PhyTxPower).await {
+            Ok(bytes) => bytes.first().map_or(dbm, |&b| b as i8),
+            Err(_) => dbm,
+        };
+        info!("Transmit power: {actual} dBm");
+        if let Some(network) = self.data.lock().unwrap().network.as_mut() {
+            network.tx_power = actual;
+        }
+        self.dirty.notify_one();
+        Ok(actual)
+    }
+
+    pub fn request_restart(&self) {
+        info!("Restart requested from the web UI");
+        self.restart.notify_one();
+    }
+
+    pub async fn restart_requested(&self) {
+        self.restart.notified().await;
+    }
+
+    pub fn log_lines(&self, after: u64) -> Vec<crate::logging::Line> {
+        self.logging.buffer.since(after, 500)
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<Event> {
@@ -1411,6 +1548,7 @@ impl Hub {
                                 }
                             }
                             drop(pending);
+                            self.dirty.notify_one();
                             self.emit_device(ieee);
                             return Ok(false);
                         }
@@ -1424,6 +1562,7 @@ impl Hub {
                     .entry(ieee.to_owned())
                     .or_default()
                     .insert(key.to_owned(), value);
+                self.dirty.notify_one();
                 self.emit_device(ieee);
                 self.spawn_eager_writes(ieee.to_owned());
                 Ok(true)
@@ -1732,7 +1871,10 @@ impl Hub {
                 continue;
             };
             match self.write_attribute_within(device, feature, &value, wait).await {
-                Ok(()) => settle_pending(&mut self.pending_writes.lock().unwrap(), &device.ieee, &key, &value),
+                Ok(()) => {
+                    settle_pending(&mut self.pending_writes.lock().unwrap(), &device.ieee, &key, &value);
+                    self.dirty.notify_one();
+                }
                 Err(e) => failures.push((key, e)),
             }
         }
@@ -1851,6 +1993,7 @@ impl Hub {
             data.link_keys.retain(|k| k.ieee != ieee);
             data.children.retain(|c| c.ieee != ieee);
         }
+        self.pending_writes.lock().unwrap().remove(ieee);
         let _ = self.events.send(Event::Removed {
             ieee: ieee.to_owned(),
         });
@@ -1870,7 +2013,14 @@ impl Hub {
     }
 
     pub async fn save_now(&self) -> Result<()> {
-        let snapshot = self.data.lock().unwrap().clone();
+        let mut snapshot = self.data.lock().unwrap().clone();
+        snapshot.pending_writes = self
+            .pending_writes
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(ieee, values)| (ieee.clone(), values.clone()))
+            .collect();
         let path = self.state_path.clone();
         tokio::task::spawn_blocking(move || snapshot.save(&path)).await??;
         Ok(())

@@ -1,6 +1,7 @@
 mod hub;
 mod hue_reset;
 mod devices;
+mod logging;
 mod radio;
 mod sniff;
 mod store;
@@ -16,7 +17,6 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use tokio::signal::unix::{SignalKind, signal};
 use tracing::info;
-use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
 #[command(version, about = "A lightweight Zigbee hub on top of Ziggurat")]
@@ -49,7 +49,7 @@ struct Args {
     #[arg(long)]
     sniff: bool,
 
-    /// Log level (RUST_LOG with per-module filters takes precedence)
+    /// Log level (RUST_LOG takes precedence; a level saved in the UI overrides both)
     #[arg(long, default_value = "info")]
     log_level: String,
 }
@@ -57,24 +57,19 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    tracing_subscriber::fmt()
-        // The service logs to a file, where color codes are just noise
-        .with_ansi(std::io::stderr().is_terminal())
-        .with_writer(std::io::stderr)
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level)),
-        )
-        .init();
+    let level = std::env::var("RUST_LOG").unwrap_or_else(|_| args.log_level.clone());
+    // The service logs to a file, where color codes are just noise
+    let logging = logging::Logging::init(&level, std::io::stderr().is_terminal())?;
 
     // The router has four cores but the work is mostly I/O; two threads save memory
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()?;
-    runtime.block_on(run(args))
+    runtime.block_on(run(args, logging))
 }
 
-async fn run(args: Args) -> Result<()> {
+async fn run(args: Args, logging: std::sync::Arc<logging::Logging>) -> Result<()> {
     let hub = hub::Hub::start(hub::Options {
         device: args.device,
         baudrate: args.baudrate,
@@ -82,12 +77,13 @@ async fn run(args: Args) -> Result<()> {
         channel: args.channel,
         tx_power: args.tx_power,
         sniff: args.sniff,
+        logging,
     })
     .await?;
 
     let listener = tokio::net::TcpListener::bind(&args.listen)
         .await
-        .with_context(|| format!("{} dinlenemedi", args.listen))?;
+        .with_context(|| format!("cannot listen on {}", args.listen))?;
     info!("Web UI: http://{}", args.listen);
 
     let mut terminate = signal(SignalKind::terminate())?;
@@ -98,6 +94,8 @@ async fn run(args: Args) -> Result<()> {
         result = server => result?,
         _ = terminate.recv() => info!("SIGTERM received, shutting down"),
         _ = interrupt.recv() => info!("SIGINT received, shutting down"),
+        // The service script starts zhub again after it exits
+        _ = hub.restart_requested() => info!("Restarting"),
     }
 
     hub.refresh_tables();

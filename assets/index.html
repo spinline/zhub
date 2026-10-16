@@ -115,6 +115,30 @@
   .cluster-list { font-size: 13px; }
   .cluster-list code { background: var(--chip); border-radius: 6px; padding: 1px 6px; margin: 2px; display: inline-block; }
 
+  header h1 { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+  @media (max-width: 520px) {
+    header { gap: 8px; padding: 12px; }
+    header h1 { font-size: 16px; }
+    /* only a lost connection is worth the room */
+    #conn:not(.off) { display: none; }
+    header #permit { padding: 7px 10px; }
+    .wide-only { display: none; }
+    nav.pages { gap: 0; }
+    nav.pages button { padding: 6px 7px; }
+  }
+  nav.pages { display: flex; gap: 4px; }
+  nav.pages button { border: 0; background: none; color: var(--muted); padding: 6px 10px; }
+  nav.pages button.active { color: var(--text); background: var(--chip); }
+  .settings { display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); align-items: start; }
+  .settings .card h3 { margin: 0; font-size: 15px; }
+  .settings .wide { grid-column: 1 / -1; }
+  .log-tools { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; font-size: 13px; color: var(--muted); }
+  pre.log {
+    margin: 0; background: var(--bg); border: 1px solid var(--line); border-radius: 10px; padding: 10px;
+    font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; max-height: 420px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere;
+  }
+  pre.log .warn { color: var(--warn); }
+
   #toast {
     position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%); z-index: 10;
     background: var(--text); color: var(--bg); padding: 10px 16px; border-radius: 10px;
@@ -125,11 +149,12 @@
 </head>
 <body>
 <header>
-  <h1>Zigbee Hub</h1>
+  <h1><span class="wide-only">Zigbee </span>Hub</h1>
+  <nav class="pages"><button data-page="devices">Devices</button><button data-page="settings">Settings</button></nav>
   <span id="conn">connecting…</span>
   <button id="permit" class="primary">Permit join</button>
 </header>
-<main>
+<main id="pageDevices">
   <h2 id="climateTitle" hidden>Climate</h2>
   <div id="climate" class="grid"></div>
   <h2>Lights</h2>
@@ -138,15 +163,38 @@
   <div id="sensors" class="grid"></div>
   <h2 id="otherTitle" hidden>Other</h2>
   <div id="other" class="grid"></div>
-  <h2>Tools</h2>
-  <div class="grid">
+</main>
+<main id="pageSettings" hidden>
+  <div class="settings">
+    <div class="card"><h3>Hub</h3><dl class="info" id="setHub"></dl></div>
+    <div class="card"><h3>Network</h3><dl class="info" id="setNetwork"></dl><div id="setTxPower"></div></div>
+    <div class="card"><h3>Adapter</h3><dl class="info" id="setAdapter"></dl></div>
+    <div class="card"><h3>Availability and joining</h3><div id="setGeneral"></div></div>
     <div class="card">
-      <b>Factory reset a Hue light by serial number</b>
-      <div class="sub" style="white-space:normal">The 6-character code printed on the light (0-9, A-F). Separate several with commas. The light must be powered; after the reset it joins on its own. Takes about 20 s.</div>
-      <div class="row" style="display:flex;gap:8px">
-        <input id="hueSerials" type="text" placeholder="e.g. A1B2C3" autocomplete="off" style="flex:1">
-        <button id="hueReset">Reset</button>
+      <h3>Tools</h3>
+      <div class="ctl">
+        <div class="label">Restart the hub</div>
+        <button id="restart" class="danger">Restart</button>
+        <div class="desc">Saves the state and starts zhub again; the network stays up for the devices and the page reconnects in about 10 s.</div>
       </div>
+      <div class="ctl">
+        <div class="label">Factory reset a Hue light by serial number</div>
+        <span></span>
+        <div class="desc">The 6-character code printed on the light (0-9, A-F). Separate several with commas. The light must be powered; after the reset it joins on its own. Takes about 20 s.</div>
+        <div class="row" style="grid-column: 1 / -1">
+          <input id="hueSerials" type="text" placeholder="e.g. A1B2C3" autocomplete="off" style="flex:1">
+          <button id="hueReset">Reset</button>
+        </div>
+      </div>
+    </div>
+    <div class="card wide">
+      <h3>Logs</h3>
+      <div class="log-tools">
+        <label>Level <select id="logLevel"></select></label>
+        <label><input type="checkbox" id="logPause"> Pause</label>
+        <span id="logNote"></span>
+      </div>
+      <pre class="log" id="log"></pre>
     </div>
   </div>
 </main>
@@ -165,6 +213,7 @@
 const devices = new Map();
 const cards = new Map();
 let permitUntil = 0;
+let hubSettings = { availability_mains_minutes: 10, availability_battery_minutes: 1500, permit_join_seconds: 180 };
 
 const $ = (sel, root = document) => root.querySelector(sel);
 const el = (tag, props = {}, ...children) => {
@@ -550,9 +599,17 @@ function compactControl(ieee, f) {
   return c;
 }
 
+// Zigbee2MQTT's availability: no message for longer than the device type's limit
+function isOffline(d) {
+  if (!d.last_seen) return false;
+  const minutes = d.rx_on_when_idle ? hubSettings.availability_mains_minutes : hubSettings.availability_battery_minutes;
+  return Date.now() / 1000 - d.last_seen > minutes * 60;
+}
+
 function chipList(d) {
   const s = d.state, chips = [];
   const chip = (text, cls = "") => el("span", { className: `chip ${cls}`, textContent: text });
+  if (isOffline(d)) chips.push(chip("Offline", "warn"));
   if (d.interviewing) chips.push(chip("Interviewing…"));
   else if (d.waiting_for_wake) chips.push(chip("Interview on wake-up", "warn"));
   else if (!d.interviewed) chips.push(chip("Interview failed", "warn"));
@@ -746,7 +803,7 @@ function renderPermit() {
 
 $("#permit").onclick = () => {
   const open = permitUntil > Date.now();
-  run(api("/api/permit_join", { seconds: open ? 0 : 180 }).then(() => {
+  run(api("/api/permit_join", { seconds: open ? 0 : hubSettings.permit_join_seconds }).then(() => {
     if (!open) toast("Joining is open. Put the device in pairing mode.");
   }));
 };
@@ -761,13 +818,138 @@ $("#hueReset").onclick = () => {
     .finally(() => { button.disabled = false; button.textContent = "Reset"; }));
 };
 
+// ---- Settings page ----
+
+let page = "devices";
+
+function showPage() {
+  page = location.hash === "#settings" ? "settings" : "devices";
+  $("#pageDevices").hidden = page !== "devices";
+  $("#pageSettings").hidden = page !== "settings";
+  for (const b of document.querySelectorAll("nav.pages button")) b.classList.toggle("active", b.dataset.page === page);
+  if (page === "settings") { run(loadSettings()); pollLogs(); }
+}
+
+for (const b of document.querySelectorAll("nav.pages button")) {
+  b.onclick = () => { location.hash = b.dataset.page === "settings" ? "#settings" : ""; };
+}
+window.addEventListener("hashchange", showPage);
+
+const LOG_LEVELS = [
+  ["info,ziggurat_driver=warn", "Info (recommended)"],
+  ["debug,ziggurat_driver=info", "Debug"],
+  ["warn", "Warnings only"],
+  ["error", "Errors only"],
+];
+
+function infoRows(node, rows) {
+  node.replaceChildren(...rows.filter(([, v]) => v != null && v !== "")
+    .flatMap(([k, v]) => [el("dt", { textContent: k }), el("dd", { textContent: v })]));
+}
+
+function duration(seconds) {
+  const d = Math.floor(seconds / 86400), h = Math.floor(seconds % 86400 / 3600), m = Math.floor(seconds % 3600 / 60);
+  return d ? `${d} d ${h} h` : h ? `${h} h ${m} min` : `${m} min`;
+}
+
+// A settings row: label, number input with Save, description
+function numberSetting(label, unit, value, { min, max, step = 1 }, description, save) {
+  const input = el("input", { type: "number", min, max, step, value });
+  const button = el("button", { textContent: "Save" });
+  button.onclick = () => run(save(Number(input.value)));
+  return el("div", { className: "ctl" },
+    el("div", { className: "label" }, label, unit ? el("small", { textContent: ` (${unit})` }) : ""),
+    el("div", { className: "row" }, input, button),
+    el("div", { className: "desc", textContent: description }));
+}
+
+function saveSettings(patch) {
+  return api("/api/hub/settings", { ...hubSettings, ...patch }).then(() => toast("Settings saved"));
+}
+
+async function loadSettings() {
+  const info = await api("/api/hub", null, "GET");
+  hubSettings = info.settings;
+  infoRows($("#setHub"), [
+    ["Version", info.version],
+    ["Running for", duration(info.uptime_seconds)],
+    ["Radio firmware", info.radio_firmware ?? "unknown"],
+    ["IEEE address", info.ieee],
+    ["Devices", String(info.devices)],
+  ]);
+  infoRows($("#setNetwork"), [
+    ["Channel", String(info.channel)],
+    ["PAN ID", hex(info.pan_id)],
+    ["Extended PAN ID", info.extended_pan_id],
+    ["Network key", "Not shown (the page has no password yet)"],
+  ]);
+  $("#setTxPower").replaceChildren(numberSetting("Transmit power", "dBm", info.tx_power, { min: -10, max: 20 },
+    "Radio output of the dongle. Higher reaches farther devices. Applies now and after restarts. " +
+    "Channel, PAN ID and network key cannot be changed here: every device would have to be paired again.",
+    (dbm) => api("/api/hub/tx_power", { dbm }).then(r => toast(`Transmit power: ${r.tx_power} dBm`))));
+  infoRows($("#setAdapter"), [
+    ["Serial port", info.serial_port],
+    ["Baud rate", String(info.baudrate)],
+    ["Flow control", "None"],
+  ]);
+  $("#setGeneral").replaceChildren(
+    numberSetting("Mains-powered devices offline after", "min", hubSettings.availability_mains_minutes, { min: 1, max: 1440 },
+      "Lights and plugs report at least every 5 minutes; without any message for this long the card shows Offline.",
+      (v) => saveSettings({ availability_mains_minutes: v })),
+    numberSetting("Battery devices offline after", "min", hubSettings.availability_battery_minutes, { min: 1, max: 10080 },
+      "Battery devices may stay silent for hours; Zigbee2MQTT's default is 25 hours.",
+      (v) => saveSettings({ availability_battery_minutes: v })),
+    numberSetting("Permit join duration", "s", hubSettings.permit_join_seconds, { min: 1, max: 254 },
+      "How long the Permit join button keeps joining open.",
+      (v) => saveSettings({ permit_join_seconds: v })),
+  );
+  const select = $("#logLevel");
+  const options = LOG_LEVELS.some(([v]) => v === info.log_level) ? LOG_LEVELS : [[info.log_level, info.log_level], ...LOG_LEVELS];
+  select.replaceChildren(...options.map(([v, t]) => el("option", { value: v, textContent: t })));
+  select.value = info.log_level;
+  render();
+}
+
+$("#logLevel").onchange = () => run(saveSettings({ log_level: $("#logLevel").value }));
+
+$("#restart").onclick = () => {
+  if (confirm("Restart the hub?")) run(api("/api/hub/restart").then(() => toast("Restarting; the page reconnects in about 10 s.")));
+};
+
+// Live log: new lines every 2 s while the settings page is open
+let logAfter = 0, logTimer = null;
+const LOG_KEEP = 500;
+
+async function fetchLogs() {
+  const { lines } = await api(`/api/logs?after=${logAfter}`, null, "GET");
+  if (!lines.length) return;
+  const box = $("#log");
+  const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 30;
+  for (const line of lines) {
+    box.append(el("div", { className: / (WARN|ERROR) /.test(line.text) ? "warn" : "", textContent: line.text }));
+    logAfter = line.id;
+  }
+  while (box.childElementCount > LOG_KEEP) box.firstChild.remove();
+  if (atBottom) box.scrollTop = box.scrollHeight;
+}
+
+function pollLogs() {
+  clearTimeout(logTimer);
+  if (page !== "settings") return;
+  const next = () => { logTimer = setTimeout(pollLogs, 2000); };
+  if ($("#logPause").checked) { next(); return; }
+  fetchLogs().then(() => { $("#logNote").textContent = ""; }, () => { $("#logNote").textContent = "not reachable"; }).finally(next);
+}
+
 async function load() {
   const state = await api("/api/state", null, "GET");
   devices.clear();
   for (const d of state.devices) devices.set(d.ieee, d);
   for (const ieee of [...cards.keys()]) if (!devices.has(ieee)) cards.delete(ieee);
   permitUntil = Date.now() + state.permit_join * 1000;
+  if (state.settings) hubSettings = state.settings;
   render();
+  if (page === "settings") run(loadSettings());
   renderPermit();
 }
 
@@ -794,12 +976,15 @@ function connect() {
     } else if (event.type === "permit_join") {
       permitUntil = Date.now() + event.remaining * 1000;
       renderPermit();
+    } else if (event.type === "settings") {
+      run(load());
     }
   };
 }
 
 setInterval(() => { renderPermit(); render(); }, 1000 * 15);
 setInterval(renderPermit, 1000);
+showPage();
 connect();
 </script>
 </body>
