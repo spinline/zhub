@@ -343,7 +343,13 @@ function updateCard(parts, d) {
   else if (!d.interviewed) chips.push(el("span", { className: "chip warn", textContent: "Tanınamadı" }));
   if (s.battery != null) chips.push(el("span", { className: "chip" + (s.battery < 15 ? " warn" : ""), textContent: `Pil %${s.battery}` }));
   if (s.battery_low) chips.push(el("span", { className: "chip warn", textContent: "Pil zayıf" }));
-  if (d.lqi != null) chips.push(el("span", { className: "chip", textContent: `Sinyal ${d.lqi}` }));
+  if (d.rssi != null) {
+    // Kabaca: -60 dBm üstü iyi, -80 altı zayıf
+    const weak = d.rssi < -80;
+    chips.push(el("span", { className: "chip" + (weak ? " warn" : ""), textContent: `Sinyal ${d.rssi} dBm`, title: `LQI ${d.lqi ?? "?"}` }));
+  } else if (d.lqi != null) {
+    chips.push(el("span", { className: "chip", textContent: `LQI ${d.lqi}` }));
+  }
   chips.push(el("span", { className: "chip", textContent: ago(d.last_seen) }));
   parts.chips.replaceChildren(...chips);
 }

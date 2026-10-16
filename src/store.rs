@@ -144,6 +144,9 @@ pub struct Device {
     pub last_seen: Option<u64>,
     #[serde(default)]
     pub lqi: Option<u8>,
+    /// Son paketin alınan sinyal gücü (dBm)
+    #[serde(default)]
+    pub rssi: Option<i8>,
 }
 
 fn default_true() -> bool {
@@ -172,6 +175,7 @@ impl Device {
             settings: BTreeMap::new(),
             last_seen: None,
             lqi: None,
+            rssi: None,
         }
     }
 

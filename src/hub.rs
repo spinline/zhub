@@ -591,10 +591,11 @@ impl Hub {
                 cluster_id,
                 src_ep,
                 lqi,
+                rssi,
                 data,
                 ..
             } => {
-                self.touch(source.0, lqi);
+                self.touch(source.0, lqi, rssi);
                 self.flush_pending_settings(source.0);
                 self.start_wake_interview(source.0);
                 if profile_id == ZDO_PROFILE {
@@ -656,11 +657,12 @@ impl Hub {
         }
     }
 
-    fn touch(&self, nwk: u16, lqi: u8) {
+    fn touch(&self, nwk: u16, lqi: u8, rssi: i8) {
         let mut data = self.data.lock().unwrap();
         if let Some(device) = data.devices.values_mut().find(|d| d.nwk == nwk) {
             device.last_seen = Some(now_unix());
             device.lqi = Some(lqi);
+            device.rssi = Some(rssi);
         }
     }
 
