@@ -60,6 +60,8 @@ pub struct Options {
     pub state_path: PathBuf,
     pub channel: u8,
     pub tx_power: i8,
+    /// Tanılama: radyoyu karışık moda al ve MAC komut çerçevelerini günlüğe yaz
+    pub sniff: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -397,7 +399,7 @@ impl Hub {
     pub async fn start(opts: Options) -> Result<Arc<Self>> {
         let mut data = Persisted::load(&opts.state_path)?;
 
-        let phy = crate::radio::open(&opts.device, opts.baudrate).await?;
+        let (phy, spinel) = crate::radio::open(&opts.device, opts.baudrate, opts.sniff).await?;
         let radio_ieee = phy
             .hw_address()
             .await
@@ -444,6 +446,15 @@ impl Hub {
         stack.spawn_tracked(|stack| async move {
             stack.run().await;
         });
+        if opts.sniff {
+            // Radyo süzgecini kapat: hedef adresi olmayan ya da başka PAN'a giden
+            // çerçeveler de görünsün. Radyo sıfırlanırsa ziggurat ayarı geri alır.
+            spinel
+                .prop_value_set(ziggurat_spinel::SpinelPropertyId::MacPromiscuousMode, vec![2])
+                .await
+                .map_err(|e| anyhow!("karışık mod açılamadı: {e:?}"))?;
+            warn!("TANILAMA: radyo karışık modda, MAC komut çerçeveleri günlüğe yazılıyor");
+        }
         info!(
             "Ağ çalışıyor: kanal {}, PAN 0x{:04x}, {} cihaz",
             network.channel,

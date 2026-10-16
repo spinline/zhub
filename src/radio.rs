@@ -13,7 +13,7 @@ use ziggurat_spinel::client::SpinelClient;
 /// baytları boşaltıyoruz; yoksa Spinel istemcisinin ilk komutu sıfırlamayla çakışıyor.
 const BOOT_SETTLE: Duration = Duration::from_secs(2);
 
-pub async fn open(device: &str, baudrate: u32) -> Result<Arc<SpinelPhy>> {
+pub async fn open(device: &str, baudrate: u32, sniff: bool) -> Result<(Arc<SpinelPhy>, Arc<SpinelClient>)> {
     let mut port = tokio_serial::new(device, baudrate)
         .flow_control(FlowControl::None)
         .open_native_async()
@@ -29,6 +29,10 @@ pub async fn open(device: &str, baudrate: u32) -> Result<Arc<SpinelPhy>> {
         }
     }
 
-    let client = SpinelClient::new(Box::new(port));
-    Ok(Arc::new(SpinelPhy::new(Arc::new(client))))
+    let client = if sniff {
+        Arc::new(SpinelClient::new(Box::new(crate::sniff::Tap::new(port))))
+    } else {
+        Arc::new(SpinelClient::new(Box::new(port)))
+    };
+    Ok((Arc::new(SpinelPhy::new(client.clone())), client))
 }

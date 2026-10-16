@@ -1,6 +1,7 @@
 mod hub;
 mod profiles;
 mod radio;
+mod sniff;
 mod store;
 mod tuya;
 mod web;
@@ -43,6 +44,10 @@ struct Args {
     #[arg(long, default_value_t = 8)]
     tx_power: i8,
 
+    /// Tanılama: radyoyu karışık moda alıp MAC komut çerçevelerini günlüğe yazar
+    #[arg(long)]
+    sniff: bool,
+
     /// Günlük düzeyi (RUST_LOG ayrıntılı süzgeçlerle üstün gelir)
     #[arg(long, default_value = "info")]
     log_level: String,
@@ -75,6 +80,7 @@ async fn run(args: Args) -> Result<()> {
         state_path: args.state,
         channel: args.channel,
         tx_power: args.tx_power,
+        sniff: args.sniff,
     })
     .await?;
 
