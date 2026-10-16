@@ -6,11 +6,11 @@ description = "A lightweight Zigbee hub on the Ziggurat stack"
 license = "Apache-2.0"
 
 [dependencies]
-ziggurat-driver = { git = "https://github.com/zigpy/ziggurat", rev = "392d4c7fe5c497d553977492bc02cb305573b7fc" }
-ziggurat-phy = { git = "https://github.com/zigpy/ziggurat", rev = "392d4c7fe5c497d553977492bc02cb305573b7fc" }
-ziggurat-phy-spinel = { git = "https://github.com/zigpy/ziggurat", rev = "392d4c7fe5c497d553977492bc02cb305573b7fc" }
-ziggurat-spinel = { git = "https://github.com/zigpy/ziggurat", rev = "392d4c7fe5c497d553977492bc02cb305573b7fc" }
-ziggurat-protocol = { git = "https://github.com/zigpy/ziggurat", rev = "392d4c7fe5c497d553977492bc02cb305573b7fc" }
+ziggurat-driver = { git = "https://github.com/zigpy/ziggurat", rev = "913a5c247b611ac1ffa0bb7f9feaa9e59d656336" }
+ziggurat-phy = { git = "https://github.com/zigpy/ziggurat", rev = "913a5c247b611ac1ffa0bb7f9feaa9e59d656336" }
+ziggurat-phy-spinel = { git = "https://github.com/zigpy/ziggurat", rev = "913a5c247b611ac1ffa0bb7f9feaa9e59d656336" }
+ziggurat-spinel = { git = "https://github.com/zigpy/ziggurat", rev = "913a5c247b611ac1ffa0bb7f9feaa9e59d656336" }
+ziggurat-protocol = { git = "https://github.com/zigpy/ziggurat", rev = "913a5c247b611ac1ffa0bb7f9feaa9e59d656336" }
 
 anyhow = "1"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
