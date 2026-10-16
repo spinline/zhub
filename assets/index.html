@@ -261,7 +261,7 @@ function range(f, d) {
 
 function setValue(ieee, key, value) {
   return api(`/api/devices/${ieee}/set`, { key, value }).then(r => {
-    if (r.pending) toast("Will be applied when the device wakes up (press its button briefly to apply now).");
+    if (r.pending) toast("Sent to the battery device; it applies when the device next checks in (usually within seconds).");
     return r;
   });
 }
@@ -290,7 +290,7 @@ function valueTile(key) {
 function control(ieee, f) {
   const title = el("div", { className: "label" });
   const desc = f.description ? el("div", { className: "desc", textContent: f.description }) : null;
-  const note = el("div", { className: "note", hidden: true, textContent: "Waiting for the device to wake up" });
+  const note = el("div", { className: "note", hidden: true, textContent: "Waiting for the device to take the value" });
   const setTitle = (d) => {
     title.replaceChildren(featureLabel(f, d), f.kind.unit ? el("small", { textContent: ` (${f.kind.unit})` }) : "");
     note.hidden = !(d.pending || []).includes(f.key);

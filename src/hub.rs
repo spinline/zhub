@@ -52,8 +52,10 @@ const SLEEPY_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_PERMIT_SECONDS: u8 = 254;
 /// Fast poll duration requested in the check-in response (quarter seconds): 20 s
 const FAST_POLL_QUARTER_SECONDS: u16 = 80;
-/// A sleepy device counts as awake for this many seconds after it sent something
-const AWAKE_WINDOW_SECONDS: u64 = 2;
+/// How long writes to a sleepy device are attempted right away, and the reply wait of each
+/// attempt (the parent keeps the frame 7.68 s, then the device answers)
+const EAGER_WRITE_WINDOW: Duration = Duration::from_secs(60);
+const EAGER_WRITE_WAIT: Duration = Duration::from_secs(10);
 /// Attributes per read request, so the response fits in one frame
 const READ_CHUNK: usize = 4;
 const SECONDS_1970_TO_2000: u64 = 946_684_800;
@@ -119,9 +121,23 @@ pub struct Hub {
     wake_interviews: Mutex<HashSet<String>>,
     /// Devices being written to right now: one write at a time per device
     writing: Mutex<HashSet<String>>,
+    /// Sleepy devices whose writes are being attempted right now
+    eager_writes: Mutex<HashSet<String>>,
     /// The last action frame per device (cluster, ZCL sequence), to drop repeats
     last_action_seq: Mutex<HashMap<String, (u16, u8)>>,
 }
+
+/// The device did not answer a request in time
+#[derive(Debug)]
+struct NoReply;
+
+impl std::fmt::Display for NoReply {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the device did not respond")
+    }
+}
+
+impl std::error::Error for NoReply {}
 
 fn now_unix() -> u64 {
     SystemTime::now()
@@ -424,6 +440,7 @@ impl Hub {
             pending_writes: Mutex::new(HashMap::new()),
             wake_interviews: Mutex::new(HashSet::new()),
             writing: Mutex::new(HashSet::new()),
+            eager_writes: Mutex::new(HashSet::new()),
             last_action_seq: Mutex::new(HashMap::new()),
         });
 
@@ -998,6 +1015,7 @@ impl Hub {
         src_ep: u8,
         dst_ep: u8,
         data: Vec<u8>,
+        wait: Option<Duration>,
     ) -> Result<Vec<u8>> {
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(key, tx);
@@ -1005,16 +1023,16 @@ impl Hub {
             self.pending.lock().unwrap().remove(&key);
             return Err(e);
         }
-        let wait = if self.is_sleepy(nwk) {
+        let wait = wait.unwrap_or(if self.is_sleepy(nwk) {
             SLEEPY_REPLY_TIMEOUT
         } else {
             REPLY_TIMEOUT
-        };
+        });
         match tokio::time::timeout(wait, rx).await {
             Ok(Ok(response)) => Ok(response),
             _ => {
                 self.pending.lock().unwrap().remove(&key);
-                bail!("the device did not respond")
+                Err(NoReply.into())
             }
         }
     }
@@ -1027,7 +1045,7 @@ impl Hub {
             cluster: cluster_id | zdo::cluster::RESPONSE,
             tsn,
         };
-        self.request(key, nwk, ZDO_PROFILE, cluster_id, 0, 0, data)
+        self.request(key, nwk, ZDO_PROFILE, cluster_id, 0, 0, data, None)
             .await
     }
 
@@ -1055,11 +1073,28 @@ impl Hub {
         command: u8,
         payload: &[u8],
     ) -> Result<(zcl::Header, Vec<u8>)> {
+        self.zcl_request_within(nwk, ep, cluster_id, frame_control, manufacturer, command, payload, None)
+            .await
+    }
+
+    /// `wait` overrides the reply timeout
+    #[allow(clippy::too_many_arguments)]
+    async fn zcl_request_within(
+        &self,
+        nwk: u16,
+        ep: u8,
+        cluster_id: u16,
+        frame_control: u8,
+        manufacturer: Option<u16>,
+        command: u8,
+        payload: &[u8],
+        wait: Option<Duration>,
+    ) -> Result<(zcl::Header, Vec<u8>)> {
         let seq = self.next_seq();
         let frame = zcl::manufacturer_frame(frame_control, manufacturer, seq, command, payload);
         let key = PendingKey::Zcl { nwk, seq };
         let response = self
-            .request(key, nwk, HA_PROFILE, cluster_id, HUB_ENDPOINT, ep, frame)
+            .request(key, nwk, HA_PROFILE, cluster_id, HUB_ENDPOINT, ep, frame, wait)
             .await?;
         let (header, body) =
             zcl::Header::parse(&response).ok_or_else(|| anyhow!("malformed ZCL response"))?;
@@ -1364,14 +1399,7 @@ impl Hub {
                     .or_default()
                     .insert(key.to_owned(), value);
                 self.emit_device(ieee);
-                // A write only reaches a sleepy device while it is awake (indirect
-                // transmissions wait 7.68 s). Try now if it just sent something.
-                if device
-                    .last_seen
-                    .is_some_and(|seen| now_unix().saturating_sub(seen) <= AWAKE_WINDOW_SECONDS)
-                {
-                    self.flush_pending_writes(device.nwk);
-                }
+                self.spawn_eager_writes(ieee.to_owned());
                 Ok(true)
             }
             Source::Attr { cluster, write, .. } => {
@@ -1494,6 +1522,10 @@ impl Hub {
     }
 
     async fn write_attribute(&self, device: &Device, feature: &Feature, value: &Json) -> Result<()> {
+        self.write_attribute_within(device, feature, value, None).await
+    }
+
+    async fn write_attribute_within(&self, device: &Device, feature: &Feature, value: &Json, wait: Option<Duration>) -> Result<()> {
         let Source::Attr {
             cluster,
             attr,
@@ -1509,7 +1541,7 @@ impl Hub {
         let ep = device.endpoint_with(cluster).context("the device lacks the attribute's cluster")?;
         let payload = zcl::write_attribute_payload(attr, ty, &bytes);
         let (header, body) = self
-            .zcl_request_with(device.nwk, ep, cluster, 0x00, manufacturer, zcl::cmd::WRITE_ATTRIBUTES, &payload)
+            .zcl_request_within(device.nwk, ep, cluster, 0x00, manufacturer, zcl::cmd::WRITE_ATTRIBUTES, &payload, wait)
             .await?;
         if header.command != zcl::cmd::WRITE_ATTRIBUTES_RSP || !zcl::all_success(&body) {
             bail!("the device rejected the value ({body:02x?})");
@@ -1651,21 +1683,83 @@ impl Hub {
         }
         let hub = self.clone();
         tokio::spawn(async move {
-            let features = devices::features(&device);
-            for (key, value) in pending {
-                let Some(feature) = features.iter().find(|f| f.key == key) else {
-                    continue;
-                };
-                match hub.write_attribute(&device, feature, &value).await {
-                    Ok(()) => settle_pending(&mut hub.pending_writes.lock().unwrap(), &device.ieee, &key, &value),
-                    Err(e) => warn!(
-                        "{} {key} not written, retrying at the next wake-up: {e:#}",
-                        device.ieee
-                    ),
-                }
+            for (key, error) in hub.write_pending(&device, pending, None).await {
+                warn!("{} {key} not written, retrying at the next wake-up: {error:#}", device.ieee);
             }
             hub.writing.lock().unwrap().remove(&device.ieee);
             hub.emit_device(&device.ieee);
+        });
+    }
+
+    /// Writes queued values; a confirmed one leaves the queue. Returns the failures. The
+    /// caller holds the device's `writing` slot.
+    async fn write_pending(
+        &self,
+        device: &Device,
+        pending: BTreeMap<String, Json>,
+        wait: Option<Duration>,
+    ) -> Vec<(String, anyhow::Error)> {
+        let features = devices::features(device);
+        let mut failures = Vec::new();
+        for (key, value) in pending {
+            let Some(feature) = features.iter().find(|f| f.key == key) else {
+                continue;
+            };
+            match self.write_attribute_within(device, feature, &value, wait).await {
+                Ok(()) => settle_pending(&mut self.pending_writes.lock().unwrap(), &device.ieee, &key, &value),
+                Err(e) => failures.push((key, e)),
+            }
+        }
+        failures
+    }
+
+    /// A sleepy device takes a frame when it next polls its parent, and the frame waits
+    /// for that only 7.68 s. Devices that poll every few seconds (TRVZB) get their writes
+    /// right away this way, as with Zigbee2MQTT; the attempts repeat for a while, after
+    /// which the queue waits for the device's next wake-up.
+    fn spawn_eager_writes(self: &Arc<Self>, ieee: String) {
+        if !self.eager_writes.lock().unwrap().insert(ieee.clone()) {
+            return; // the running attempts pick up the new value
+        }
+        let hub = self.clone();
+        tokio::spawn(async move {
+            let started = Instant::now();
+            let mut attempt = 0;
+            while started.elapsed() < EAGER_WRITE_WINDOW {
+                let Some(pending) = hub.pending_writes.lock().unwrap().get(&ieee).cloned() else {
+                    break;
+                };
+                let Some(device) = hub.device(&ieee) else {
+                    break;
+                };
+                if !hub.writing.lock().unwrap().insert(ieee.clone()) {
+                    // A wake-up write is under way
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
+                attempt += 1;
+                let failures = hub.write_pending(&device, pending, Some(EAGER_WRITE_WAIT)).await;
+                hub.writing.lock().unwrap().remove(&ieee);
+                hub.emit_device(&ieee);
+                if failures.is_empty() {
+                    info!(
+                        "{ieee} written {:.1} s after the request (attempt {attempt})",
+                        started.elapsed().as_secs_f32()
+                    );
+                    break;
+                }
+                // A rejection is final; only a missing reply is worth repeating
+                if failures.iter().any(|(_, e)| !e.is::<NoReply>()) {
+                    for (key, e) in &failures {
+                        warn!("{ieee} {key} not written: {e:#}");
+                    }
+                    break;
+                }
+            }
+            if hub.pending_writes.lock().unwrap().contains_key(&ieee) {
+                info!("{ieee} did not take the write within {} s; waiting for its next wake-up", EAGER_WRITE_WINDOW.as_secs());
+            }
+            hub.eager_writes.lock().unwrap().remove(&ieee);
         });
     }
 
