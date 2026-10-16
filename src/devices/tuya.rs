@@ -1,5 +1,5 @@
-//! Tuya cihazları. DP eşlemeleri zigbee-herdsman-converters `tuya.ts` ve daha ayrıntılı
-//! olduğunda tuya-local tanımlarından.
+//! Tuya devices. Datapoint maps come from zigbee-herdsman-converters `tuya.ts`, and from
+//! tuya-local where it has more detail.
 
 use super::common::numeric;
 use super::{Card, Conv, Definition, Feature, Fingerprint, Kind, Place, Source, TimeBase};
@@ -25,7 +25,7 @@ const fn whole() -> Conv {
 
 const BOOL: Conv = Conv::Bool { on: 1, off: 0 };
 
-// ---- RTI-Tek T5Z / Tuya ZWT07 duvar termostatı (`_TZE200_g9a3awaj`) ----
+// ---- RTI-Tek T5Z / Tuya ZWT07 wall thermostat (`_TZE200_g9a3awaj`) ----
 // tuya-local: rtitek_t5z_thermostat.yaml
 
 const MODES: &[(i64, &str)] = &[(0, "off"), (1, "heat")];
@@ -34,19 +34,22 @@ const WORKING_WEEK: &[(i64, &str)] = &[(0, "5_2"), (1, "6_1"), (2, "7")];
 
 pub static ZWT07: Definition = Definition {
     fingerprint: &[Fingerprint::Manufacturer("_TZE200_g9a3awaj")],
-    name: Some("Termostat"),
+    vendor: "Tuya",
+    description: "Wall-mount thermostat",
+    name: Some("Thermostat"),
     card: Card::Thermostat,
     features: &[
         Feature::new(
             "temperature",
-            "Oda sıcaklığı",
+            "Local temperature",
             numeric("°C", None, None, None),
             Place::Card,
             dp(24, dp_type::VALUE, tenths()),
-        ),
+        )
+        .describe("Current temperature measured on the device"),
         Feature::new(
             "setpoint",
-            "Hedef sıcaklık",
+            "Heating setpoint",
             Kind::Numeric {
                 unit: "°C",
                 min: Some(5.0),
@@ -56,61 +59,73 @@ pub static ZWT07: Definition = Definition {
             },
             Place::Card,
             dp(16, dp_type::VALUE, tenths()),
-        ),
+        )
+        .describe("Temperature setpoint"),
         Feature::new(
             "system_mode",
-            "Mod",
+            "System mode",
             Kind::Enum { values: &["off", "heat"] },
             Place::Card,
             dp(1, dp_type::BOOL, Conv::Enum(MODES)),
-        ),
+        )
+        .describe("Mode of this device"),
         Feature::new(
             "preset",
-            "Çalışma",
+            "Preset",
             Kind::Enum {
                 values: &["manual", "program"],
             },
             Place::Card,
             dp(2, dp_type::ENUM, Conv::Enum(PRESETS)),
-        ),
-        Feature::new("heating", "Isıtıyor", Kind::Binary, Place::Card, dp(36, dp_type::ENUM, BOOL)).read_only(),
-        Feature::new("battery", "Pil", numeric("%", None, None, None), Place::Card, dp(9, dp_type::VALUE, whole()))
-            .read_only(),
-        Feature::new("frost", "Donma koruması", Kind::Binary, Place::Config, dp(10, dp_type::BOOL, BOOL)),
-        Feature::new("child_lock", "Çocuk kilidi", Kind::Binary, Place::Config, dp(40, dp_type::BOOL, BOOL)),
+        )
+        .describe("manual: hold the setpoint. program: follow the weekly schedule"),
+        Feature::new("heating", "Running state", Kind::Binary, Place::Card, dp(36, dp_type::ENUM, BOOL))
+            .read_only()
+            .describe("The current running state: heating or idle"),
+        Feature::new("battery", "Battery", numeric("%", None, None, None), Place::Card, dp(9, dp_type::VALUE, whole()))
+            .read_only()
+            .describe("Remaining battery in %"),
+        Feature::new("frost", "Frost protection", Kind::Binary, Place::Config, dp(10, dp_type::BOOL, BOOL))
+            .describe("Antifreeze function"),
+        Feature::new("child_lock", "Child lock", Kind::Binary, Place::Config, dp(40, dp_type::BOOL, BOOL))
+            .describe("Enables/disables physical input on the device"),
         Feature::new(
             "working_week",
-            "Çalışma haftası",
+            "Working week",
             Kind::Enum {
                 values: &["5_2", "6_1", "7"],
             },
             Place::Config,
             dp(31, dp_type::ENUM, Conv::Enum(WORKING_WEEK)),
-        ),
+        )
+        .describe("How the weekly schedule splits the week: 5 workdays + 2, 6 + 1, or the same 7 days"),
         Feature::new(
             "temperature_calibration",
-            "Sıcaklık düzeltmesi",
+            "Local temperature calibration",
             numeric("°C", Some(-9.9), Some(9.9), Some(0.1)),
             Place::Config,
             dp(109, dp_type::VALUE, tenths()),
-        ),
+        )
+        .describe("Offset to add/subtract to the local temperature"),
         Feature::new(
             "min_temperature",
-            "En düşük hedef",
+            "Minimum setpoint",
             numeric("°C", Some(5.0), Some(20.0), Some(1.0)),
             Place::Config,
             dp(18, dp_type::VALUE, tenths()),
-        ),
+        )
+        .describe("Lowest heating setpoint the thermostat accepts"),
         Feature::new(
             "max_temperature",
-            "En yüksek hedef",
+            "Maximum setpoint",
             numeric("°C", Some(21.0), Some(95.0), Some(1.0)),
             Place::Config,
             dp(19, dp_type::VALUE, tenths()),
-        ),
+        )
+        .describe("Highest heating setpoint the thermostat accepts"),
         Feature::new(
             "schedule",
-            "Haftalık program",
+            "Weekly schedule",
             Kind::Schedule {
                 min: 5.0,
                 max: 95.0,
@@ -118,10 +133,13 @@ pub static ZWT07: Definition = Definition {
             },
             Place::Config,
             Source::TuyaSchedule { dp: 67, divisor: 10.0 },
-        ),
-        Feature::new("fault", "Arıza kodu", numeric("", None, None, None), Place::Diagnostic, dp(45, dp_type::BITMAP, whole()))
-            .read_only(),
-        Feature::new("product_info", "Ürün bilgisi", Kind::Text, Place::Diagnostic, dp(105, dp_type::STRING, Conv::Text)),
+        )
+        .describe("From each time on, the thermostat targets the given temperature (used in the program preset)"),
+        Feature::new("fault", "Fault", numeric("", None, None, None), Place::Diagnostic, dp(45, dp_type::BITMAP, whole()))
+            .read_only()
+            .describe("Fault bitmap reported by the device; 0 means no fault"),
+        Feature::new("product_info", "Product info", Kind::Text, Place::Diagnostic, dp(105, dp_type::STRING, Conv::Text))
+            .describe("Product identifier reported by the device"),
     ],
     binds: &[],
     time_base: TimeBase::Zigbee2000,
@@ -154,7 +172,7 @@ mod tests {
         Some((feature.key, value))
     }
 
-    /// Termostatın DATA_QUERY'ye verdiği gerçek yanıtlar (zhub günlüğünden)
+    /// Real replies of the thermostat to DATA_QUERY (from the zhub log)
     #[test]
     fn decodes_observed_datapoints() {
         let observed = [

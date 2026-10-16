@@ -1,6 +1,6 @@
 #!/bin/sh
-# zhub: Zigbee merkezi. Entware açılışta /opt/etc/init.d/S* betiklerini çalıştırır.
-# Süreç çökerse (ya da dongle açılışta henüz hazır değilse) 5 sn sonra yeniden başlar.
+# zhub: Zigbee hub. Entware runs /opt/etc/init.d/S* scripts at boot.
+# If the process dies (or the dongle is not ready yet at boot) it restarts after 5 s.
 
 ARGS="--device /dev/ttyUSB0 --baudrate 921600 --log-level info,ziggurat_driver=warn"
 BIN=/opt/bin/zhub
@@ -14,7 +14,7 @@ running() {
 
 start() {
     if running; then
-        echo "zhub zaten çalışıyor"
+        echo "zhub is already running"
         return 0
     fi
     mkdir -p /opt/var/log /opt/var/run
@@ -28,25 +28,25 @@ start() {
             $BIN $ARGS >> "$LOG" 2>&1 &
             child=$!
             wait "$child"
-            echo "$(date '+%F %T') zhub çıktı (kod $?), 5 sn sonra yeniden başlıyor" >> "$LOG"
+            echo "$(date '+%F %T') zhub exited (code $?), restarting in 5 s" >> "$LOG"
             sleep 5
         done
     ) < /dev/null > /dev/null 2>&1 &
     echo $! > "$PIDFILE"
-    echo "zhub başlatıldı"
+    echo "zhub started"
 }
 
 stop() {
     if running; then
         kill "$(cat "$PIDFILE")"
-        # zhub durumunu kaydedip çıksın
+        # let zhub save its state and exit
         for _ in 1 2 3 4 5 6 7 8 9 10; do
             pidof zhub > /dev/null || break
             sleep 1
         done
-        echo "zhub durduruldu"
+        echo "zhub stopped"
     else
-        echo "zhub çalışmıyor"
+        echo "zhub is not running"
     fi
     rm -f "$PIDFILE"
 }
@@ -55,6 +55,6 @@ case "$1" in
     start) start ;;
     stop) stop ;;
     restart) stop; start ;;
-    status) if running; then echo "çalışıyor"; else echo "çalışmıyor"; exit 1; fi ;;
-    *) echo "Kullanım: $0 {start|stop|restart|status}"; exit 1 ;;
+    status) if running; then echo "running"; else echo "not running"; exit 1; fi ;;
+    *) echo "Usage: $0 {start|stop|restart|status}"; exit 1 ;;
 esac

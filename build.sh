@@ -1,6 +1,6 @@
 #!/bin/sh
-# Keenetic (MIPS big-endian, soft-float) için statik zhub ikilisi üretir.
-# Kullanım: ./build.sh  → target/mips-unknown-linux-musl/release/zhub
+# Builds a static zhub binary for Keenetic (MIPS big-endian, soft-float).
+# Usage: ./build.sh  → target/mips-unknown-linux-musl/release/zhub
 set -e
 cd "$(dirname "$0")"
 docker build -q -t zhub-mips-builder docker >/dev/null

@@ -19,37 +19,37 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
-#[command(version, about = "Ziggurat üzerinde hafif Zigbee merkezi")]
+#[command(version, about = "A lightweight Zigbee hub on top of Ziggurat")]
 struct Args {
-    /// RCP'nin seri portu
+    /// Serial port of the RCP
     #[arg(long, default_value = "/dev/ttyUSB0")]
     device: String,
 
-    /// Seri hız; Sonoff'un OpenThread RCP 3.x derlemeleri 921600 kullanıyor
+    /// Serial baud rate; SONOFF's OpenThread RCP 3.x builds use 921600
     #[arg(long, default_value_t = 921_600)]
     baudrate: u32,
 
-    /// Ağ ve cihaz kayıtlarının tutulduğu dosya
+    /// File holding the network and device records
     #[arg(long, default_value = "/opt/var/lib/zhub/state.json")]
     state: PathBuf,
 
-    /// Web arayüzünün dinleyeceği adres
+    /// Address the web UI listens on
     #[arg(long, default_value = "0.0.0.0:8099")]
     listen: String,
 
-    /// Yalnızca yeni ağ kurulurken kullanılır
+    /// Only used when forming a new network
     #[arg(long, default_value_t = 11, value_parser = clap::value_parser!(u8).range(11..=26))]
     channel: u8,
 
-    /// Verici gücü (dBm); yalnızca yeni ağ kurulurken kullanılır
+    /// Transmit power (dBm); only used when forming a new network
     #[arg(long, default_value_t = 8)]
     tx_power: i8,
 
-    /// Tanılama: radyoyu karışık moda alıp MAC komut çerçevelerini günlüğe yazar
+    /// Diagnostics: put the radio in promiscuous mode and log MAC command frames
     #[arg(long)]
     sniff: bool,
 
-    /// Günlük düzeyi (RUST_LOG ayrıntılı süzgeçlerle üstün gelir)
+    /// Log level (RUST_LOG with per-module filters takes precedence)
     #[arg(long, default_value = "info")]
     log_level: String,
 }
@@ -58,7 +58,7 @@ fn main() -> Result<()> {
     let args = Args::parse();
 
     tracing_subscriber::fmt()
-        // Servis günlüğü dosyaya yazar; renk kodları orada yalnızca gürültü
+        // The service logs to a file, where color codes are just noise
         .with_ansi(std::io::stderr().is_terminal())
         .with_writer(std::io::stderr)
         .with_env_filter(
@@ -66,7 +66,7 @@ fn main() -> Result<()> {
         )
         .init();
 
-    // Modemin dört çekirdeği var ama işin çoğu G/Ç; iki iş parçacığı belleği korur
+    // The router has four cores but the work is mostly I/O; two threads save memory
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -88,7 +88,7 @@ async fn run(args: Args) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&args.listen)
         .await
         .with_context(|| format!("{} dinlenemedi", args.listen))?;
-    info!("Web arayüzü: http://{}", args.listen);
+    info!("Web UI: http://{}", args.listen);
 
     let mut terminate = signal(SignalKind::terminate())?;
     let mut interrupt = signal(SignalKind::interrupt())?;
@@ -96,8 +96,8 @@ async fn run(args: Args) -> Result<()> {
 
     tokio::select! {
         result = server => result?,
-        _ = terminate.recv() => info!("SIGTERM alındı, kapanıyor"),
-        _ = interrupt.recv() => info!("SIGINT alındı, kapanıyor"),
+        _ = terminate.recv() => info!("SIGTERM received, shutting down"),
+        _ = interrupt.recv() => info!("SIGINT received, shutting down"),
     }
 
     hub.refresh_tables();

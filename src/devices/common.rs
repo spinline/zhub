@@ -1,5 +1,6 @@
-//! Standart ZCL kümelerinin özellikleri (Zigbee2MQTT'deki modernExtend karşılığı).
-//! Tanımı olmayan cihazlar bunlardan, sundukları kümelere göre otomatik tanım alır.
+//! Features of the standard ZCL clusters (the counterpart of Zigbee2MQTT's modernExtend).
+//! Devices without a definition get one built from these, based on their clusters.
+//! Descriptions are taken from Zigbee2MQTT's exposes.
 
 use super::{Conv, Feature, Kind, Place, Report, Source, Write};
 use crate::store::Device;
@@ -36,27 +37,29 @@ pub const fn numeric(unit: &'static str, min: Option<f64>, max: Option<f64>, ste
 
 const NO_READING_INT16: Option<i64> = Some(-0x8000);
 
-// ---- Işık ----
+// ---- Light ----
 
 pub const ON_OFF: Feature = Feature::new(
     "on",
-    "Açık",
+    "State",
     Kind::Binary,
     Place::Card,
     attr(cluster::ON_OFF, 0x0000, types::BOOL, Conv::Bool { on: 1, off: 0 }, Write::OnOff, report(0, 300, 0)),
-);
+)
+.describe("On/off state of this light");
 
 pub const BRIGHTNESS: Feature = Feature::new(
     "level",
-    "Parlaklık",
+    "Brightness",
     numeric("", Some(1.0), Some(254.0), Some(1.0)),
     Place::Card,
     attr(cluster::LEVEL, 0x0000, types::UINT8, number(1.0, None), Write::Level, report(1, 300, 1)),
-);
+)
+.describe("Brightness of this light");
 
 pub const COLOR_TEMP: Feature = Feature::new(
     "color_temp",
-    "Renk sıcaklığı",
+    "Color temperature",
     Kind::Numeric {
         unit: "mired",
         min: Some(153.0),
@@ -66,67 +69,75 @@ pub const COLOR_TEMP: Feature = Feature::new(
     },
     Place::Card,
     attr(cluster::COLOR, 0x0007, types::UINT16, number(1.0, None), Write::ColorTemp, report(1, 300, 1)),
-);
+)
+.describe("Color temperature of this light");
 
 pub const COLOR_TEMP_MIN: Feature = Feature::new(
     "color_temp_min",
-    "En soğuk renk",
+    "Coldest color temperature",
     numeric("mired", None, None, None),
     Place::Hidden,
     attr(cluster::COLOR, 0x400B, types::UINT16, number(1.0, None), Write::No, None),
-);
+)
+.describe("Coldest color temperature the light supports");
 
 pub const COLOR_TEMP_MAX: Feature = Feature::new(
     "color_temp_max",
-    "En sıcak renk",
+    "Warmest color temperature",
     numeric("mired", None, None, None),
     Place::Hidden,
     attr(cluster::COLOR, 0x400C, types::UINT16, number(1.0, None), Write::No, None),
-);
+)
+.describe("Warmest color temperature the light supports");
 
-// ---- Ölçümler ----
+// ---- Measurements ----
 
 pub const TEMPERATURE: Feature = Feature::new(
     "temperature",
-    "Sıcaklık",
+    "Temperature",
     numeric("°C", None, None, None),
     Place::Card,
     attr(cluster::TEMPERATURE, 0x0000, types::INT16, number(100.0, NO_READING_INT16), Write::No, report(30, 1800, 20)),
-);
+)
+.describe("Measured temperature value");
 
 pub const HUMIDITY: Feature = Feature::new(
     "humidity",
-    "Nem",
+    "Humidity",
     numeric("%", None, None, None),
     Place::Card,
     attr(cluster::HUMIDITY, 0x0000, types::UINT16, number(100.0, Some(0xFFFF)), Write::No, report(30, 1800, 100)),
-);
+)
+.describe("Measured relative humidity");
 
 pub const OCCUPANCY: Feature = Feature::new(
     "occupancy",
-    "Varlık",
+    "Occupancy",
     Kind::Binary,
     Place::Card,
     attr(cluster::OCCUPANCY, 0x0000, types::BITMAP8, Conv::Bit(0), Write::No, report(0, 1800, 0)),
-);
+)
+.describe("Indicates whether the device detected occupancy");
 
 pub const BATTERY: Feature = Feature::new(
     "battery",
-    "Pil",
+    "Battery",
     numeric("%", None, None, None),
     Place::Card,
     attr(cluster::POWER_CONFIG, 0x0021, types::UINT8, Conv::BatteryHalfPercent, Write::No, report(3600, 21600, 2)),
-);
+)
+.describe("Remaining battery in %, can take up to 24 hours before reported");
 
 pub const VOLTAGE: Feature = Feature::new(
     "voltage",
-    "Pil voltajı",
+    "Voltage",
     numeric("V", None, None, None),
     Place::Diagnostic,
     attr(cluster::POWER_CONFIG, 0x0020, types::UINT8, number(10.0, Some(0xFF)), Write::No, None),
-);
+)
+.describe("Voltage of the battery");
 
-// ---- IAS bölgesi (kapı, hareket, su…) ----
+// ---- IAS zone (contact, motion, water leak…) ----
 
 pub const ALARM: Feature = Feature::new(
     "alarm",
@@ -134,79 +145,87 @@ pub const ALARM: Feature = Feature::new(
     Kind::Binary,
     Place::Card,
     attr(cluster::IAS_ZONE, 0x0002, types::BITMAP16, Conv::Bit(0), Write::No, None),
-);
+)
+.describe("Zone alarm 1: open for a contact sensor, motion for a motion sensor");
 
 pub const BATTERY_LOW: Feature = Feature::new(
     "battery_low",
-    "Pil zayıf",
+    "Battery low",
     Kind::Binary,
     Place::Diagnostic,
     attr(cluster::IAS_ZONE, 0x0002, types::BITMAP16, Conv::Bit(3), Write::No, None),
-);
+)
+.describe("Indicates if the battery of this device is almost empty");
 
-/// Arayüz alarmın adını bundan seçer: 0x0015 kapı/pencere, 0x000D hareket…
+/// The UI names the alarm after this: 0x0015 contact, 0x000D motion…
 pub const ZONE_TYPE: Feature = Feature::new(
     "zone_type",
-    "Bölge türü",
+    "Zone type",
     numeric("", None, None, None),
     Place::Hidden,
     attr(cluster::IAS_ZONE, 0x0001, types::ENUM16, number(1.0, None), Write::No, None),
-);
+)
+.describe("IAS zone type reported by the device");
 
-// ---- Termostat kümesi (0x0201) ----
+// ---- Thermostat cluster (0x0201) ----
 
 pub mod thermostat {
     use super::*;
 
     pub const LOCAL_TEMPERATURE: Feature = Feature::new(
         "temperature",
-        "Oda sıcaklığı",
+        "Local temperature",
         numeric("°C", None, None, None),
         Place::Card,
         attr(cluster::THERMOSTAT, 0x0000, types::INT16, number(100.0, NO_READING_INT16), Write::No, report(10, 3600, 10)),
-    );
+    )
+    .describe("Current temperature measured on the device");
 
     pub const fn setpoint(min: f64, max: f64, step: f64) -> Feature {
         Feature::new(
             "setpoint",
-            "Hedef sıcaklık",
+            "Heating setpoint",
             numeric("°C", Some(min), Some(max), Some(step)),
             Place::Card,
             attr(cluster::THERMOSTAT, 0x0012, types::INT16, number(100.0, None), Write::Attribute, report(0, 3600, 10)),
         )
+        .describe("Temperature setpoint")
     }
 
     pub const fn system_mode(map: &'static [(i64, &'static str)], names: &'static [&'static str]) -> Feature {
         Feature::new(
             "system_mode",
-            "Mod",
+            "System mode",
             Kind::Enum { values: names },
             Place::Card,
             attr(cluster::THERMOSTAT, 0x001C, types::ENUM8, Conv::Enum(map), Write::Attribute, report(0, 3600, 0)),
         )
+        .describe("Mode of this device")
     }
 
-    /// Running State bit 0: ısıtıyor
+    /// Running State bit 0: heating
     pub const HEATING: Feature = Feature::new(
         "heating",
-        "Isıtıyor",
+        "Running state",
         Kind::Binary,
         Place::Card,
         attr(cluster::THERMOSTAT, 0x0029, types::BITMAP16, Conv::Bit(0), Write::No, report(0, 3600, 0)),
-    );
+    )
+    .describe("The current running state: heating or idle");
 
     pub const fn calibration(min: f64, max: f64, step: f64) -> Feature {
         Feature::new(
             "temperature_calibration",
-            "Sıcaklık düzeltmesi",
+            "Local temperature calibration",
             numeric("°C", Some(min), Some(max), Some(step)),
             Place::Config,
             attr(cluster::THERMOSTAT, 0x0010, types::INT8, number(10.0, None), Write::Attribute, None),
         )
+        .describe("Offset to add/subtract to the local temperature")
     }
 }
 
-/// Tanımı olmayan cihaz: sunduğu standart kümelere göre özellikler
+/// A device without a definition: features based on the standard clusters it offers
 pub fn from_clusters(device: &Device) -> Vec<&'static Feature> {
     let mut features: Vec<&'static Feature> = Vec::new();
     let has = |c| device.has_cluster(c);

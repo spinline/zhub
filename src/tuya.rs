@@ -1,6 +1,6 @@
-//! Tuya'nın `0xEF00` kümesi: cihaz değerlerini standart ZCL öznitelikleri yerine
-//! numaralı "veri noktaları" (DP) olarak taşır. DP'lerin anlamı modele göre değişir;
-//! eşlemeler zigbee-herdsman-converters'taki tanımlardan alınmıştır.
+//! Tuya's `0xEF00` cluster carries device values as numbered "datapoints" (DPs)
+//! instead of standard ZCL attributes. What a DP means depends on the model; the maps
+//! live in `devices::tuya`.
 
 use serde_json::{Value as Json, json};
 
@@ -26,7 +26,7 @@ pub mod dp_type {
     pub const BITMAP: u8 = 5;
 }
 
-/// 1970 ile 2000 arasındaki saniye; bazı Tuya cihazları saati 2000'den sayar
+/// Seconds between 1970 and 2000; some Tuya devices count time from 2000
 const SECONDS_1970_TO_2000: u64 = 946_684_800;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,7 +61,7 @@ impl Datapoint {
         }
     }
 
-    /// Sayısal türlerin değeri (değerler büyük-uçlu ve işaretli)
+    /// The value of the numeric types (big-endian and signed)
     pub fn as_int(&self) -> Option<i64> {
         match self.ty {
             dp_type::BOOL | dp_type::ENUM => self.data.first().map(|&b| i64::from(b)),
@@ -74,7 +74,7 @@ impl Datapoint {
     }
 }
 
-/// Yanıt/rapor yükü: sıra (2 bayt) ardından (dp, tür, uzunluk BE, veri)*
+/// Response/report payload: sequence (2 bytes), then (dp, type, length BE, data)*
 pub fn parse_datapoints(payload: &[u8]) -> Vec<Datapoint> {
     let mut rest = payload.get(2..).unwrap_or_default();
     let mut out = Vec::new();
@@ -104,7 +104,7 @@ pub fn data_request(seq: u16, datapoints: &[Datapoint]) -> Vec<u8> {
     out
 }
 
-/// mcuSyncTime yanıtı: yük uzunluğu (ZCL uint16), UTC ve yerel saat (BE saniye)
+/// mcuSyncTime response: payload length (ZCL uint16), UTC and local time (BE seconds)
 pub fn time_sync_payload(unix_seconds: u64, utc_offset: i64, since_2000: bool) -> Vec<u8> {
     let base = if since_2000 { SECONDS_1970_TO_2000 } else { 0 };
     let utc = unix_seconds.saturating_sub(base) as i64;
@@ -115,8 +115,8 @@ pub fn time_sync_payload(unix_seconds: u64, utc_offset: i64, since_2000: bool) -
     out
 }
 
-/// Yerel saatin UTC'den farkı (saniye). Keenetic saat dilimini `/etc/TZ` dosyasına
-/// POSIX biçiminde yazıyor (ör. `<+03>-3`); yaz saati kuralları yok sayılır.
+/// Local time offset from UTC (seconds). Keenetic writes the time zone to `/etc/TZ` in
+/// POSIX form (e.g. `<+03>-3`); daylight saving rules are ignored.
 pub fn utc_offset_seconds() -> i64 {
     std::env::var("TZ")
         .ok()
@@ -127,7 +127,7 @@ pub fn utc_offset_seconds() -> i64 {
 }
 
 fn parse_posix_tz_offset(tz: &str) -> Option<i64> {
-    // Saat dilimi adı: <...> ya da harfler
+    // Time zone name: <...> or letters
     let rest = if let Some(stripped) = tz.strip_prefix('<') {
         &stripped[stripped.find('>')? + 1..]
     } else {
@@ -146,12 +146,12 @@ fn parse_posix_tz_offset(tz: &str) -> Option<i64> {
     let hours = parts.next()??;
     let minutes = parts.next().flatten().unwrap_or(0);
     let seconds = parts.next().flatten().unwrap_or(0);
-    // POSIX'te işaret ters: "-3" UTC'nin 3 saat ilerisi
+    // POSIX inverts the sign: "-3" is three hours ahead of UTC
     Some(-sign * (hours * 3600 + minutes * 60 + seconds))
 }
 
-/// Ham baytlı haftalık program: 4 baytlık [saat, dakika, sıcaklık×bölen (BE u16)]
-/// dilimleri. Özellik değeri olarak [{"time": "SS:DD", "temperature": t}, …]
+/// A raw weekly schedule: 4-byte [hour, minute, temperature×divisor (BE u16)] slots.
+/// As a feature value: [{"time": "HH:MM", "temperature": t}, …]
 pub fn decode_schedule(data: &[u8], divisor: f64) -> Json {
     Json::Array(
         data.chunks_exact(4)
@@ -165,18 +165,18 @@ pub fn decode_schedule(data: &[u8], divisor: f64) -> Json {
     )
 }
 
-/// Programı geri kodlar. Dilim sayısı cihazın bildirdiğiyle aynı kalmalı: cihazın
-/// beklediği düzen (hafta içi/sonu dilimleri) bu sayıya bağlı.
+/// Encodes a schedule back. The slot count must stay as the device reported it: the
+/// layout the device expects (weekday/weekend slots) depends on it.
 pub fn encode_schedule(
     value: &Json,
     expected_slots: Option<usize>,
     (min, max, step): (f64, f64, f64),
     divisor: f64,
 ) -> Result<Vec<u8>, String> {
-    let slots = value.as_array().ok_or("program bir dilim listesi olmalı")?;
+    let slots = value.as_array().ok_or("the schedule must be a list of slots")?;
     if expected_slots != Some(slots.len()) {
         return Err(format!(
-            "program {} dilim olmalı (cihazın bildirdiği düzen)",
+            "the schedule must have {} slots (the layout the device reported)",
             expected_slots.unwrap_or(0)
         ));
     }
@@ -187,12 +187,12 @@ pub fn encode_schedule(
             .split_once(':')
             .and_then(|(h, m)| Some((h.parse::<u8>().ok()?, m.parse::<u8>().ok()?)))
             .filter(|&(h, m)| h < 24 && m < 60)
-            .ok_or_else(|| format!("geçersiz saat: {time}"))?;
+            .ok_or_else(|| format!("invalid time: {time}"))?;
         let temperature = slot
             .get("temperature")
             .and_then(Json::as_f64)
             .filter(|t| t.is_finite() && (min..=max).contains(t))
-            .ok_or_else(|| format!("sıcaklık {min}-{max} °C arasında olmalı"))?;
+            .ok_or_else(|| format!("the temperature must be between {min} and {max} °C"))?;
         let raw = (temperature / step).round() * step * divisor;
         data.extend_from_slice(&[hour, minute]);
         data.extend_from_slice(&(raw.round() as u16).to_be_bytes());
@@ -206,7 +206,7 @@ mod tests {
 
     #[test]
     fn parses_multiple_datapoints() {
-        // sıra 0x0012; DP16 değer 215 (21.5 °C); DP1 bool true; DP36 enum 1
+        // sequence 0x0012; DP16 value 215 (21.5 °C); DP1 bool true; DP36 enum 1
         let payload = [
             0x00, 0x12, 16, 2, 0, 4, 0, 0, 0, 215, 1, 1, 0, 1, 1, 36, 4, 0, 1, 1,
         ];
@@ -236,8 +236,8 @@ mod tests {
         assert_eq!(parse_datapoints(&payload), [dp]);
     }
 
-    /// Termostatın gerçek programı (zhub günlüğünden): değiştirilmeden geri kodlanınca
-    /// aynı baytlar çıkmalı
+    /// The thermostat's real schedule (from the zhub log): encoding it back unchanged
+    /// must give the same bytes
     #[test]
     fn schedule_round_trips_observed_bytes() {
         let raw = [

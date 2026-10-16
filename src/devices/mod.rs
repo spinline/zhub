@@ -1,9 +1,10 @@
-//! Cihaz tanımları, Zigbee2MQTT'deki mantıkla: her cihaz bir parmak izi ve bir özellik
-//! listesinden oluşur. Bir özellik hem gelen değerin nasıl çözüleceğini (fromZigbee),
-//! hem yazmanın nasıl yapılacağını (toZigbee), hem de arayüz şemasını (exposes) taşır.
-//! Ana uygulama hiçbir cihaz türünü bilmez; yalnızca bu tanımları uygular.
+//! Device definitions, following the Zigbee2MQTT model: every device is a fingerprint
+//! plus a list of features. A feature carries how an incoming value is decoded
+//! (fromZigbee), how a write is performed (toZigbee) and its UI schema (exposes).
+//! The hub itself knows no device types; it only applies these definitions.
 //!
-//! Tanımlar zigbee-herdsman-converters'tan (ve gerektiğinde tuya-local'den) aktarılır.
+//! Definitions are ported from zigbee-herdsman-converters (and from tuya-local where it
+//! has more detail).
 
 pub mod common;
 pub mod sonoff;
@@ -23,17 +24,17 @@ pub enum Access {
     ReadWrite,
 }
 
-/// Arayüzde nerede durduğu
+/// Where the feature appears in the UI
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Place {
-    /// Kartın üzerinde: ana değerler ve sık kullanılan denetimler
+    /// On the card: primary values and frequently used controls
     Card,
-    /// Ayrıntılar'da, ayar olarak
+    /// A device setting
     Config,
-    /// Ayrıntılar'da, salt bilgi
+    /// Read-only diagnostic information
     Diagnostic,
-    /// Yalnızca başka özelliklerin hesabında kullanılır (ör. renk sıcaklığı aralığı)
+    /// Only used to compute other features (e.g. the color temperature range)
     Hidden,
 }
 
@@ -45,7 +46,7 @@ pub enum Kind {
         min: Option<f64>,
         max: Option<f64>,
         step: Option<f64>,
-        /// Aralığı cihazın bildirdiği başka iki özellik daraltıyorsa (en az, en çok)
+        /// Two other features the device reports that narrow the range (min, max)
         #[serde(skip_serializing_if = "Option::is_none")]
         range_keys: Option<(&'static str, &'static str)>,
     },
@@ -54,7 +55,7 @@ pub enum Kind {
         values: &'static [&'static str],
     },
     Text,
-    /// Haftalık program: (saat, sıcaklık) dilimleri
+    /// Weekly schedule: (time, temperature) slots
     Schedule {
         min: f64,
         max: f64,
@@ -62,18 +63,18 @@ pub enum Kind {
     },
 }
 
-/// Ham değer ile özellik değeri arasındaki dönüşüm
+/// Conversion between a raw value and the feature value
 #[derive(Debug, Clone, Copy)]
 pub enum Conv {
-    /// ham / bölen; `invalid` "ölçüm yok" anlamına gelen ham değer
+    /// raw / divisor; `invalid` is the raw value meaning "no reading"
     Number { divisor: f64, invalid: Option<i64> },
-    /// ham == on ise açık; yazarken on/off değerleri
+    /// On when raw == on; writes use the on/off values
     Bool { on: i64, off: i64 },
-    /// Tek bir bit (salt okunur)
+    /// A single bit (read-only)
     Bit(u32),
-    /// Ham değer ↔ ad; aynı ada birden çok ham değer düşebilir, yazmada ilki kullanılır
+    /// Raw value ↔ name; several raw values may map to one name, writes use the first
     Enum(&'static [(i64, &'static str)]),
-    /// Yarım yüzde birimli pil; 0xFF bilinmiyor
+    /// Battery in half-percent units; 0xFF means unknown
     BatteryHalfPercent,
     Text,
 }
@@ -105,25 +106,25 @@ impl Conv {
             .map(|t| json!(t))
     }
 
-    /// Özellik değerini ham tamsayıya çevirir
+    /// Converts a feature value to the raw integer
     pub fn encode(&self, value: &Json) -> Result<i64> {
         match *self {
             Self::Number { divisor, .. } => match value.as_f64() {
                 Some(v) if v.is_finite() => Ok((v * divisor).round() as i64),
-                _ => bail!("sayı bekleniyordu"),
+                _ => bail!("expected a number"),
             },
             Self::Bool { on, off } => match value.as_bool() {
                 Some(b) => Ok(if b { on } else { off }),
-                None => bail!("açık/kapalı bekleniyordu"),
+                None => bail!("expected true or false"),
             },
             Self::Enum(map) => {
                 let name = value.as_str().unwrap_or_default();
                 match map.iter().find(|(_, n)| *n == name) {
                     Some((raw, _)) => Ok(*raw),
-                    None => bail!("geçersiz seçim: {value}"),
+                    None => bail!("invalid option: {value}"),
                 }
             }
-            Self::Bit(_) | Self::BatteryHalfPercent | Self::Text => bail!("bu özellik yazılamaz"),
+            Self::Bit(_) | Self::BatteryHalfPercent | Self::Text => bail!("this feature is read-only"),
         }
     }
 }
@@ -132,16 +133,16 @@ fn round2(value: f64) -> Json {
     json!((value * 100.0).round() / 100.0)
 }
 
-/// Öznitelik yazmanın yolu: doğrudan öznitelik yazma ya da ışıklarda olduğu gibi komut
+/// How an attribute is written: a plain attribute write, or a command as with lights
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Write {
     No,
     Attribute,
-    /// On/Off kümesi: Kapat (0x00) / Aç (0x01)
+    /// On/Off cluster: Off (0x00) / On (0x01)
     OnOff,
-    /// Level kümesi: Move to Level (with On/Off)
+    /// Level cluster: Move to Level (with On/Off)
     Level,
-    /// Color kümesi: Move to Color Temperature
+    /// Color cluster: Move to Color Temperature
     ColorTemp,
 }
 
@@ -167,7 +168,7 @@ pub enum Source {
         dp_type: u8,
         conv: Conv,
     },
-    /// Tuya'nın ham baytlı haftalık programı (4 baytlık dilimler)
+    /// Tuya's raw weekly schedule (4-byte slots)
     TuyaSchedule { dp: u8, divisor: f64 },
 }
 
@@ -185,6 +186,8 @@ impl Source {
 pub struct Feature {
     pub key: &'static str,
     pub label: &'static str,
+    #[serde(skip_serializing_if = "str::is_empty")]
+    pub description: &'static str,
     pub kind: Kind,
     pub access: Access,
     pub place: Place,
@@ -202,6 +205,7 @@ impl Feature {
         Self {
             key,
             label,
+            description: "",
             kind,
             access,
             place,
@@ -209,7 +213,13 @@ impl Feature {
         }
     }
 
-    /// Yalnızca okunur olsun (ör. yazılabilir öznitelik ama arayüzde değiştirilmesin)
+    /// The help text shown under the feature (taken from Zigbee2MQTT where it has one)
+    pub const fn describe(mut self, description: &'static str) -> Self {
+        self.description = description;
+        self
+    }
+
+    /// Show as read-only even though the source could be written
     pub const fn read_only(mut self) -> Self {
         self.access = Access::Read;
         self
@@ -219,8 +229,8 @@ impl Feature {
         matches!(self.source, Source::Tuya { dp, .. } | Source::TuyaSchedule { dp, .. } if dp == id)
     }
 
-    /// Sayısal değerin geçerli aralığı: tanımdaki sınırlar, cihazın bildirdiği
-    /// sınırlarla (range_keys) daraltılmış
+    /// The valid range of a numeric value: the definition's limits, narrowed by the
+    /// limits the device reports (range_keys)
     pub fn range(&self, device: &Device) -> (Option<f64>, Option<f64>) {
         let Kind::Numeric { min, max, range_keys, .. } = self.kind else {
             return (None, None);
@@ -240,15 +250,15 @@ impl Feature {
         (narrowed_min, narrowed_max)
     }
 
-    /// Yazılacak değeri doğrular ve sayıları adıma yuvarlar
+    /// Validates a value to be written and snaps numbers to the step
     pub fn validate(&self, device: &Device, value: Json) -> Result<Json> {
         if self.access != Access::ReadWrite {
-            bail!("{} değiştirilemez", self.label);
+            bail!("{} is read-only", self.label);
         }
         match self.kind {
             Kind::Numeric { step, unit, .. } => {
                 let Some(mut v) = value.as_f64().filter(|v| v.is_finite()) else {
-                    bail!("{}: sayı bekleniyordu", self.label);
+                    bail!("{}: expected a number", self.label);
                 };
                 if let Some(step) = step {
                     v = (v / step).round() * step;
@@ -256,7 +266,7 @@ impl Feature {
                 let (min, max) = self.range(device);
                 if min.is_some_and(|m| v < m - 1e-9) || max.is_some_and(|m| v > m + 1e-9) {
                     bail!(
-                        "{} {}…{} {unit} arasında olmalı",
+                        "{} must be between {} and {} {unit}",
                         self.label,
                         min.map_or("-∞".into(), |m| m.to_string()),
                         max.map_or("∞".into(), |m| m.to_string())
@@ -265,10 +275,10 @@ impl Feature {
                 Ok(round2(v))
             }
             Kind::Binary if value.is_boolean() => Ok(value),
-            Kind::Binary => bail!("{}: açık/kapalı bekleniyordu", self.label),
+            Kind::Binary => bail!("{}: expected true or false", self.label),
             Kind::Enum { values } => match value.as_str() {
                 Some(v) if values.contains(&v) => Ok(value),
-                _ => bail!("{}: geçersiz seçim", self.label),
+                _ => bail!("{}: invalid option", self.label),
             },
             Kind::Schedule { .. } | Kind::Text => Ok(value),
         }
@@ -281,7 +291,7 @@ pub enum Fingerprint {
     Manufacturer(&'static str),
 }
 
-/// Arayüzün kart düzeni
+/// The card layout in the UI
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Card {
@@ -291,27 +301,37 @@ pub enum Card {
     Generic,
 }
 
-/// Merkezin Time kümesi yanıtında zamanın başlangıcı
+/// The epoch of the hub's Time cluster responses
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TimeBase {
-    /// ZCL standardı: 2000-01-01 UTC'den beri saniye
+    /// ZCL standard: seconds since 2000-01-01 UTC
     Zigbee2000,
-    /// Bazı cihazlar (Sonoff TRVZB) Unix zamanı bekliyor
+    /// Some devices (SONOFF TRVZB) expect Unix time
     Unix1970,
 }
 
 #[derive(Debug)]
 pub struct Definition {
     pub fingerprint: &'static [Fingerprint],
-    /// Varsayılan ad; yoksa model kodu
+    /// As in Zigbee2MQTT
+    pub vendor: &'static str,
+    pub description: &'static str,
+    /// Default device name; the model code when absent
     pub name: Option<&'static str>,
     pub card: Card,
     pub features: &'static [Feature],
-    /// Raporlama olmadan merkeze bağlanacak ek kümeler (ör. Poll Control)
+    /// Extra clusters bound to the hub without reporting (e.g. Poll Control)
     pub binds: &'static [u16],
     pub time_base: TimeBase,
-    /// Tuya mcuSyncTime yanıtında saat 2000'den mi sayılsın
+    /// Whether the Tuya mcuSyncTime response counts from 2000
     pub tuya_time_since_2000: bool,
+}
+
+/// What the UI shows about a matched definition
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct DefinitionInfo {
+    pub vendor: &'static str,
+    pub description: &'static str,
 }
 
 const DEFINITIONS: &[&Definition] = &[&sonoff::SNZB_02P, &sonoff::TRVZB, &tuya::ZWT07];
@@ -325,7 +345,14 @@ pub fn definition(device: &Device) -> Option<&'static Definition> {
     })
 }
 
-/// Cihazın özellikleri: varsa tanımından, yoksa sunduğu standart kümelerden
+pub fn definition_info(device: &Device) -> Option<DefinitionInfo> {
+    definition(device).map(|def| DefinitionInfo {
+        vendor: def.vendor,
+        description: def.description,
+    })
+}
+
+/// The device's features: from its definition, or from the standard clusters it offers
 pub fn features(device: &Device) -> Vec<&'static Feature> {
     if let Some(def) = definition(device) {
         return def.features.iter().collect();
@@ -352,19 +379,19 @@ pub fn time_base(device: &Device) -> TimeBase {
     definition(device).map_or(TimeBase::Zigbee2000, |def| def.time_base)
 }
 
-/// Bağlanacak ek kümeler (raporlamalı kümeler özelliklerden çıkarılır)
+/// Extra clusters to bind (reported clusters are derived from the features)
 pub fn extra_binds(device: &Device) -> &'static [u16] {
     definition(device).map_or(&[], |def| def.binds)
 }
 
-/// Kullanıcı ad vermediyse kullanılacak ad
+/// The name to use when the user has not named the device
 pub fn default_name(device: &Device) -> Option<String> {
     definition(device)
         .and_then(|def| def.name.map(str::to_owned))
         .or_else(|| device.model.clone())
 }
 
-/// IAS bölgesi olan cihazlar merkeze kaydedilir
+/// Devices with an IAS zone are enrolled with the hub
 pub fn has_ias_zone(device: &Device) -> bool {
     device.has_cluster(cluster::IAS_ZONE)
 }
@@ -417,5 +444,15 @@ mod tests {
         let device = Device::new("00:00:00:00:00:00:00:01".into(), 1);
         let temperature = &common::TEMPERATURE;
         assert!(temperature.validate(&device, json!(20)).is_err());
+    }
+
+    /// Every feature of every definition should explain itself in the UI
+    #[test]
+    fn every_defined_feature_has_a_description() {
+        for def in DEFINITIONS {
+            for feature in def.features {
+                assert!(!feature.description.is_empty(), "{}: {}", def.description, feature.key);
+            }
+        }
     }
 }

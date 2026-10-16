@@ -1,5 +1,5 @@
-//! Diskte tutulan durum: ağ parametreleri, güvenlik sayaçları, yığın tabloları ve
-//! cihaz listesi. Tek bir JSON dosyası; yazma geçici dosya + rename ile atomik.
+//! State kept on disk: network parameters, security counters, stack tables and the
+//! device list. A single JSON file, written atomically via a temporary file + rename.
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -72,12 +72,12 @@ pub struct Device {
     pub endpoints: Vec<Endpoint>,
     #[serde(default)]
     pub interviewed: bool,
-    /// Özellik anahtarı → değer (bkz. `devices`)
+    /// Feature key → value (see `devices`)
     #[serde(default)]
     pub state: BTreeMap<String, Json>,
     #[serde(default)]
     pub firmware: Option<String>,
-    /// Eski sürümlerin ayrı tuttuğu alanlar; yüklemede `state`e taşınır
+    /// Fields older versions kept separately; moved into `state` on load
     #[serde(default, skip_serializing)]
     settings: BTreeMap<String, f64>,
     #[serde(default, skip_serializing)]
@@ -90,7 +90,7 @@ pub struct Device {
     pub last_seen: Option<u64>,
     #[serde(default)]
     pub lqi: Option<u8>,
-    /// Son paketin alınan sinyal gücü (dBm)
+    /// Received signal strength of the last packet (dBm)
     #[serde(default)]
     pub rssi: Option<i8>,
 }
@@ -102,7 +102,7 @@ fn default_true() -> bool {
 impl Device {
     pub fn new(ieee: String, nwk: u16) -> Self {
         let suffix = ieee.replace(':', "");
-        let name = format!("Cihaz {}", &suffix[suffix.len().saturating_sub(4)..]);
+        let name = format!("Device {}", &suffix[suffix.len().saturating_sub(4)..]);
         Self {
             ieee,
             nwk,
@@ -125,8 +125,8 @@ impl Device {
         }
     }
 
-    /// Eski sürümün ayrı alanlarını özellik haritasına taşır; anahtarlar aynı adlarla
-    /// özellik olarak tanımlı
+    /// Moves the older version's separate fields into the feature map; the keys are
+    /// defined as features under the same names
     fn migrate_legacy(&mut self) {
         for (key, value) in std::mem::take(&mut self.settings) {
             self.state.entry(key).or_insert_with(|| serde_json::json!(value));
@@ -143,7 +143,7 @@ impl Device {
         }
     }
 
-    /// Bir kümeyi sunucu tarafında barındıran ilk uç nokta
+    /// The first endpoint hosting a cluster on the server side
     pub fn endpoint_with(&self, cluster: u16) -> Option<u8> {
         self.endpoints
             .iter()
@@ -172,14 +172,14 @@ impl Persisted {
         match std::fs::read(path) {
             Ok(bytes) => {
                 let mut data: Self = serde_json::from_slice(&bytes)
-                    .with_context(|| format!("{} okunamadı", path.display()))?;
+                    .with_context(|| format!("cannot parse {}", path.display()))?;
                 for device in data.devices.values_mut() {
                     device.migrate_legacy();
                 }
                 Ok(data)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(e) => Err(e).with_context(|| format!("{} açılamadı", path.display())),
+            Err(e) => Err(e).with_context(|| format!("cannot open {}", path.display())),
         }
     }
 
@@ -190,7 +190,7 @@ impl Persisted {
         let tmp = path.with_extension("json.tmp");
         let bytes = serde_json::to_vec_pretty(self)?;
         {
-            // Ağ anahtarını içerir; yalnız sahibi okuyabilsin
+            // Holds the network key: owner-readable only
             let mut file = std::fs::OpenOptions::new()
                 .write(true)
                 .create(true)
@@ -205,7 +205,7 @@ impl Persisted {
     }
 }
 
-/// EUI64 havada küçük-uçlu taşınır; insanlar en anlamlı bayttan başlayarak okur
+/// EUI64s travel little-endian over the air; people read them most significant byte first
 pub fn eui64_to_string(eui64: &Eui64) -> String {
     eui64
         .0
@@ -232,24 +232,24 @@ pub fn parse_key(text: &str) -> Result<Key> {
 
 fn decode_hex<const N: usize>(text: &str) -> Result<[u8; N]> {
     if text.len() != N * 2 {
-        bail!("{N} baytlık onaltılık değer bekleniyordu: {text}");
+        bail!("expected a {N}-byte hex value: {text}");
     }
     let mut out = [0u8; N];
     for (i, byte) in out.iter_mut().enumerate() {
         *byte = u8::from_str_radix(&text[i * 2..i * 2 + 2], 16)
-            .with_context(|| format!("geçersiz onaltılık değer: {text}"))?;
+            .with_context(|| format!("invalid hex value: {text}"))?;
     }
     Ok(out)
 }
 
 pub fn random_bytes<const N: usize>() -> [u8; N] {
     let mut out = [0u8; N];
-    getrandom::fill(&mut out).expect("işletim sistemi rastgele sayı üretemedi");
+    getrandom::fill(&mut out).expect("the operating system failed to produce random bytes");
     out
 }
 
 pub fn new_network(ieee: &Eui64, channel: u8, tx_power: i8) -> NetworkData {
-    // 0x0000 ve 0xFFFF dışında, 0xFFF0 üstü de ayrılmış
+    // Besides 0x0000 and 0xFFFF, everything from 0xFFF0 up is reserved
     let pan_id = loop {
         let candidate = u16::from_le_bytes(random_bytes());
         if (0x0001..0xFFF0).contains(&candidate) {
@@ -276,7 +276,7 @@ mod tests {
 
     #[test]
     fn eui64_round_trips_in_display_order() {
-        // Dongle'ın havadan okunan adresi: 1c 48 99 fe ff b1 5c 6c
+        // The dongle's address as read over the air: 1c 48 99 fe ff b1 5c 6c
         let eui64 = Eui64([0x1c, 0x48, 0x99, 0xfe, 0xff, 0xb1, 0x5c, 0x6c]);
         let text = eui64_to_string(&eui64);
         assert_eq!(text, "6c:5c:b1:ff:fe:99:48:1c");
@@ -289,7 +289,7 @@ mod tests {
         assert_eq!(parse_key(&key_to_string(&key)).unwrap(), key);
     }
 
-    /// Önceki sürümün yazdığı bir kayıt yeni yapıya kayıpsız taşınmalı
+    /// A file written by the previous version must migrate without loss
     #[test]
     fn migrates_previous_state_format() {
         let old = serde_json::json!({

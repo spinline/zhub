@@ -1,9 +1,9 @@
 <!doctype html>
-<html lang="tr">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Zigbee Merkezi</title>
+<title>Zigbee Hub</title>
 <style>
   :root {
     --bg: #f4f5f7; --card: #ffffff; --text: #1b1d22; --muted: #6b7180;
@@ -18,7 +18,7 @@
     }
   }
   * { box-sizing: border-box; }
-  /* display kuralları hidden özniteliğini ezmesin */
+  /* display rules must not override the hidden attribute */
   [hidden] { display: none !important; }
   body {
     margin: 0; background: var(--bg); color: var(--text);
@@ -37,6 +37,7 @@
     border-radius: 10px; padding: 8px 14px; cursor: pointer;
   }
   button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.danger { color: var(--warn); }
   button:disabled { opacity: .6; cursor: default; }
   main { max-width: 1100px; margin: 0 auto; padding: 16px; }
   h2 { font-size: 14px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 20px 0 10px; }
@@ -47,22 +48,21 @@
   }
   .top { display: flex; align-items: flex-start; gap: 10px; }
   .names { flex: 1; min-width: 0; }
-  .name { font-weight: 600; border: 0; background: none; padding: 0; text-align: left; cursor: pointer; }
+  .name { font-weight: 600; }
   .sub { color: var(--muted); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .chips { display: flex; gap: 6px; flex-wrap: wrap; }
   .chip { background: var(--chip); border-radius: 999px; padding: 2px 9px; font-size: 12px; color: var(--muted); }
   .chip.warn { color: var(--warn); }
+  .chip.heat { color: #fff; background: var(--warn); }
   .values { display: flex; gap: 16px; flex-wrap: wrap; }
   .value b { font-size: 22px; font-weight: 600; }
   .value span { display: block; font-size: 12px; color: var(--muted); }
   .value.alert b { color: var(--warn); }
-  label.slider { display: grid; grid-template-columns: 70px 1fr 44px; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); }
+  label.slider { display: grid; grid-template-columns: 80px 1fr 48px; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); }
   input[type=range] { width: 100%; accent-color: var(--accent); }
-  .switch { position: relative; width: 48px; height: 28px; flex: none; }
+  .switch { position: relative; display: inline-block; width: 48px; height: 28px; flex: none; }
   .switch input { opacity: 0; width: 0; height: 0; }
-  .switch span {
-    position: absolute; inset: 0; background: var(--line); border-radius: 999px; transition: .15s; cursor: pointer;
-  }
+  .switch span { position: absolute; inset: 0; background: var(--line); border-radius: 999px; transition: .15s; cursor: pointer; }
   .switch span::before {
     content: ""; position: absolute; width: 22px; height: 22px; left: 3px; top: 3px;
     background: #fff; border-radius: 50%; transition: .15s;
@@ -72,34 +72,49 @@
   .thermo { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
   .thermo .target { font-size: 26px; font-weight: 600; min-width: 92px; text-align: center; }
   .thermo button.step { width: 40px; height: 40px; padding: 0; font-size: 20px; border-radius: 50%; }
-  .thermo select { font: inherit; padding: 6px 8px; border-radius: 10px; border: 1px solid var(--line); background: var(--card); color: var(--text); }
-  .chip.heat { color: #fff; background: var(--warn); }
-  label.check { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); }
-  details.more { border-top: 1px solid var(--line); padding-top: 8px; }
-  details.more summary { cursor: pointer; color: var(--muted); font-size: 13px; }
-  .info { display: grid; grid-template-columns: auto 1fr; gap: 2px 12px; font-size: 13px; margin: 8px 0; }
-  .info dt { color: var(--muted); }
-  .info dd { margin: 0; overflow-wrap: anywhere; }
-  .setting { display: grid; grid-template-columns: 1fr 90px auto; align-items: center; gap: 8px; font-size: 13px; margin: 6px 0; }
-  .setting input { font: inherit; width: 100%; padding: 6px 8px; border-radius: 8px; border: 1px solid var(--line); background: var(--card); color: var(--text); }
-  .setting .note { grid-column: 1 / -1; color: var(--warn); font-size: 12px; }
-  .schedule { margin: 8px 0; }
+  select, input[type=number], input[type=time], input[type=text] {
+    font: inherit; padding: 5px 8px; border-radius: 8px; border: 1px solid var(--line); background: var(--card); color: var(--text);
+  }
+  .ctl { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 4px 12px; font-size: 14px; padding: 10px 0; border-bottom: 1px solid var(--line); }
+  .ctl:last-child { border-bottom: 0; }
+  .ctl .label { font-weight: 500; }
+  .ctl .label small { color: var(--muted); font-weight: 400; }
+  .ctl .desc { grid-column: 1 / -1; color: var(--muted); font-size: 12px; line-height: 1.4; }
+  .ctl .row { display: flex; gap: 6px; align-items: center; }
+  .ctl input[type=number] { width: 96px; }
+  .ctl .note { grid-column: 1 / -1; color: var(--warn); font-size: 12px; }
+  .ctl .ro { font-weight: 600; }
+  .card-foot { display: flex; justify-content: flex-end; }
+  .card-foot button { padding: 4px 12px; font-size: 13px; }
+  .empty { color: var(--muted); padding: 24px; text-align: center; border: 1px dashed var(--line); border-radius: 14px; }
   .schedule h4 { font-size: 13px; margin: 10px 0 4px; color: var(--muted); font-weight: 600; }
   .slot { display: grid; grid-template-columns: 22px 1fr 1fr; gap: 8px; align-items: center; margin: 4px 0; font-size: 13px; }
-  .slot input { font: inherit; width: 100%; padding: 5px 6px; border-radius: 8px; border: 1px solid var(--line); background: var(--card); color: var(--text); }
+  .slot input { width: 100%; }
   .slot span { color: var(--muted); }
-  .ctl { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 8px; font-size: 13px; margin: 6px 0; }
-  .ctl > span { color: var(--muted); }
-  .ctl select, .ctl input[type=number] { font: inherit; padding: 5px 8px; border-radius: 8px; border: 1px solid var(--line); background: var(--card); color: var(--text); }
-  .ctl .row { display: flex; gap: 6px; align-items: center; }
-  .ctl input[type=number] { width: 90px; }
-  .ctl .note { grid-column: 1 / -1; color: var(--warn); font-size: 12px; }
-  details.more h4 { font-size: 13px; margin: 12px 0 4px; color: var(--muted); font-weight: 600; }
-  .menu { display: flex; gap: 8px; margin-top: 10px; }
-  .menu button { padding: 4px 10px; font-size: 13px; }
-  .empty { color: var(--muted); padding: 24px; text-align: center; border: 1px dashed var(--line); border-radius: 14px; }
+
+  dialog#detail {
+    width: min(720px, calc(100% - 24px)); max-height: calc(100% - 24px); padding: 0;
+    border: 1px solid var(--line); border-radius: 16px; background: var(--card); color: var(--text);
+  }
+  dialog#detail::backdrop { background: rgba(0, 0, 0, .45); }
+  .dlg-head { display: flex; align-items: center; gap: 12px; padding: 16px 18px 8px; }
+  .dlg-head .names { flex: 1; }
+  .dlg-head .name { font-size: 18px; }
+  .tabs { display: flex; gap: 4px; padding: 0 14px; border-bottom: 1px solid var(--line); overflow-x: auto; }
+  .tabs button { border: 0; border-radius: 0; background: none; padding: 10px 12px; color: var(--muted); border-bottom: 2px solid transparent; }
+  .tabs button.active { color: var(--text); border-bottom-color: var(--accent); }
+  .panel { padding: 8px 18px 18px; overflow-y: auto; max-height: calc(100vh - 190px); }
+  .panel h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 16px 0 2px; }
+  .info { display: grid; grid-template-columns: auto 1fr; gap: 6px 16px; font-size: 14px; margin: 10px 0; }
+  .info dt { color: var(--muted); }
+  .info dd { margin: 0; overflow-wrap: anywhere; }
+  .actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 14px; }
+  pre.state { background: var(--bg); border: 1px solid var(--line); border-radius: 10px; padding: 12px; font-size: 13px; overflow: auto; }
+  .cluster-list { font-size: 13px; }
+  .cluster-list code { background: var(--chip); border-radius: 6px; padding: 1px 6px; margin: 2px; display: inline-block; }
+
   #toast {
-    position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%);
+    position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%); z-index: 10;
     background: var(--text); color: var(--bg); padding: 10px 16px; border-radius: 10px;
     opacity: 0; transition: opacity .2s; pointer-events: none; max-width: calc(100% - 32px);
   }
@@ -108,31 +123,41 @@
 </head>
 <body>
 <header>
-  <h1>Zigbee Merkezi</h1>
-  <span id="conn">bağlanıyor…</span>
-  <button id="permit" class="primary">Cihaz ekle</button>
+  <h1>Zigbee Hub</h1>
+  <span id="conn">connecting…</span>
+  <button id="permit" class="primary">Permit join</button>
 </header>
 <main>
-  <h2 id="climateTitle" hidden>Termostatlar</h2>
+  <h2 id="climateTitle" hidden>Climate</h2>
   <div id="climate" class="grid"></div>
-  <h2>Işıklar</h2>
+  <h2>Lights</h2>
   <div id="lights" class="grid"></div>
-  <h2>Sensörler</h2>
+  <h2>Sensors</h2>
   <div id="sensors" class="grid"></div>
-  <h2 id="otherTitle" hidden>Diğer</h2>
+  <h2 id="otherTitle" hidden>Other</h2>
   <div id="other" class="grid"></div>
-  <h2>Araçlar</h2>
+  <h2>Tools</h2>
   <div class="grid">
     <div class="card">
-      <b>Hue lambayı seri numarasıyla sıfırla</b>
-      <div class="sub" style="white-space:normal">Lambanın üzerindeki 6 haneli numara (0-9, A-F). Birden fazlası için virgülle ayır. Lamba açık olmalı; sıfırlanınca kendiliğinden ağa katılır. İşlem ~20 sn sürer.</div>
-      <div class="setting" style="grid-template-columns:1fr auto">
-        <input id="hueSerials" placeholder="ör. A1B2C3" autocomplete="off">
-        <button id="hueReset">Sıfırla</button>
+      <b>Factory reset a Hue light by serial number</b>
+      <div class="sub" style="white-space:normal">The 6-character code printed on the light (0-9, A-F). Separate several with commas. The light must be powered; after the reset it joins on its own. Takes about 20 s.</div>
+      <div class="row" style="display:flex;gap:8px">
+        <input id="hueSerials" type="text" placeholder="e.g. A1B2C3" autocomplete="off" style="flex:1">
+        <button id="hueReset">Reset</button>
       </div>
     </div>
   </div>
 </main>
+
+<dialog id="detail">
+  <div class="dlg-head">
+    <div class="names"><div class="name" id="dlgName"></div><div class="sub" id="dlgSub"></div></div>
+    <button id="dlgClose" title="Close">✕</button>
+  </div>
+  <nav class="tabs" id="dlgTabs"></nav>
+  <div class="panel" id="dlgPanel"></div>
+</dialog>
+
 <div id="toast"></div>
 <script>
 const devices = new Map();
@@ -168,26 +193,26 @@ async function api(path, body, method = "POST") {
 const run = (promise) => promise.catch(e => toast(e.message));
 
 function ago(ts) {
-  if (!ts) return "hiç görülmedi";
+  if (!ts) return "never seen";
   const s = Math.max(0, Math.round(Date.now() / 1000 - ts));
-  if (s < 60) return "az önce";
-  if (s < 3600) return `${Math.floor(s / 60)} dk önce`;
-  if (s < 86400) return `${Math.floor(s / 3600)} sa önce`;
-  return `${Math.floor(s / 86400)} gün önce`;
+  if (s < 60) return "just now";
+  if (s < 3600) return `${Math.floor(s / 60)} min ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)} h ago`;
+  return `${Math.floor(s / 86400)} d ago`;
 }
 
-// ---- Özellik yardımcıları ----
+// ---- Feature helpers ----
 
 const LABELS = {
-  off: "Kapalı", heat: "Isıt", auto: "Otomatik", manual: "Manuel", program: "Program",
-  "5_2": "5+2 gün", "6_1": "6+1 gün", "7": "7 gün",
-  local_temperature: "Dahili sensör", remote_temperature: "Harici sensör",
-  remote_source_offline: "Harici sensör (çevrimdışı)", boost: "Boost", timer: "Zamanlayıcı",
+  off: "Off", heat: "Heat", auto: "Auto", manual: "Manual", program: "Program",
+  "5_2": "5 + 2 days", "6_1": "6 + 1 days", "7": "7 days",
+  local_temperature: "Built-in sensor", remote_temperature: "External sensor",
+  remote_source_offline: "External sensor (offline)", boost: "Boost", timer: "Timer",
 };
-const tr = (v) => LABELS[v] ?? v;
+const label = (v) => LABELS[v] ?? v;
 
-// IAS bölge türleri: [ad, alarm var, alarm yok]
-const ZONES = { 0x15: ["Kapı/pencere", "Açık", "Kapalı"], 0x0D: ["Hareket", "Algılandı", "Yok"], 0x2A: ["Su", "Sızıntı!", "Kuru"], 0x28: ["Duman", "Alarm!", "Normal"] };
+// IAS zone types: [name, alarm on, alarm off]
+const ZONES = { 0x15: ["Contact", "Open", "Closed"], 0x0D: ["Motion", "Detected", "Clear"], 0x2A: ["Water leak", "Leak!", "Dry"], 0x28: ["Smoke", "Alarm!", "Clear"] };
 
 const feature = (d, key) => d.features.find(f => f.key === key);
 const writable = (f) => f && f.access === "read_write";
@@ -203,11 +228,12 @@ function formatValue(f, v, d) {
   if (k.type === "binary") {
     if (f.key === "alarm") {
       const z = ZONES[d.state.zone_type];
-      return z ? (v ? z[1] : z[2]) : (v ? "Etkin" : "Normal");
+      return z ? (v ? z[1] : z[2]) : (v ? "Active" : "Normal");
     }
-    return v ? "Evet" : "Hayır";
+    if (f.key === "heating") return v ? "Heating" : "Idle";
+    return v ? "On" : "Off";
   }
-  if (k.type === "enum") return tr(v);
+  if (k.type === "enum") return label(v);
   if (k.type === "numeric") {
     const n = Number(v);
     const text = Number.isInteger(n) ? String(n) : n.toFixed(1);
@@ -216,7 +242,7 @@ function formatValue(f, v, d) {
   return String(v);
 }
 
-// Aralık: tanımdaki sınırlar, cihazın bildirdikleriyle daraltılmış
+// The definition's limits, narrowed by the limits the device reports
 function range(f, d) {
   const k = f.kind;
   let min = k.min, max = k.max;
@@ -230,14 +256,14 @@ function range(f, d) {
 
 function setValue(ieee, key, value) {
   return api(`/api/devices/${ieee}/set`, { key, value }).then(r => {
-    if (r.pending) toast("Cihaz uyanınca uygulanacak (hemen uygulamak için cihazın düğmesine kısa bas).");
+    if (r.pending) toast("Will be applied when the device wakes up (press its button briefly to apply now).");
     return r;
   });
 }
 
 const focused = (...nodes) => nodes.includes(document.activeElement);
 
-// ---- Denetimler: her biri {node, update(d)} ----
+// ---- Controls: each returns {node, update(d)} ----
 
 function valueTile(key) {
   const b = el("b"), span = el("span");
@@ -255,66 +281,70 @@ function valueTile(key) {
   };
 }
 
-function pendingNote(key) {
-  const node = el("div", { className: "note", hidden: true, textContent: "Cihaz uyanınca uygulanacak" });
-  return { node, update(d) { node.hidden = !(d.pending || []).includes(key); } };
-}
-
-// Ayrıntılar'daki genel denetim: türüne göre anahtar, seçim, sayı ya da salt değer
+// A feature row: label, control (or value) and the description underneath
 function control(ieee, f) {
-  const note = pendingNote(f.key);
-  const title = el("span", { textContent: f.kind.unit ? `${f.label} (${f.kind.unit})` : f.label });
+  const title = el("div", { className: "label" });
+  const desc = f.description ? el("div", { className: "desc", textContent: f.description }) : null;
+  const note = el("div", { className: "note", hidden: true, textContent: "Waiting for the device to wake up" });
+  const setTitle = (d) => {
+    title.replaceChildren(featureLabel(f, d), f.kind.unit ? el("small", { textContent: ` (${f.kind.unit})` }) : "");
+    note.hidden = !(d.pending || []).includes(f.key);
+  };
+  const row = (widget) => el("div", { className: "ctl" }, title, widget, desc, note);
+
   if (f.access !== "read_write") {
-    const out = el("b", { style: "font-weight:500" });
-    return {
-      node: el("div", { className: "ctl" }, title, out),
-      update(d) { out.textContent = formatValue(f, d.state[f.key], d); title.textContent = featureLabel(f, d); },
-    };
+    const out = el("span", { className: "ro" });
+    return { node: row(out), update(d) { setTitle(d); out.textContent = formatValue(f, d.state[f.key], d); } };
   }
   if (f.kind.type === "binary") {
     const input = el("input", { type: "checkbox" });
     input.onchange = () => run(setValue(ieee, f.key, input.checked).catch(e => { input.checked = !input.checked; throw e; }));
     return {
-      node: el("div", { className: "ctl" }, title, el("label", { className: "switch" }, input, el("span")), note.node),
-      update(d) { if (!focused(input)) input.checked = !!d.state[f.key]; note.update(d); },
+      node: row(el("label", { className: "switch" }, input, el("span"))),
+      update(d) { setTitle(d); if (!focused(input)) input.checked = !!d.state[f.key]; },
     };
   }
   if (f.kind.type === "enum") {
-    const select = el("select", {}, ...f.kind.values.map(v => el("option", { value: v, textContent: tr(v) })));
+    const select = el("select", {}, ...f.kind.values.map(v => el("option", { value: v, textContent: label(v) })));
     select.onchange = () => run(setValue(ieee, f.key, select.value));
     return {
-      node: el("div", { className: "ctl" }, title, select, note.node),
-      update(d) { if (!focused(select) && d.state[f.key] != null) select.value = d.state[f.key]; note.update(d); },
+      node: row(select),
+      update(d) { setTitle(d); if (!focused(select) && d.state[f.key] != null) select.value = d.state[f.key]; },
     };
   }
   if (f.kind.type === "numeric") {
     const input = el("input", { type: "number" });
-    const save = el("button", { textContent: "Kaydet" });
+    const save = el("button", { textContent: "Save" });
     let last;
-    save.onclick = () => run(setValue(ieee, f.key, Number(input.value)).then(r => { if (!r.pending) toast(`${f.label} kaydedildi`); }));
+    save.onclick = () => run(setValue(ieee, f.key, Number(input.value)).then(r => { if (!r.pending) toast(`${f.label} saved`); }));
     return {
-      node: el("div", { className: "ctl" }, title, el("div", { className: "row" }, input, save), note.node),
+      node: row(el("div", { className: "row" }, input, save)),
       update(d) {
+        setTitle(d);
         const [min, max, step] = range(f, d);
         Object.assign(input, { min: min ?? "", max: max ?? "", step });
-        // Kaydedilmemiş girişi ezme: yalnızca cihazın değeri değiştiyse güncelle
+        // Do not overwrite unsaved input: only follow changes of the device's value
         const v = d.state[f.key];
         if (!focused(input) && v !== last) { input.value = v ?? ""; last = v; }
-        note.update(d);
       },
     };
   }
-  if (f.kind.type === "schedule") return scheduleControl(ieee, f);
-  return { node: el("div"), update() {} };
+  if (f.kind.type === "schedule") {
+    const s = scheduleEditor(ieee, f);
+    const node = el("div", { className: "ctl" }, title, el("span"), desc, el("div", { style: "grid-column: 1 / -1" }, s.node), note);
+    return { node, update(d) { setTitle(d); s.update(d); } };
+  }
+  const out = el("span", { className: "ro" });
+  return { node: row(out), update(d) { setTitle(d); out.textContent = formatValue(f, d.state[f.key], d); } };
 }
 
-// Haftalık program: dilim sayısı cihazın bildirdiği düzende sabit
-function scheduleControl(ieee, f) {
+// Weekly schedule: the slot count stays as the device reported it
+function scheduleEditor(ieee, f) {
   const box = el("div", { className: "schedule" });
   let inputs = [], last;
   const groups = (d, n) => d.state.working_week === "5_2" && n === 8
-    ? [["Hafta içi (Pzt–Cum)", 0, 6], ["Hafta sonu (Cmt–Paz)", 6, 8]]
-    : [["Dilimler", 0, n]];
+    ? [["Weekdays (Mon–Fri)", 0, 6], ["Weekend (Sat–Sun)", 6, 8]]
+    : [["Slots", 0, n]];
   return {
     node: box,
     update(d) {
@@ -322,7 +352,7 @@ function scheduleControl(ieee, f) {
       const json = JSON.stringify(slots);
       if (!Array.isArray(slots) || json === last) return;
       last = json;
-      const [min, max, step] = [f.kind.min, f.kind.max, f.kind.step];
+      const { min, max, step } = f.kind;
       const rows = [];
       inputs = [];
       for (const [title, from, to] of groups(d, slots.length)) {
@@ -334,30 +364,30 @@ function scheduleControl(ieee, f) {
           rows.push(el("div", { className: "slot" }, el("span", { textContent: `${i - from + 1}.` }), time, temp));
         }
       }
-      const save = el("button", { textContent: "Programı kaydet" });
+      const save = el("button", { textContent: "Save schedule" });
       save.onclick = () => {
         const value = inputs.map(({ time, temp }) => ({ time: time.value, temperature: Number(temp.value) }));
-        run(setValue(ieee, f.key, value).then(() => toast("Program gönderildi")));
+        run(setValue(ieee, f.key, value).then(() => toast("Schedule sent")));
       };
-      box.replaceChildren(el("h4", { textContent: `${f.label} (saat · °C)` }), ...rows, save);
+      box.replaceChildren(...rows, save);
     },
   };
 }
 
-// ---- Kartlar ----
+// ---- Cards: primary controls only ----
 
 function lightControls(ieee) {
   const level = el("input", { type: "range", min: 1, max: 254 });
   const levelText = el("span");
-  level.oninput = () => levelText.textContent = `%${Math.round(level.value / 2.54)}`;
+  level.oninput = () => levelText.textContent = `${Math.round(level.value / 2.54)}%`;
   level.onchange = () => run(setValue(ieee, "level", Number(level.value)));
-  const levelRow = el("label", { className: "slider" }, "Parlaklık", level, levelText);
+  const levelRow = el("label", { className: "slider" }, "Brightness", level, levelText);
 
   const ct = el("input", { type: "range" });
   const ctText = el("span");
   ct.oninput = () => ctText.textContent = `${Math.round(1e6 / ct.value / 100) * 100}K`;
   ct.onchange = () => run(setValue(ieee, "color_temp", Number(ct.value)));
-  const ctRow = el("label", { className: "slider" }, "Renk", ct, ctText);
+  const ctRow = el("label", { className: "slider" }, "Color temp", ct, ctText);
 
   return {
     node: el("div", {}, levelRow, ctRow),
@@ -378,24 +408,23 @@ function lightControls(ieee) {
 function thermostatControls(ieee) {
   const room = valueTile("temperature");
   const target = el("span", { className: "target" });
-  let pending = null, timer = null;
+  let pending = null, timer = null, current = {};
   const show = (v) => target.textContent = v == null ? "–" : `${Number(v).toFixed(1)} °C`;
-  let current = {};
   const step = (dir) => {
     const f = feature(current, "setpoint");
-    const [min, max, stepSize] = range(f, current);
+    const [min, max, size] = range(f, current);
     const base = pending ?? current.state.setpoint ?? 20;
-    pending = Math.min(max ?? 99, Math.max(min ?? 0, Math.round((base + dir * stepSize) / stepSize) * stepSize));
+    pending = Math.min(max ?? 99, Math.max(min ?? 0, Math.round((base + dir * size) / size) * size));
     show(pending);
-    // Art arda tıklamalar tek komutta birleşir
+    // Consecutive clicks merge into one command
     clearTimeout(timer);
     timer = setTimeout(() => {
       const value = pending;
       run(setValue(ieee, "setpoint", value).finally(() => { pending = null; }));
     }, 800);
   };
-  const minus = el("button", { className: "step", textContent: "−", title: "Azalt" });
-  const plus = el("button", { className: "step", textContent: "+", title: "Artır" });
+  const minus = el("button", { className: "step", textContent: "−", title: "Lower" });
+  const plus = el("button", { className: "step", textContent: "+", title: "Raise" });
   minus.onclick = () => step(-1);
   plus.onclick = () => step(1);
   const setpointRow = el("div", { className: "thermo" }, minus, target, plus);
@@ -410,7 +439,7 @@ function thermostatControls(ieee) {
   };
 }
 
-// Kart düzeninin kullandığı anahtarlar; geri kalan "kart" özellikleri genel denetim alır
+// Keys a card layout already shows; other card features get a generic control
 const CONSUMED = {
   light: ["on", "level", "color_temp"],
   thermostat: ["temperature", "setpoint", "heating"],
@@ -423,18 +452,11 @@ function buildCard(d) {
   const ieee = d.ieee;
   const updaters = [];
   const card = el("div", { className: "card" });
-
-  const name = el("button", { className: "name", title: "Yeniden adlandır" });
-  name.onclick = () => {
-    const current = devices.get(ieee);
-    const next = prompt("Cihazın adı", current.name);
-    if (next && next.trim() && next !== current.name) run(api(`/api/devices/${ieee}/rename`, { name: next }));
-  };
+  const name = el("div", { className: "name" });
   const sub = el("div", { className: "sub" });
   const top = el("div", { className: "top" }, el("div", { className: "names" }, name, sub));
   card.append(top);
 
-  // Işıkta başlıkta aç/kapa anahtarı
   if (d.card === "light" && writable(feature(d, "on"))) {
     const toggle = el("input", { type: "checkbox" });
     toggle.onchange = () => run(setValue(ieee, "on", toggle.checked).catch(e => { toggle.checked = !toggle.checked; throw e; }));
@@ -448,7 +470,6 @@ function buildCard(d) {
     const c = thermostatControls(ieee); card.append(c.node); updaters.push(c.update);
   }
 
-  // Kalan "kart" özellikleri: salt okunurlar değer olarak, yazılabilirler denetim olarak
   const consumed = new Set([...(CONSUMED[d.card] || []), ...CHIP_KEYS]);
   const cardFeatures = d.features.filter(f => f.place === "card" && !consumed.has(f.key));
   const tiles = cardFeatures.filter(f => !writable(f)).map(f => valueTile(f.key));
@@ -456,81 +477,194 @@ function buildCard(d) {
     card.append(el("div", { className: "values" }, ...tiles.map(t => t.node)));
     tiles.forEach(t => updaters.push(t.update));
   }
+  // Writable card features (e.g. system mode): compact select or switch on the card
   for (const f of cardFeatures.filter(writable)) {
-    const c = control(ieee, f); card.append(c.node); updaters.push(c.update);
+    const c = compactControl(ieee, f); card.append(c.node); updaters.push(c.update);
   }
 
   const chips = el("div", { className: "chips" });
   card.append(chips);
   updaters.push(d => chips.replaceChildren(...chipList(d)));
 
-  // Ayrıntılar: bilgi, ayarlar, tanı
-  const info = el("dl", { className: "info" });
-  updaters.push(d => info.replaceChildren(...infoRows(d)));
-  const config = d.features.filter(f => f.place === "config").map(f => control(ieee, f));
-  const diagnostic = d.features.filter(f => f.place === "diagnostic").map(f => control(ieee, f));
-  [...config, ...diagnostic].forEach(c => updaters.push(c.update));
-
-  const reinterview = el("button", { textContent: "Yeniden tanı" });
-  reinterview.onclick = () => run(api(`/api/devices/${ieee}/interview`).then(r => toast(r.waiting_for_wake
-    ? "Pilli cihaz: düğmesine kısa basarak uyandır, tanıma o an başlayacak."
-    : "Cihaz yeniden tanınıyor.")));
-  const remove = el("button", { textContent: "Kaldır" });
-  remove.onclick = () => {
-    const current = devices.get(ieee);
-    if (confirm(`"${current.name}" ağdan çıkarılsın mı?`)) run(api(`/api/devices/${ieee}`, null, "DELETE"));
-  };
-  card.append(el("details", { className: "more" },
-    el("summary", { textContent: "Ayrıntılar" }),
-    info,
-    config.length ? el("h4", { textContent: "Ayarlar" }) : null, ...config.map(c => c.node),
-    diagnostic.length ? el("h4", { textContent: "Tanı" }) : null, ...diagnostic.map(c => c.node),
-    el("div", { className: "menu" }, reinterview, remove)));
+  const details = el("button", { textContent: "Details" });
+  details.onclick = () => openDetail(ieee);
+  card.append(el("div", { className: "card-foot" }, details));
 
   updaters.push(d => {
     name.textContent = d.name;
-    sub.textContent = [d.manufacturer, d.model].filter(Boolean).join(" · ") || d.ieee;
+    sub.textContent = [d.definition?.vendor ?? d.manufacturer, d.model].filter(Boolean).join(" · ") || d.ieee;
   });
-
   return { card, update: (d) => updaters.forEach(u => u(d)) };
+}
+
+// On the card: label and widget on one line, without the description
+function compactControl(ieee, f) {
+  const c = control(ieee, f);
+  c.node.querySelector(".desc")?.remove();
+  c.node.style.borderBottom = "0";
+  c.node.style.padding = "2px 0";
+  return c;
 }
 
 function chipList(d) {
   const s = d.state, chips = [];
   const chip = (text, cls = "") => el("span", { className: `chip ${cls}`, textContent: text });
-  if (d.interviewing) chips.push(chip("Tanınıyor…"));
-  else if (d.waiting_for_wake) chips.push(chip("Uyanınca tanınacak", "warn"));
-  else if (!d.interviewed) chips.push(chip("Tanınamadı", "warn"));
-  if (feature(d, "heating") && s.heating != null) chips.push(s.heating ? chip("Isıtıyor", "heat") : chip("Beklemede"));
-  if (s.fault) chips.push(chip(`Arıza kodu ${s.fault}`, "warn"));
-  if (s.battery != null) chips.push(chip(`Pil %${Math.round(s.battery)}`, s.battery < 15 ? "warn" : ""));
-  if (s.battery_low) chips.push(chip("Pil zayıf", "warn"));
-  if ((d.pending || []).length) chips.push(chip("Ayar bekliyor", "warn"));
-  if (d.rssi != null) chips.push(el("span", { className: "chip" + (d.rssi < -80 ? " warn" : ""), textContent: `Sinyal ${d.rssi} dBm`, title: `LQI ${d.lqi ?? "?"}` }));
+  if (d.interviewing) chips.push(chip("Interviewing…"));
+  else if (d.waiting_for_wake) chips.push(chip("Interview on wake-up", "warn"));
+  else if (!d.interviewed) chips.push(chip("Interview failed", "warn"));
+  if (feature(d, "heating") && s.heating != null) chips.push(s.heating ? chip("Heating", "heat") : chip("Idle"));
+  if (s.fault) chips.push(chip(`Fault ${s.fault}`, "warn"));
+  if (s.battery != null) chips.push(chip(`Battery ${Math.round(s.battery)}%`, s.battery < 15 ? "warn" : ""));
+  if (s.battery_low) chips.push(chip("Battery low", "warn"));
+  if ((d.pending || []).length) chips.push(chip("Write pending", "warn"));
+  if (d.rssi != null) chips.push(el("span", { className: "chip" + (d.rssi < -80 ? " warn" : ""), textContent: `${d.rssi} dBm`, title: `LQI ${d.lqi ?? "?"}` }));
   chips.push(chip(ago(d.last_seen)));
   return chips;
 }
 
-function infoRows(d) {
-  const kind = d.router ? "Yönlendirici (şebeke)" : d.rx_on_when_idle ? "Uç cihaz" : "Pilli uç cihaz (uyuyan)";
-  return [
-    ["IEEE", d.ieee],
-    ["Ağ adresi", "0x" + d.nwk.toString(16).padStart(4, "0")],
-    ["Üretici", d.manufacturer],
-    ["Model", d.model],
-    ["Yazılım", d.firmware],
-    ["Tür", kind],
-  ].filter(([, v]) => v != null && v !== "")
-    .flatMap(([k, v]) => [el("dt", { textContent: k }), el("dd", { textContent: v })]);
+// ---- Detail dialog with tabs ----
+
+const CLUSTERS = {
+  0x0000: "Basic", 0x0001: "Power Configuration", 0x0003: "Identify", 0x0004: "Groups", 0x0005: "Scenes",
+  0x0006: "On/Off", 0x0008: "Level Control", 0x000A: "Time", 0x0019: "OTA Upgrade", 0x0020: "Poll Control",
+  0x0201: "Thermostat", 0x0204: "Thermostat UI Config", 0x0300: "Color Control", 0x0402: "Temperature Measurement",
+  0x0405: "Relative Humidity", 0x0406: "Occupancy Sensing", 0x0500: "IAS Zone", 0x0B05: "Diagnostics",
+  0x1000: "Touchlink", 0xEF00: "Tuya", 0xFC11: "SONOFF", 0xFC57: "SONOFF (private)", 0xFC03: "Philips", 0xFC04: "Philips",
+};
+const hex = (n, width = 4) => "0x" + n.toString(16).padStart(width, "0");
+
+const detail = { ieee: null, tab: "about", view: null, signature: null };
+
+function openDetail(ieee) {
+  detail.ieee = ieee;
+  detail.signature = null;
+  renderDetail();
+  $("#detail").showModal();
 }
+
+$("#dlgClose").onclick = () => $("#detail").close();
+$("#detail").addEventListener("close", () => { detail.ieee = null; });
+$("#detail").addEventListener("click", (e) => { if (e.target === $("#detail")) $("#detail").close(); });
+
+const TABS = [["about", "About"], ["exposes", "Exposes"], ["state", "State"], ["clusters", "Clusters"]];
+
+function renderDetail() {
+  const d = devices.get(detail.ieee);
+  if (!d) { $("#detail").close(); return; }
+  $("#dlgName").textContent = d.name;
+  $("#dlgSub").textContent = [d.definition?.vendor ?? d.manufacturer, d.model].filter(Boolean).join(" · ");
+  // Tab buttons are created once; live updates only move the highlight, so a click is
+  // never lost to a re-render
+  if (!$("#dlgTabs").children.length) {
+    $("#dlgTabs").append(...TABS.map(([id, text]) => {
+      const b = el("button", { textContent: text });
+      b.dataset.tab = id;
+      b.onclick = () => { detail.tab = id; detail.signature = null; renderDetail(); };
+      return b;
+    }));
+  }
+  for (const b of $("#dlgTabs").children) b.classList.toggle("active", b.dataset.tab === detail.tab);
+  // Rebuild a tab only when its structure changes; otherwise just update its values
+  const sig = detail.tab + "|" + signature(d);
+  if (detail.signature !== sig) {
+    detail.view = { about: aboutTab, exposes: exposesTab, state: stateTab, clusters: clustersTab }[detail.tab](d);
+    detail.signature = sig;
+    $("#dlgPanel").replaceChildren(detail.view.node);
+  }
+  detail.view.update(d);
+}
+
+function aboutTab(d) {
+  const ieee = d.ieee;
+  const info = el("dl", { className: "info" });
+  const rename = el("button", { textContent: "Rename" });
+  rename.onclick = () => {
+    const current = devices.get(ieee);
+    const next = prompt("Device name", current.name);
+    if (next && next.trim() && next !== current.name) run(api(`/api/devices/${ieee}/rename`, { name: next }));
+  };
+  const interview = el("button", { textContent: "Interview again" });
+  interview.onclick = () => run(api(`/api/devices/${ieee}/interview`).then(r => toast(r.waiting_for_wake
+    ? "Battery device: press its button briefly to wake it up; the interview starts then."
+    : "Interviewing the device.")));
+  const remove = el("button", { textContent: "Remove", className: "danger" });
+  remove.onclick = () => {
+    const current = devices.get(ieee);
+    if (confirm(`Remove "${current.name}" from the network?`)) {
+      run(api(`/api/devices/${ieee}`, null, "DELETE").then(() => $("#detail").close()));
+    }
+  };
+  return {
+    node: el("div", {}, info, el("div", { className: "actions" }, rename, interview, remove)),
+    update(d) {
+      const type = d.router ? "Router (mains powered)" : d.rx_on_when_idle ? "End device" : "End device (sleepy, battery)";
+      const interview = d.interviewing ? "In progress" : d.waiting_for_wake ? "On next wake-up" : d.interviewed ? "Completed" : "Failed";
+      const rows = [
+        ["Description", d.definition?.description],
+        ["Vendor", d.definition?.vendor ?? d.manufacturer],
+        ["Model", d.model],
+        ["Manufacturer", d.manufacturer],
+        ["Firmware", d.firmware],
+        ["IEEE address", d.ieee],
+        ["Network address", hex(d.nwk)],
+        ["Device type", type],
+        ["Interview", interview],
+        ["Supported", d.definition ? "Yes (device definition)" : "Generic (from its clusters)"],
+        ["Signal", d.rssi != null ? `${d.rssi} dBm (LQI ${d.lqi ?? "?"})` : null],
+        ["Last seen", ago(d.last_seen)],
+      ].filter(([, v]) => v != null && v !== "");
+      info.replaceChildren(...rows.flatMap(([k, v]) => [el("dt", { textContent: k }), el("dd", { textContent: v })]));
+    },
+  };
+}
+
+function exposesTab(d) {
+  const sections = [["card", "Primary"], ["config", "Settings"], ["diagnostic", "Diagnostics"]];
+  const controls = [];
+  const node = el("div");
+  for (const [place, title] of sections) {
+    const features = d.features.filter(f => f.place === place);
+    if (!features.length) continue;
+    node.append(el("h3", { textContent: title }));
+    for (const f of features) {
+      const c = control(d.ieee, f);
+      controls.push(c);
+      node.append(c.node);
+    }
+  }
+  return { node, update: (d) => controls.forEach(c => c.update(d)) };
+}
+
+function stateTab() {
+  const pre = el("pre", { className: "state" });
+  return { node: pre, update(d) { pre.textContent = JSON.stringify(d.state, null, 2); } };
+}
+
+function clustersTab(d) {
+  const node = el("div", { className: "cluster-list" });
+  const list = (ids) => ids.length
+    ? ids.map(id => el("code", { textContent: `${CLUSTERS[id] ?? "Unknown"} (${hex(id)})` }))
+    : [el("span", { textContent: "none" })];
+  for (const ep of d.endpoints) {
+    node.append(
+      el("h3", { textContent: `Endpoint ${ep.id} · profile ${hex(ep.profile)} · device ${hex(ep.device_id)}` }),
+      el("div", {}, el("b", { textContent: "Input: " }), ...list(ep.in_clusters)),
+      el("div", { style: "margin-top:6px" }, el("b", { textContent: "Output: " }), ...list(ep.out_clusters)),
+    );
+  }
+  if (!d.endpoints.length) node.append(el("p", { textContent: "Not interviewed yet." }));
+  return { node, update() {} };
+}
+
+// ---- Page ----
 
 const GROUPS = { thermostat: "climate", light: "lights", sensor: "sensors", generic: "other" };
 
-// Tanım değişirse (ör. tanıma sonrası model öğrenildi) kart baştan kurulur
+// The card is rebuilt when the definition changes (e.g. the model was learned)
 const signature = (d) => d.card + "|" + d.features.map(f => f.key + f.access + f.place).join(",");
 
 function render() {
-  const sorted = [...devices.values()].sort((a, b) => a.name.localeCompare(b.name, "tr"));
+  const sorted = [...devices.values()].sort((a, b) => a.name.localeCompare(b.name));
   const groups = { climate: [], lights: [], sensors: [], other: [] };
   for (const d of sorted) {
     let entry = cards.get(d.ieee);
@@ -544,23 +678,24 @@ function render() {
   for (const [id, list] of Object.entries(groups)) {
     const container = $("#" + id);
     if (list.length === 0 && (id === "lights" || id === "sensors")) {
-      container.replaceChildren(el("div", { className: "empty", textContent: id === "lights" ? "Henüz ışık yok." : "Henüz sensör yok." }));
+      container.replaceChildren(el("div", { className: "empty", textContent: id === "lights" ? "No lights yet." : "No sensors yet." }));
     } else {
       container.replaceChildren(...list);
     }
   }
   $("#otherTitle").hidden = groups.other.length === 0;
   $("#climateTitle").hidden = groups.climate.length === 0;
+  if (detail.ieee) renderDetail();
 }
 
 function renderPermit() {
   const button = $("#permit");
   const left = Math.max(0, Math.round((permitUntil - Date.now()) / 1000));
   if (left > 0) {
-    button.textContent = `Eşleştirme açık · ${Math.floor(left / 60)}:${String(left % 60).padStart(2, "0")} (durdur)`;
+    button.textContent = `Joining open · ${Math.floor(left / 60)}:${String(left % 60).padStart(2, "0")} (stop)`;
     button.classList.remove("primary");
   } else {
-    button.textContent = "Cihaz ekle";
+    button.textContent = "Permit join";
     button.classList.add("primary");
   }
 }
@@ -568,7 +703,7 @@ function renderPermit() {
 $("#permit").onclick = () => {
   const open = permitUntil > Date.now();
   run(api("/api/permit_join", { seconds: open ? 0 : 180 }).then(() => {
-    if (!open) toast("Eşleştirme açık. Cihazı eşleştirme moduna al.");
+    if (!open) toast("Joining is open. Put the device in pairing mode.");
   }));
 };
 
@@ -576,10 +711,10 @@ $("#hueReset").onclick = () => {
   const serials = $("#hueSerials").value.split(/[\s,]+/).filter(Boolean);
   const button = $("#hueReset");
   button.disabled = true;
-  button.textContent = "Gönderiliyor…";
+  button.textContent = "Sending…";
   run(api("/api/hue_reset", { serials })
-    .then(() => toast("Sıfırlama isteği gönderildi; lamba yanıp sönüp ağa katılmalı."))
-    .finally(() => { button.disabled = false; button.textContent = "Sıfırla"; }));
+    .then(() => toast("Reset request sent; the light should blink and join the network."))
+    .finally(() => { button.disabled = false; button.textContent = "Reset"; }));
 };
 
 async function load() {
@@ -595,12 +730,12 @@ async function load() {
 function connect() {
   const source = new EventSource("/api/events");
   source.onopen = () => {
-    $("#conn").textContent = "bağlı";
+    $("#conn").textContent = "connected";
     $("#conn").classList.remove("off");
     run(load());
   };
   source.onerror = () => {
-    $("#conn").textContent = "bağlantı koptu, yeniden deneniyor…";
+    $("#conn").textContent = "disconnected, retrying…";
     $("#conn").classList.add("off");
   };
   source.onmessage = (msg) => {

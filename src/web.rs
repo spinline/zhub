@@ -1,4 +1,4 @@
-//! Web arayüzü ve JSON API. Canlı güncellemeler Server-Sent Events ile akar.
+//! Web UI and JSON API. Live updates flow over Server-Sent Events.
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -61,7 +61,7 @@ async fn index() -> impl IntoResponse {
     (
         [
             (header::CONTENT_TYPE, "text/html; charset=utf-8"),
-            // Sayfa ikiliyle birlikte güncelleniyor; tarayıcı eskisini göstermesin
+            // The page ships with the binary; the browser must not show a stale copy
             (header::CACHE_CONTROL, "no-cache"),
         ],
         INDEX_HTML,
@@ -79,7 +79,7 @@ async fn events(
     State(hub): State<Arc<Hub>>,
 ) -> Sse<impl Stream<Item = Result<SseEvent, Infallible>>> {
     let stream = BroadcastStream::new(hub.subscribe()).filter_map(|event| async move {
-        // Geride kalan istemci olayları kaçırır; arayüz yeniden bağlanınca durumu tazeler
+        // A lagging client misses events; the UI refreshes its state when it reconnects
         let event = event.ok()?;
         SseEvent::default().json_data(event).ok().map(Ok)
     });

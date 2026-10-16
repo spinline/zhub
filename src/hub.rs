@@ -1,5 +1,5 @@
-//! Zigbee merkezi: yığını ayağa kaldırır, gelen trafiği işler, katılan cihazları tanır
-//! ve kullanıcının komutlarını gönderir.
+//! The Zigbee hub: brings up the stack, handles incoming traffic, interviews joining
+//! devices and sends the user's commands.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
@@ -33,28 +33,28 @@ use crate::store::{
 use crate::zcl::{self, ReportConfig, Value, cluster, types};
 use crate::{tuya, zdo};
 
-/// Koordinatörün kendi uç noktası; bağlamalar ve raporlar buraya gelir
+/// The coordinator's own endpoint; bindings and reports arrive here
 pub const HUB_ENDPOINT: u8 = 1;
 const HA_PROFILE: u16 = 0x0104;
 const ZDO_PROFILE: u16 = 0x0000;
 const GREEN_POWER_PROFILE: u16 = 0xA1E0;
 const GREEN_POWER_ENDPOINT: u8 = 242;
-/// NWK yarıçapı; 0 vermek çerçeveyi ilk aktarıcıda düşürür
+/// NWK radius; 0 would make the first relay drop the frame
 const RADIUS: u8 = 30;
-/// Yığın çerçeve sayacını her 100 çerçevede bildiriyor. Yeniden başlatmada sayacın
-/// geri gitmemesi için kayıtlı değerin üstüne bu kadar ekliyoruz.
+/// The stack reports the frame counter every 100 frames. This much is added to the
+/// saved value on restart so the counter never goes backwards.
 const FRAME_COUNTER_MARGIN: u32 = 1000;
 const SAVE_DELAY: Duration = Duration::from_secs(5);
 const TABLE_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(300);
 const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
-/// Uyuyan cihaz isteği ancak bir sonraki yoklamada alır
+/// A sleepy device only receives a request at its next poll
 const SLEEPY_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_PERMIT_SECONDS: u8 = 254;
-/// Check-in yanıtında istenen hızlı yoklama süresi (çeyrek saniye): 20 sn
+/// Fast poll duration requested in the check-in response (quarter seconds): 20 s
 const FAST_POLL_QUARTER_SECONDS: u16 = 80;
-/// Uyuyan cihaz bir şey gönderdikten sonra bu kadar saniye uyanık sayılır
+/// A sleepy device counts as awake for this many seconds after it sent something
 const AWAKE_WINDOW_SECONDS: u64 = 2;
-/// Tek okuma isteğindeki öznitelik sayısı: yanıt tek çerçeveye sığsın
+/// Attributes per read request, so the response fits in one frame
 const READ_CHUNK: usize = 4;
 const SECONDS_1970_TO_2000: u64 = 946_684_800;
 
@@ -64,7 +64,7 @@ pub struct Options {
     pub state_path: PathBuf,
     pub channel: u8,
     pub tx_power: i8,
-    /// Tanılama: radyoyu karışık moda al ve MAC komut çerçevelerini günlüğe yaz
+    /// Diagnostics: put the radio in promiscuous mode and log MAC command frames
     pub sniff: bool,
 }
 
@@ -81,12 +81,15 @@ pub struct DeviceView {
     #[serde(flatten)]
     pub device: Device,
     pub card: Card,
-    /// Arayüz şeması: cihazın özellikleri
+    /// Vendor and description of the matched definition (as in Zigbee2MQTT)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub definition: Option<devices::DefinitionInfo>,
+    /// The UI schema: the device's features
     pub features: Vec<Feature>,
     pub interviewing: bool,
-    /// Uyuyan cihaz uyanınca tanınacak
+    /// A sleepy device to be interviewed when it wakes up
     pub waiting_for_wake: bool,
-    /// Cihaz uyanınca yazılacak özellikler
+    /// Features to write when the device wakes up
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub pending: Vec<String>,
 }
@@ -99,7 +102,7 @@ enum PendingKey {
 
 pub struct Hub {
     stack: Arc<ZigbeeStack<SpinelPhy>>,
-    /// Ham çerçeve ve kanal işleri için (Hue sıfırlama); normal trafik yığından geçer
+    /// For raw frames and channel changes (Hue reset); normal traffic goes through the stack
     phy: Arc<SpinelPhy>,
     ieee: Eui64,
     state_path: PathBuf,
@@ -110,11 +113,11 @@ pub struct Hub {
     events: broadcast::Sender<Event>,
     permit_until: Mutex<Option<Instant>>,
     interviews: Mutex<HashSet<String>>,
-    /// Uyuyan cihazlara, uyandıklarında yazılacak değerler: ieee → (özellik → değer)
+    /// Values to write to sleepy devices when they wake: ieee → (feature → value)
     pending_writes: Mutex<HashMap<String, BTreeMap<String, Json>>>,
-    /// Uyanınca yeniden tanınacak uyuyan cihazlar
+    /// Sleepy devices to re-interview when they wake
     wake_interviews: Mutex<HashSet<String>>,
-    /// Şu an yazma yapılan cihazlar: aynı cihaza aynı anda tek yazma gider
+    /// Devices being written to right now: one write at a time per device
     writing: Mutex<HashSet<String>>,
 }
 
@@ -143,8 +146,8 @@ fn network_config(network: &NetworkData) -> Result<NetworkConfig> {
     })
 }
 
-/// Yazılan değer hâlâ kuyruktaki değerse kuyruktan düşer; yazma sürerken yeni bir
-/// değer girildiyse o kalır ve sonraki uyanışta yazılır
+/// Drops the written value from the queue if it is still the queued one; a newer value
+/// entered while the write was in flight stays and is written at the next wake-up
 fn settle_pending(pending: &mut HashMap<String, BTreeMap<String, Json>>, ieee: &str, key: &str, written: &Json) {
     let Some(entries) = pending.get_mut(ieee) else {
         return;
@@ -157,7 +160,7 @@ fn settle_pending(pending: &mut HashMap<String, BTreeMap<String, Json>>, ieee: &
     }
 }
 
-/// Aynı adlı iki cihaz olmasın: gerekirse IEEE'nin son dört hanesi eklenir
+/// No two devices share a name: the last four IEEE digits are appended if needed
 fn unique_name(base: String, ieee: &str, taken: &[String]) -> String {
     if !taken.contains(&base) {
         return base;
@@ -166,20 +169,26 @@ fn unique_name(base: String, ieee: &str, taken: &[String]) -> String {
     format!("{base} {}", &suffix[suffix.len().saturating_sub(4)..])
 }
 
-/// Kullanıcı adı değiştirmemiş mi: "Cihaz xxxx" ya da önceki sürümün verdiği model kodu
+/// Whether the user kept the automatic name: "Device xxxx" or a default an earlier
+/// version assigned (the Turkish ones, or the model code)
 fn untouched_name(device: &Device) -> bool {
-    device.name == Device::new(device.ieee.clone(), device.nwk).name
+    /// Automatic names of earlier, Turkish versions
+    const LEGACY: &[&str] = &["Radyatör vanası", "Termostat"];
+    let generated = Device::new(device.ieee.clone(), device.nwk).name;
+    device.name == generated
+        || device.name == generated.replacen("Device", "Cihaz", 1)
+        || LEGACY.contains(&device.name.as_str())
         || device.model.as_deref() == Some(device.name.as_str())
 }
 
-/// Tanımda karşılığı olmayan eski durum anahtarlarını atar (ör. tanım değişince)
+/// Drops stale state keys the definition does not know (e.g. after the definition changed)
 fn prune_state(device: &mut Device) {
     let keys: Vec<&str> = devices::features(device).iter().map(|f| f.key).collect();
     device.state.retain(|key, _| keys.contains(&key.as_str()));
 }
 
-/// Adı hâlâ otomatik olan tanınmış cihazlara tanımdan ya da modelden ad verir; eski
-/// durum anahtarlarını temizler
+/// Gives interviewed devices that still have an automatic name a name from their
+/// definition or model; clears stale state keys
 fn apply_default_names(data: &mut Persisted) {
     let ieees: Vec<String> = data.devices.keys().cloned().collect();
     for ieee in ieees {
@@ -204,7 +213,7 @@ fn apply_default_names(data: &mut Persisted) {
     }
 }
 
-/// ZCL öznitelik kayıtlarını cihazın durumuna, tanımındaki özellikler üzerinden yansıtır
+/// Applies ZCL attribute records to the device state through its definition's features
 fn apply_zcl_records(device: &mut Device, cluster_id: u16, records: &[zcl::AttributeRecord]) {
     if cluster_id == cluster::BASIC {
         for record in records {
@@ -217,7 +226,7 @@ fn apply_zcl_records(device: &mut Device, cluster_id: u16, records: &[zcl::Attri
             }
         }
     }
-    // Model az önce öğrenildiyse tanım da değişmiş olabilir: özellikler şimdi alınır
+    // If the model was just learned the definition may have changed: fetch features now
     for feature in devices::features(device) {
         let Source::Attr { cluster, attr, conv, .. } = feature.source else {
             continue;
@@ -238,7 +247,7 @@ fn apply_zcl_records(device: &mut Device, cluster_id: u16, records: &[zcl::Attri
     }
 }
 
-/// Tuya DP'lerini cihazın durumuna yansıtır; tanımda karşılığı olmayan DP'leri döndürür
+/// Applies Tuya datapoints to the device state; returns the ones the definition does not know
 fn apply_tuya_datapoints<'a>(device: &mut Device, datapoints: &'a [tuya::Datapoint]) -> Vec<&'a tuya::Datapoint> {
     let features = devices::features(device);
     let mut unknown = Vec::new();
@@ -264,17 +273,17 @@ fn apply_tuya_datapoints<'a>(device: &mut Device, datapoints: &'a [tuya::Datapoi
     unknown
 }
 
-/// Özellik değerini Tuya DP'sine çevirir
+/// Converts a feature value to a Tuya datapoint
 fn tuya_datapoint(id: u8, dp_type: u8, raw: i64) -> Result<tuya::Datapoint> {
     Ok(match dp_type {
         tuya::dp_type::BOOL => tuya::Datapoint::bool(id, raw != 0),
-        tuya::dp_type::ENUM => tuya::Datapoint::enumeration(id, u8::try_from(raw).context("seçim değeri sığmıyor")?),
-        tuya::dp_type::VALUE => tuya::Datapoint::value(id, i32::try_from(raw).context("değer sığmıyor")?),
-        other => bail!("Tuya DP türü {other} yazılamaz"),
+        tuya::dp_type::ENUM => tuya::Datapoint::enumeration(id, u8::try_from(raw).context("option value does not fit")?),
+        tuya::dp_type::VALUE => tuya::Datapoint::value(id, i32::try_from(raw).context("value does not fit")?),
+        other => bail!("Tuya datapoint type {other} cannot be written"),
     })
 }
 
-/// Merkezin Time kümesi: cihazın okuduğu özniteliklere Read Attributes Response yükü
+/// The hub's Time cluster: a Read Attributes Response payload for the requested attributes
 fn time_read_response(ids: &[u16], unix_now: u64, utc_offset: i64, base: TimeBase) -> Vec<u8> {
     let time = match base {
         TimeBase::Zigbee2000 => unix_now.saturating_sub(SECONDS_1970_TO_2000),
@@ -285,7 +294,7 @@ fn time_read_response(ids: &[u16], unix_now: u64, utc_offset: i64, base: TimeBas
         out.extend_from_slice(&id.to_le_bytes());
         let (ty, value): (u8, Vec<u8>) = match id {
             0x0000 => (types::UTC_TIME, (time as u32).to_le_bytes().to_vec()),
-            // Bit 0: bu cihaz zaman kaynağı (master)
+            // Bit 0: this device is the time master
             0x0001 => (types::BITMAP8, vec![0x01]),
             0x0002 => (types::INT32, (utc_offset as i32).to_le_bytes().to_vec()),
             0x0007 => (types::UINT32, ((time + utc_offset) as u32).to_le_bytes().to_vec()),
@@ -311,13 +320,13 @@ where
         match attempt().await {
             Ok(value) => return Ok(value),
             Err(e) => {
-                debug!("{what} denemesi {n} başarısız: {e:#}");
+                debug!("{what} attempt {n} failed: {e:#}");
                 last_error = Some(e);
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
         }
     }
-    Err(last_error.unwrap_or_else(|| anyhow!("{what} başarısız")))
+    Err(last_error.unwrap_or_else(|| anyhow!("{what} failed")))
 }
 
 impl Hub {
@@ -328,15 +337,15 @@ impl Hub {
         let radio_ieee = phy
             .hw_address()
             .await
-            .map_err(|e| anyhow!("radyonun adresi okunamadı: {e}"))?;
-        info!("Radyo hazır: {}", eui64_to_string(&radio_ieee));
+            .map_err(|e| anyhow!("cannot read the radio address: {e}"))?;
+        info!("Radio ready: {}", eui64_to_string(&radio_ieee));
 
         let mut network = match data.network.take() {
             Some(network) => network,
             None => {
                 let network = store::new_network(&radio_ieee, opts.channel, opts.tx_power);
                 info!(
-                    "Kayıtlı ağ yok; yeni ağ kuruluyor (kanal {}, PAN 0x{:04x})",
+                    "No saved network; forming a new one (channel {}, PAN 0x{:04x})",
                     network.channel, network.pan_id
                 );
                 network
@@ -345,7 +354,7 @@ impl Hub {
         network.nwk_frame_counter = network.nwk_frame_counter.saturating_add(FRAME_COUNTER_MARGIN);
         network.aps_frame_counter = network.aps_frame_counter.saturating_add(FRAME_COUNTER_MARGIN);
         data.network = Some(network.clone());
-        // Sayaçlar kullanılmadan önce diske: çökme döngüsünde bile geri gitmesinler
+        // Counters hit the disk before use, so even a crash loop cannot rewind them
         data.save(&opts.state_path)?;
 
         let ieee = parse_eui64(&network.ieee)?;
@@ -367,21 +376,21 @@ impl Hub {
         stack
             .start_network()
             .await
-            .map_err(|e| anyhow!("ağ başlatılamadı: {e}"))?;
+            .map_err(|e| anyhow!("cannot start the network: {e}"))?;
         stack.spawn_tracked(|stack| async move {
             stack.run().await;
         });
         if opts.sniff {
-            // Radyo süzgecini kapat: hedef adresi olmayan ya da başka PAN'a giden
-            // çerçeveler de görünsün. Radyo sıfırlanırsa ziggurat ayarı geri alır.
+            // Disable the radio's filter so frames without a destination or for another
+            // PAN show too. Ziggurat restores the setting if the radio resets.
             spinel
                 .prop_value_set(ziggurat_spinel::SpinelPropertyId::MacPromiscuousMode, vec![2])
                 .await
-                .map_err(|e| anyhow!("karışık mod açılamadı: {e:?}"))?;
-            warn!("TANILAMA: radyo karışık modda, MAC komut çerçeveleri günlüğe yazılıyor");
+                .map_err(|e| anyhow!("cannot enable promiscuous mode: {e:?}"))?;
+            warn!("DIAGNOSTICS: radio in promiscuous mode, logging MAC command frames");
         }
         info!(
-            "Ağ çalışıyor: kanal {}, PAN 0x{:04x}, {} cihaz",
+            "Network up: channel {}, PAN 0x{:04x}, {} devices",
             network.channel,
             network.pan_id,
             data.devices.len()
@@ -411,7 +420,7 @@ impl Hub {
         tokio::spawn(hub.clone().saver());
         tokio::spawn(hub.clone().table_snapshots());
 
-        // Önceki çalışmada tanıma yarıda kaldıysa sürdür
+        // Resume interviews the previous run left unfinished
         let unfinished: Vec<String> = hub
             .data
             .lock()
@@ -440,6 +449,7 @@ impl Hub {
     fn view(&self, device: &Device) -> DeviceView {
         DeviceView {
             card: devices::card(device),
+            definition: devices::definition_info(device),
             features: devices::features(device).into_iter().copied().collect(),
             interviewing: self.interviews.lock().unwrap().contains(&device.ieee),
             waiting_for_wake: self.wake_interviews.lock().unwrap().contains(&device.ieee),
@@ -474,7 +484,7 @@ impl Hub {
             .is_some_and(|d| !d.rx_on_when_idle)
     }
 
-    /// Cihazı değiştirir; değişiklik olduysa yayınlar ve kaydı tetikler
+    /// Changes a device; if anything changed, publishes it and schedules a save
     fn update_device(&self, ieee: &str, change: impl FnOnce(&mut Device)) {
         let view = {
             let mut data = self.data.lock().unwrap();
@@ -504,7 +514,7 @@ impl Hub {
         self.seq.fetch_add(1, Ordering::Relaxed)
     }
 
-    // ---- Gelen trafik ----
+    // ---- Incoming traffic ----
 
     async fn notification_loop(self: Arc<Self>) {
         loop {
@@ -573,16 +583,16 @@ impl Hub {
             }
             ZigbeeNotification::DeviceLeft { nwk, ieee, reason } => {
                 let ieee = ieee.map_or_else(|| self.ieee_for_nwk(nwk.0), |e| Some(eui64_to_string(&e)));
-                info!("Cihaz ayrıldı: {ieee:?} ({reason:?})");
-                // Yeniden katılacağını söylemeden ayrılan cihazı listeden düşür; zaman
-                // aşımına uğrayan uyuyan çocuklar ise yeniden katılır
+                info!("Device left: {ieee:?} ({reason:?})");
+                // Forget a device that left without announcing a rejoin; sleepy children
+                // that timed out rejoin by themselves
                 if let (Some(ieee), DeviceLeaveReason::Announced { rejoin: false }) = (ieee, reason) {
                     self.forget(&ieee);
                 }
             }
             ZigbeeNotification::ApsDecryptionFailure { source_ieee, .. } => {
                 warn!(
-                    "{} cihazının APS çerçevesi çözülemedi; cihazı yeniden eşleştirmek gerekebilir",
+                    "cannot decrypt an APS frame from {}; the device may need to be paired again",
                     eui64_to_string(&source_ieee)
                 );
             }
@@ -614,9 +624,9 @@ impl Hub {
             device.last_seen = Some(now_unix());
             (!device.interviewed, changed)
         };
-        // Katılım, Update-Device ve Device_annce aynı olayı üç kez bildirebiliyor
+        // The join, Update-Device and Device_annce may report the same event three times
         if changed {
-            info!("Cihaz katıldı: {ieee} (nwk 0x{nwk:04x})");
+            info!("Device joined: {ieee} (nwk 0x{nwk:04x})");
         }
         self.emit_device(&ieee);
         self.dirty.notify_one();
@@ -667,7 +677,7 @@ impl Hub {
                 (payload.get(2) == Some(&HUB_ENDPOINT)).then(|| zdo::our_simple_desc_rsp(0x0000, HUB_ENDPOINT))
             }
             zdo::cluster::MATCH_DESC_REQ => {
-                // IAS sensörleri merkezi bununla arar; yanıtsız kalırlarsa kayıt olmazlar
+                // IAS sensors look for the hub with this; without an answer they never enroll
                 matches!(
                     zdo::parse_nwk_of_interest(payload),
                     Some(0x0000 | 0xFFFC | 0xFFFD | 0xFFFF)
@@ -693,7 +703,7 @@ impl Hub {
                 frame,
                 false,
             ) {
-                debug!("ZDO yanıtı gönderilemedi: {e:#}");
+                debug!("cannot send ZDO response: {e:#}");
             }
         }
     }
@@ -706,7 +716,7 @@ impl Hub {
 
         if !header.cluster_specific() {
             match header.command {
-                // Cihaz merkezden okuyor: yalnızca Time kümesini sunuyoruz
+                // The device reads from the hub: only the Time cluster is served
                 zcl::cmd::READ_ATTRIBUTES if !header.server_to_client() => {
                     if cluster_id == cluster::TIME {
                         self.answer_time_read(source, src_ep, dst_ep, &header, payload, ieee.as_deref());
@@ -738,7 +748,7 @@ impl Hub {
 
         if cluster_id == cluster::IAS_ZONE && header.server_to_client() {
             match header.command {
-                // Zone Status Change Notification: durum özniteliği raporu gibi işlenir
+                // Zone Status Change Notification: handled like a report of the status attribute
                 0x00 => {
                     if let (Some(ieee), Some(bytes)) = (&ieee, payload.get(..2)) {
                         let status = u16::from_le_bytes([bytes[0], bytes[1]]);
@@ -767,7 +777,7 @@ impl Hub {
         }
 
         if cluster_id == cluster::POLL_CONTROL && header.server_to_client() && header.command == 0x00 {
-            // Check-in: bekleyen yazma varsa cihaz hızlı yoklamaya geçsin ki yazma yetişsin
+            // Check-in: with a write pending, ask for fast polling so the write gets through
             let has_pending = ieee
                 .as_ref()
                 .is_some_and(|ieee| self.pending_writes.lock().unwrap().contains_key(ieee));
@@ -780,7 +790,7 @@ impl Hub {
                 &body,
             );
             if let Err(e) = self.send(source, HA_PROFILE, cluster::POLL_CONTROL, HUB_ENDPOINT, src_ep, frame, false) {
-                debug!("Check-in yanıtı gönderilemedi: {e:#}");
+                debug!("cannot send check-in response: {e:#}");
             }
             return;
         }
@@ -791,7 +801,7 @@ impl Hub {
         }
 
         debug!(
-            "İşlenmeyen ZCL komutu: nwk 0x{source:04x} küme 0x{cluster_id:04x} komut 0x{:02x}",
+            "Unhandled ZCL command: nwk 0x{source:04x} cluster 0x{cluster_id:04x} command 0x{:02x}",
             header.command
         );
     }
@@ -808,10 +818,10 @@ impl Hub {
             zcl::cmd::READ_ATTRIBUTES_RSP,
             &body,
         );
-        debug!("Saat isteği yanıtlandı: nwk 0x{nwk:04x} {ids:04x?} ({base:?})");
+        debug!("Answered time read: nwk 0x{nwk:04x} {ids:04x?} ({base:?})");
         let src = if dst_ep == 0 { HUB_ENDPOINT } else { dst_ep };
         if let Err(e) = self.send(nwk, HA_PROFILE, cluster::TIME, src, src_ep, frame, false) {
-            debug!("Saat yanıtı gönderilemedi: {e:#}");
+            debug!("cannot send time response: {e:#}");
         }
     }
 
@@ -827,8 +837,8 @@ impl Hub {
                 let datapoints = tuya::parse_datapoints(payload);
                 self.update_device(ieee, |device| {
                     for dp in apply_tuya_datapoints(device, &datapoints) {
-                        // Yeni bir model eklerken DP haritasını çıkarmak için
-                        info!("{ieee} Tuya DP {} (tür {}): {:02x?}", dp.id, dp.ty, dp.data);
+                        // Logged to map the datapoints when adding a new model
+                        info!("{ieee} Tuya DP {} (type {}): {:02x?}", dp.id, dp.ty, dp.data);
                     }
                 });
             }
@@ -841,7 +851,7 @@ impl Hub {
                 self.send_tuya(nwk, ep, tuya::cmd::MCU_SYNC_TIME, &body);
             }
             tuya::cmd::GATEWAY_CONNECTION_STATUS => {
-                // Ağ geçidi internete bağlı: bazı cihazlar bunu görmeden rapor göndermiyor
+                // The gateway is online: some devices only report after hearing this
                 self.send_tuya(nwk, ep, tuya::cmd::GATEWAY_CONNECTION_STATUS, &[0x01, 0x00, 0x01]);
             }
             _ => {}
@@ -857,7 +867,7 @@ impl Hub {
             body,
         );
         if let Err(e) = self.send(nwk, HA_PROFILE, tuya::CLUSTER, HUB_ENDPOINT, ep, frame, true) {
-            warn!("Tuya komutu 0x{command:02x} gönderilemedi: {e:#}");
+            warn!("cannot send Tuya command 0x{command:02x}: {e:#}");
         }
     }
 
@@ -881,12 +891,12 @@ impl Hub {
             &[header.command, zcl::STATUS_SUCCESS],
         );
         if let Err(e) = self.send(nwk, HA_PROFILE, cluster_id, HUB_ENDPOINT, ep, frame, false) {
-            debug!("Default Response gönderilemedi: {e:#}");
+            debug!("cannot send Default Response: {e:#}");
         }
     }
 
     fn send_enroll_response(&self, nwk: u16, ep: u8) {
-        // Bölge kimliği yalnızca bu merkez içinde anlamlı
+        // The zone ID only has meaning within this hub
         let zone_id = (nwk & 0x7F) as u8;
         let frame = zcl::frame(
             zcl::FC_CLUSTER_SPECIFIC | zcl::FC_DISABLE_DEFAULT_RESPONSE,
@@ -895,11 +905,11 @@ impl Hub {
             &[zcl::STATUS_SUCCESS, zone_id],
         );
         if let Err(e) = self.send(nwk, HA_PROFILE, cluster::IAS_ZONE, HUB_ENDPOINT, ep, frame, true) {
-            warn!("IAS kayıt yanıtı gönderilemedi: {e:#}");
+            warn!("cannot send IAS enroll response: {e:#}");
         }
     }
 
-    // ---- Giden istekler ----
+    // ---- Outgoing requests ----
 
     #[allow(clippy::too_many_arguments)]
     fn send(
@@ -929,7 +939,7 @@ impl Hub {
                 RouteDirective::StackDecides,
             )
             .map(drop)
-            .map_err(|e| anyhow!("gönderim kuyruğa alınamadı: {e:?}"))
+            .map_err(|e| anyhow!("cannot queue the send: {e:?}"))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -958,7 +968,7 @@ impl Hub {
             Ok(Ok(response)) => Ok(response),
             _ => {
                 self.pending.lock().unwrap().remove(&key);
-                bail!("cihaz yanıt vermedi")
+                bail!("the device did not respond")
             }
         }
     }
@@ -991,7 +1001,7 @@ impl Hub {
             .request(key, nwk, HA_PROFILE, cluster_id, HUB_ENDPOINT, ep, frame)
             .await?;
         let (header, body) =
-            zcl::Header::parse(&response).ok_or_else(|| anyhow!("bozuk ZCL yanıtı"))?;
+            zcl::Header::parse(&response).ok_or_else(|| anyhow!("malformed ZCL response"))?;
         Ok((header, body.to_vec()))
     }
 
@@ -1013,25 +1023,25 @@ impl Hub {
             )
             .await?;
         if header.command != zcl::cmd::READ_ATTRIBUTES_RSP {
-            bail!("öznitelik okuma reddedildi (komut 0x{:02x})", header.command);
+            bail!("attribute read rejected (command 0x{:02x})", header.command);
         }
         Ok(zcl::parse_read_response(&body))
     }
 
-    // ---- Cihaz tanıma ----
+    // ---- Interview ----
 
-    /// Katılımdan sonra cihaz anahtar alışverişini bitirsin diye kısa bir bekleme
+    /// A short delay after joining so the device finishes the key exchange
     pub fn spawn_interview(self: &Arc<Self>, ieee: String) {
         self.spawn_interview_after(ieee, Duration::from_secs(2));
     }
 
-    /// Uyuyan cihaz az önce bir şey gönderdi: uyanıkken hemen tanı
+    /// A sleepy device just sent something: interview it right away while it is awake
     fn start_wake_interview(self: &Arc<Self>, nwk: u16) {
         let Some(ieee) = self.ieee_for_nwk(nwk) else {
             return;
         };
         if self.wake_interviews.lock().unwrap().remove(&ieee) {
-            info!("{ieee} uyandı, tanınıyor");
+            info!("{ieee} woke up, interviewing");
             self.spawn_interview_after(ieee, Duration::ZERO);
         }
     }
@@ -1047,16 +1057,16 @@ impl Hub {
             let result = hub.interview(&ieee).await;
             hub.interviews.lock().unwrap().remove(&ieee);
             match result {
-                Ok(()) => info!("{ieee} tanındı"),
-                Err(e) => warn!("{ieee} tanınamadı: {e:#}"),
+                Ok(()) => info!("{ieee} interviewed"),
+                Err(e) => warn!("{ieee} interview failed: {e:#}"),
             }
             hub.emit_device(&ieee);
         });
     }
 
     async fn interview(self: &Arc<Self>, ieee: &str) -> Result<()> {
-        let nwk = self.device(ieee).context("cihaz listede yok")?.nwk;
-        info!("{ieee} tanınıyor");
+        let nwk = self.device(ieee).context("device not in the list")?.nwk;
+        info!("{ieee} interviewing");
 
         let desc = retry("Node_Desc", || async move {
             let rsp = self
@@ -1096,22 +1106,22 @@ impl Hub {
         }
         self.update_device(ieee, |d| d.endpoints = endpoints);
 
-        let device = self.device(ieee).context("cihaz listede yok")?;
+        let device = self.device(ieee).context("device not in the list")?;
         if let Some(ep) = device.endpoint_with(cluster::BASIC) {
-            // Tuya cihazları bu öznitelikleri tek istekte okumadan veri göndermiyor;
-            // diğer cihazlar için de zararsız
+            // Tuya devices do not send data until these are read in a single request;
+            // harmless for other devices
             if let Err(e) = self
                 .read_attributes(nwk, ep, cluster::BASIC, &[0x0004, 0x0000, 0x0001, 0x0005, 0x0007, 0xFFFE, 0x4000])
                 .await
             {
-                warn!("{ieee} temel bilgileri okunamadı: {e:#}");
+                warn!("{ieee} cannot read basic info: {e:#}");
             }
         }
 
         self.configure(ieee).await;
 
         if let Some(ep) = self.device(ieee).and_then(|d| d.endpoint_with(tuya::CLUSTER)) {
-            // Bütün DP'leri bir kez iste; sonrası cihazın kendi raporlarıyla gelir
+            // Ask for all datapoints once; later values arrive in the device's own reports
             self.send_tuya(nwk, ep, tuya::cmd::DATA_QUERY, &[]);
         }
 
@@ -1133,9 +1143,9 @@ impl Hub {
         Ok(())
     }
 
-    /// Cihazın özelliklerinden türetilir: raporlanan kümeleri merkeze bağlar, raporlamayı
-    /// ayarlar, IAS bölgesini kaydeder ve okunabilir bütün özniteliklerin güncel değerini
-    /// okur. Tek tek hatalar tanımayı durdurmaz: bazı cihazlar bazı adımları desteklemiyor.
+    /// Derived from the device's features: binds the reported clusters to the hub,
+    /// configures reporting, enrolls the IAS zone and reads every readable attribute.
+    /// Individual failures do not stop the interview: some devices skip some steps.
     async fn configure(self: &Arc<Self>, ieee: &str) {
         let Some(device) = self.device(ieee) else {
             return;
@@ -1186,10 +1196,10 @@ impl Hub {
                 Ok((header, body))
                     if header.command == zcl::cmd::CONFIGURE_REPORTING_RSP && zcl::all_success(&body) => {}
                 Ok((header, body)) => warn!(
-                    "{ieee} küme 0x{cluster_id:04x} raporlama ayarı reddedildi (komut 0x{:02x}, {body:02x?})",
+                    "{ieee} cluster 0x{cluster_id:04x} rejected the reporting configuration (command 0x{:02x}, {body:02x?})",
                     header.command
                 ),
-                Err(e) => warn!("{ieee} küme 0x{cluster_id:04x} raporlama ayarlanamadı: {e:#}"),
+                Err(e) => warn!("{ieee} cluster 0x{cluster_id:04x} reporting not configured: {e:#}"),
             }
         }
 
@@ -1210,7 +1220,7 @@ impl Hub {
             };
             for chunk in attrs.chunks(READ_CHUNK) {
                 if let Err(e) = self.read_attributes(nwk, ep, cluster_id, chunk).await {
-                    debug!("{ieee} küme 0x{cluster_id:04x} {chunk:04x?} okunamadı: {e:#}");
+                    debug!("{ieee} cluster 0x{cluster_id:04x} {chunk:04x?} not read: {e:#}");
                 }
             }
         }
@@ -1229,12 +1239,12 @@ impl Hub {
         })
         .await;
         if let Err(e) = bind {
-            warn!("{ieee} küme 0x{cluster_id:04x} bağlanamadı: {e:#}");
+            warn!("{ieee} cluster 0x{cluster_id:04x} not bound: {e:#}");
         }
     }
 
-    /// IAS bölgesini merkeze kaydeder: CIE adresini yazar ve kayıt yanıtını önceden
-    /// gönderir (bazı sensörler kayıt isteği göndermeden bekler)
+    /// Enrolls the IAS zone with the hub: writes the CIE address and sends the enroll
+    /// response up front (some sensors wait without sending an enroll request)
     async fn enroll(&self, ieee: &str, nwk: u16, ep: u8) {
         let payload = zcl::write_attribute_payload(0x0010, types::EUI64, &self.ieee.0);
         match self
@@ -1243,22 +1253,23 @@ impl Hub {
         {
             Ok((header, body))
                 if header.command == zcl::cmd::WRITE_ATTRIBUTES_RSP && zcl::all_success(&body) => {}
-            Ok((_, body)) => warn!("{ieee} IAS merkez adresi reddedildi: {body:02x?}"),
-            Err(e) => warn!("{ieee} IAS merkez adresi yazılamadı: {e:#}"),
+            Ok((_, body)) => warn!("{ieee} rejected the IAS CIE address: {body:02x?}"),
+            Err(e) => warn!("{ieee} IAS CIE address not written: {e:#}"),
         }
         self.send_enroll_response(nwk, ep);
     }
 
-    // ---- Kullanıcı işlemleri ----
+    // ---- User actions ----
 
-    /// Bir özelliğe değer yazar: kaynağına göre öznitelik yazma, ışık komutu ya da Tuya
-    /// DP'si. Uyuyan cihaza öznitelik yazması kuyruğa alınır; dönüş `true` ise bekliyor.
+    /// Writes a feature value: an attribute write, a light command or a Tuya datapoint,
+    /// depending on its source. Attribute writes to sleepy devices are queued; returns
+    /// `true` when the write waits for the device to wake up.
     pub async fn set(self: &Arc<Self>, ieee: &str, key: &str, value: Json) -> Result<bool> {
-        let device = self.device(ieee).context("cihaz bulunamadı")?;
+        let device = self.device(ieee).context("device not found")?;
         let feature = devices::features(&device)
             .into_iter()
             .find(|f| f.key == key)
-            .with_context(|| format!("bilinmeyen özellik: {key}"))?;
+            .with_context(|| format!("unknown feature: {key}"))?;
         let value = feature.validate(&device, value)?;
 
         match feature.source {
@@ -1277,8 +1288,8 @@ impl Hub {
                     .or_default()
                     .insert(key.to_owned(), value);
                 self.emit_device(ieee);
-                // Uyuyan cihaza yazma ancak uyanıkken yetişir (dolaylı iletim 7,68 sn
-                // bekler). Cihaz az önce bir şey gönderdiyse şimdi dene.
+                // A write only reaches a sleepy device while it is awake (indirect
+                // transmissions wait 7.68 s). Try now if it just sent something.
                 if device
                     .last_seen
                     .is_some_and(|seen| now_unix().saturating_sub(seen) <= AWAKE_WINDOW_SECONDS)
@@ -1294,7 +1305,7 @@ impl Hub {
             Source::Tuya { dp, dp_type, conv } => {
                 let datapoint = tuya_datapoint(dp, dp_type, conv.encode(&value)?)?;
                 self.send_tuya_datapoint(&device, datapoint)?;
-                // Onayı cihazın kendi DP raporu getirir; arayüz beklemesin
+                // The device's own datapoint report confirms it; the UI need not wait
                 self.update_device(ieee, |d| {
                     d.state.insert(key.to_owned(), value);
                 });
@@ -1302,7 +1313,7 @@ impl Hub {
             }
             Source::TuyaSchedule { dp, divisor } => {
                 let Kind::Schedule { min, max, step } = feature.kind else {
-                    bail!("program türü bekleniyordu");
+                    bail!("expected a schedule kind");
                 };
                 let expected = device.state.get(key).and_then(Json::as_array).map(Vec::len);
                 let data = tuya::encode_schedule(&value, expected, (min, max, step), divisor).map_err(|e| anyhow!(e))?;
@@ -1324,15 +1335,15 @@ impl Hub {
     }
 
     fn send_tuya_datapoint(&self, device: &Device, datapoint: tuya::Datapoint) -> Result<()> {
-        let ep = device.endpoint_with(tuya::CLUSTER).context("cihazda Tuya kümesi yok")?;
+        let ep = device.endpoint_with(tuya::CLUSTER).context("the device has no Tuya cluster")?;
         let seq = u16::from(self.next_seq());
         self.send_tuya(device.nwk, ep, tuya::cmd::DATA_REQUEST, &tuya::data_request(seq, &[datapoint]));
         Ok(())
     }
 
-    /// Işık kümelerine komut: On/Off, Move to Level (with On/Off), Move to Color Temperature
+    /// Light cluster commands: On/Off, Move to Level (with On/Off), Move to Color Temperature
     async fn light_command(&self, device: &Device, feature: &Feature, cluster_id: u16, write: Write, value: &Json) -> Result<()> {
-        // Yarım saniyelik geçiş
+        // Half-second transition
         const TRANSITION: u16 = 5;
         let number = || value.as_f64().unwrap_or_default().round();
         let (command, payload): (u8, Vec<u8>) = match write {
@@ -1348,9 +1359,9 @@ impl Hub {
                 payload.extend_from_slice(&TRANSITION.to_le_bytes());
                 (0x0A, payload)
             }
-            Write::No | Write::Attribute => bail!("{} komutla yazılmaz", feature.label),
+            Write::No | Write::Attribute => bail!("{} is not written with a command", feature.label),
         };
-        let ep = device.endpoint_with(cluster_id).context("cihaz bu komutu desteklemiyor")?;
+        let ep = device.endpoint_with(cluster_id).context("the device does not support this command")?;
         let (header, body) = self
             .zcl_request(device.nwk, ep, cluster_id, zcl::FC_CLUSTER_SPECIFIC, command, &payload)
             .await?;
@@ -1358,9 +1369,9 @@ impl Hub {
             && let Some(status) = zcl::default_response_status(&body)
             && status != zcl::STATUS_SUCCESS
         {
-            bail!("cihaz komutu reddetti (durum 0x{status:02x})");
+            bail!("the device rejected the command (status 0x{status:02x})");
         }
-        // Raporlar birazdan gelecek; arayüz beklemesin
+        // Reports follow shortly; the UI need not wait
         self.update_device(&device.ieee, |d| {
             d.state.insert(feature.key.to_owned(), value.clone());
             if write == Write::Level {
@@ -1372,17 +1383,17 @@ impl Hub {
 
     async fn write_attribute(&self, device: &Device, feature: &Feature, value: &Json) -> Result<()> {
         let Source::Attr { cluster, attr, ty, conv, .. } = feature.source else {
-            bail!("öznitelik değil");
+            bail!("not an attribute");
         };
         let raw = conv.encode(value)?;
-        let bytes = zcl::encode_int(ty, raw).context("değer özniteliğin türüne sığmıyor")?;
-        let ep = device.endpoint_with(cluster).context("cihazda özniteliğin kümesi yok")?;
+        let bytes = zcl::encode_int(ty, raw).context("the value does not fit the attribute type")?;
+        let ep = device.endpoint_with(cluster).context("the device lacks the attribute's cluster")?;
         let payload = zcl::write_attribute_payload(attr, ty, &bytes);
         let (header, body) = self
             .zcl_request(device.nwk, ep, cluster, 0x00, zcl::cmd::WRITE_ATTRIBUTES, &payload)
             .await?;
         if header.command != zcl::cmd::WRITE_ATTRIBUTES_RSP || !zcl::all_success(&body) {
-            bail!("cihaz değeri reddetti ({body:02x?})");
+            bail!("the device rejected the value ({body:02x?})");
         }
         info!("{} {} = {value}", device.ieee, feature.key);
         self.update_device(&device.ieee, |d| {
@@ -1391,28 +1402,28 @@ impl Hub {
         Ok(())
     }
 
-    /// Hue lambalarını seri numarasıyla fabrika ayarına döndürür: önce eşleştirmeyi açar
-    /// (sıfırlanan lamba hemen katılabilsin), sonra her kanalda inter-PAN istek yayınlar
-    /// ve ağın kanalına döner. Bu sırada (~20 sn) ağ trafiği bekler.
+    /// Factory resets Hue lights by serial number: opens joining first (so the reset light
+    /// can join right away), broadcasts the inter-PAN request on every channel and
+    /// returns to the network channel. Network traffic waits meanwhile (~20 s).
     pub async fn hue_factory_reset(self: &Arc<Self>, serials: &[String]) -> Result<()> {
         if serials.is_empty() || serials.len() > 8 {
-            bail!("1-8 seri numarası girilmeli");
+            bail!("enter 1-8 serial numbers");
         }
         let numbers = serials
             .iter()
             .map(|s| crate::hue_reset::parse_serial(s))
             .collect::<Result<Vec<_>>>()?;
-        let network = self.data.lock().unwrap().network.clone().context("ağ yok")?;
+        let network = self.data.lock().unwrap().network.clone().context("no network")?;
         let extended_pan_id = parse_eui64(&network.extended_pan_id)?;
 
         self.permit_join(MAX_PERMIT_SECONDS)?;
-        info!("Hue sıfırlama isteği: {serials:?}");
+        info!("Hue factory reset request: {serials:?}");
 
         let radio = self.phy.lock().await;
         let mut result = Ok(());
         for (i, &channel) in crate::hue_reset::CHANNELS.iter().enumerate() {
             if let Err(e) = radio.set_channel(channel).await {
-                result = Err(anyhow!("kanal {channel}'e geçilemedi: {e}"));
+                result = Err(anyhow!("cannot switch to channel {channel}: {e}"));
                 break;
             }
             let psdu = crate::hue_reset::reset_frame(
@@ -1422,7 +1433,7 @@ impl Hub {
                 &extended_pan_id,
                 &numbers,
             );
-            // Yayın onaylanmaz; kaçmasın diye her kanalda iki kez
+            // Broadcasts are not acknowledged; send twice per channel to be safe
             for _ in 0..2 {
                 let frame = TxFrame {
                     psdu: psdu.clone(),
@@ -1433,23 +1444,23 @@ impl Hub {
                     security_processed: true,
                 };
                 if let Err(e) = radio.transmit(frame).await {
-                    warn!("Hue sıfırlama kanal {channel}: gönderilemedi: {e}");
+                    warn!("Hue reset on channel {channel}: send failed: {e}");
                 }
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
         }
-        // Ne olursa olsun ağın kanalına dön
+        // Return to the network channel no matter what
         let restore = radio.set_channel(network.channel).await;
         drop(radio);
-        restore.map_err(|e| anyhow!("ağ kanalına ({}) dönülemedi: {e}", network.channel))?;
-        info!("Hue sıfırlama isteği bütün kanallarda gönderildi");
+        restore.map_err(|e| anyhow!("cannot return to the network channel ({}): {e}", network.channel))?;
+        info!("Hue reset request sent on every channel");
         result
     }
 
-    /// Şebekeli cihaz hemen, uyuyan cihaz bir sonraki uyanışında tanınır; dönüş
-    /// `true` ise uyanış bekleniyor
+    /// A mains-powered device is interviewed now, a sleepy one at its next wake-up;
+    /// returns `true` when waiting for the wake-up
     pub fn reinterview(self: &Arc<Self>, ieee: &str) -> Result<bool> {
-        let device = self.device(ieee).context("cihaz bulunamadı")?;
+        let device = self.device(ieee).context("device not found")?;
         if device.rx_on_when_idle {
             self.spawn_interview_after(ieee.to_owned(), Duration::ZERO);
             return Ok(false);
@@ -1463,7 +1474,7 @@ impl Hub {
         let seconds = seconds.min(MAX_PERMIT_SECONDS);
         self.stack.permit_joins(u64::from(seconds), true);
 
-        // Yönlendiricilere de duyur: cihazlar en yakın Hue lambası üzerinden katılabilsin
+        // Tell the routers too, so devices can join through the nearest light
         let mut data = vec![self.next_seq()];
         data.extend(zdo::mgmt_permit_joining_req(seconds));
         self.stack
@@ -1477,11 +1488,11 @@ impl Hub {
                 data,
                 TxPriority::UserNormal,
             )
-            .map_err(|e| anyhow!("eşleştirme izni yayınlanamadı: {e:?}"))?;
+            .map_err(|e| anyhow!("cannot broadcast the permit join: {e:?}"))?;
 
         let until = (seconds > 0).then(|| Instant::now() + Duration::from_secs(u64::from(seconds)));
         *self.permit_until.lock().unwrap() = until;
-        info!("Eşleştirme izni: {seconds} sn");
+        info!("Permit join: {seconds} s");
         let _ = self.events.send(Event::PermitJoin {
             remaining: u64::from(seconds),
         });
@@ -1505,8 +1516,9 @@ impl Hub {
             .map_or(0, |until| until.saturating_duration_since(Instant::now()).as_secs())
     }
 
-    /// Cihaz az önce bir şey gönderdiyse uyanıktır: bekleyen yazmaları şimdi yap. Değer,
-    /// cihaz onaylayana kadar kuyrukta kalır; başarısız yazma sonraki uyanışta yinelenir.
+    /// A device that just sent something is awake: perform its pending writes now. A value
+    /// stays queued until the device confirms it; a failed write is retried at the next
+    /// wake-up.
     fn flush_pending_writes(self: &Arc<Self>, nwk: u16) {
         let Some(device) = self.data.lock().unwrap().devices.values().find(|d| d.nwk == nwk).cloned() else {
             return;
@@ -1514,7 +1526,7 @@ impl Hub {
         let Some(pending) = self.pending_writes.lock().unwrap().get(&device.ieee).cloned() else {
             return;
         };
-        // Yazmanın yanıtı da buraya düşer; süren yazma varken ikincisini başlatma
+        // The write's own response lands here too; never start a second concurrent write
         if !self.writing.lock().unwrap().insert(device.ieee.clone()) {
             return;
         }
@@ -1528,7 +1540,7 @@ impl Hub {
                 match hub.write_attribute(&device, feature, &value).await {
                     Ok(()) => settle_pending(&mut hub.pending_writes.lock().unwrap(), &device.ieee, &key, &value),
                     Err(e) => warn!(
-                        "{} {key} yazılamadı, sonraki uyanışta yeniden denenecek: {e:#}",
+                        "{} {key} not written, retrying at the next wake-up: {e:#}",
                         device.ieee
                     ),
                 }
@@ -1541,24 +1553,24 @@ impl Hub {
     pub fn rename(&self, ieee: &str, name: &str) -> Result<()> {
         let name = name.trim();
         if name.is_empty() || name.chars().count() > 64 {
-            bail!("ad 1-64 karakter olmalı");
+            bail!("the name must be 1-64 characters");
         }
         if self.device(ieee).is_none() {
-            bail!("cihaz bulunamadı");
+            bail!("device not found");
         }
         self.update_device(ieee, |d| d.name = name.to_owned());
         Ok(())
     }
 
-    /// Cihazdan ağdan ayrılmasını ister ve kayıtlarını siler
+    /// Asks the device to leave the network and deletes its records
     pub async fn remove(&self, ieee: &str) -> Result<()> {
-        let device = self.device(ieee).context("cihaz bulunamadı")?;
+        let device = self.device(ieee).context("device not found")?;
         let device_ieee = parse_eui64(ieee)?;
         if let Err(e) = self
             .zdo_request(device.nwk, zdo::cluster::MGMT_LEAVE_REQ, zdo::mgmt_leave_req(device_ieee.0))
             .await
         {
-            warn!("{ieee} ayrılma isteğine yanıt vermedi: {e:#}");
+            warn!("{ieee} did not answer the leave request: {e:#}");
         }
         self.forget(ieee);
         Ok(())
@@ -1577,7 +1589,7 @@ impl Hub {
         self.dirty.notify_one();
     }
 
-    // ---- Kalıcılık ----
+    // ---- Persistence ----
 
     async fn saver(self: Arc<Self>) {
         loop {
@@ -1605,7 +1617,7 @@ impl Hub {
         }
     }
 
-    /// Link anahtarlarını ve çocuk tablosunu yığından alır; değiştiyse `true`
+    /// Takes the link keys and the child table from the stack; `true` if they changed
     pub fn refresh_tables(&self) -> bool {
         let link_keys: Vec<LinkKey> = proto::key_entries(&self.stack)
             .into_iter()
@@ -1633,8 +1645,8 @@ impl Hub {
     }
 }
 
-/// Önceki çalışmadan kalan link anahtarlarını, çocukları ve adres eşlemelerini yığına
-/// geri yükler. Çocuk tablosu olmadan uyuyan sensörler yeniden başlatmada kopar.
+/// Restores the link keys, children and address mappings of the previous run into the
+/// stack. Without the child table, sleepy sensors drop off on restart.
 fn restore_tables(stack: &ZigbeeStack<SpinelPhy>, data: &Persisted) {
     let keys: Vec<proto::KeyEntry> = data
         .link_keys
@@ -1679,7 +1691,7 @@ fn restore_tables(stack: &ZigbeeStack<SpinelPhy>, data: &Persisted) {
         .collect();
 
     info!(
-        "Geri yükleniyor: {} link anahtarı, {} çocuk, {} adres",
+        "Restoring {} link keys, {} children, {} addresses",
         keys.len(),
         children.len(),
         addresses.len()
@@ -1760,7 +1772,7 @@ mod tests {
         assert_eq!(device.state["setpoint"], json!(21.5));
         assert_eq!(device.state["system_mode"], json!("heat"));
         assert_eq!(device.state["child_lock"], json!(true));
-        // Tanımda olmayan On/Off kümesi artık özellik değil
+        // The On/Off cluster, absent from the definition, is no longer a feature
         apply_zcl_records(&mut device, cluster::ON_OFF, &[record(0, Value::Bool(true))]);
         assert!(!device.state.contains_key("on"));
     }
@@ -1812,7 +1824,7 @@ mod tests {
         let mut thermostat = device_with(&[0x0000, 0xEF00]);
         thermostat.manufacturer = Some("_TZE200_g9a3awaj".into());
         thermostat.model = Some("TS0601".into());
-        assert_eq!(devices::default_name(&thermostat).as_deref(), Some("Termostat"));
+        assert_eq!(devices::default_name(&thermostat).as_deref(), Some("Thermostat"));
     }
 
     #[test]
@@ -1827,13 +1839,17 @@ mod tests {
         data.devices.insert(device.ieee.clone(), device.clone());
         apply_default_names(&mut data);
         let device = &data.devices[&device.ieee];
-        assert_eq!(device.name, "Radyatör vanası");
+        assert_eq!(device.name, "Radiator valve");
         assert!(!device.state.contains_key("on"));
         assert_eq!(device.state["setpoint"], json!(19.0));
 
         let mut renamed = device.clone();
-        renamed.name = "Salon".into();
+        renamed.name = "Living room".into();
         assert!(!untouched_name(&renamed));
+        renamed.name = "Termostat".into();
+        assert!(untouched_name(&renamed));
+        renamed.name = format!("Cihaz {}", &renamed.ieee.replace(':', "")[12..]);
+        assert!(untouched_name(&renamed));
     }
 
     #[test]
@@ -1842,7 +1858,7 @@ mod tests {
         let ieee = "38:39:8f:ff:fe:de:0d:70";
         pending.entry(ieee.into()).or_default().insert("temperature_calibration".into(), json!(1.0));
 
-        // Yazma sürerken kullanıcı değeri değiştirdi: eski yazma yenisini silmemeli
+        // The user changed the value during the write: the old write must not clear it
         pending.get_mut(ieee).unwrap().insert("temperature_calibration".into(), json!(-0.5));
         settle_pending(&mut pending, ieee, "temperature_calibration", &json!(1.0));
         assert_eq!(pending[ieee]["temperature_calibration"], json!(-0.5));

@@ -1,7 +1,6 @@
-//! Tanılama: seri porttan RCP'den gelen baytların bir kopyasını HDLC/Spinel olarak
-//! çözer ve 802.15.4 MAC komut çerçevelerini adresleme alanlarıyla günlüğe yazar.
-//! Ziggurat'a giden akışa dokunmaz. Radyo karışık moda alındığında radyonun normalde
-//! süzdüğü çerçeveler de görünür.
+//! Diagnostics: decodes a copy of the bytes coming from the RCP as HDLC/Spinel and logs
+//! 802.15.4 MAC command frames with their addressing fields. The stream to Ziggurat is
+//! untouched. With the radio in promiscuous mode, frames it normally filters show too.
 
 use std::io;
 use std::pin::Pin;
@@ -34,7 +33,7 @@ impl<T> Tap<T> {
     fn feed(&mut self, byte: u8) {
         match byte {
             HDLC_FLAG => {
-                // Sondaki 2 bayt HDLC sağlama toplamı
+                // The trailing 2 bytes are the HDLC checksum
                 if self.frame.len() > 2 {
                     let end = self.frame.len() - 2;
                     if let Some(line) = describe_spinel(&self.frame[..end]) {
@@ -84,8 +83,8 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for Tap<T> {
     }
 }
 
-/// Spinel: başlık, komut, özellik (ikisi de 128'in altında, tek bayt), değer.
-/// STREAM_RAW değeri: PSDU uzunluğu (LE), PSDU, RSSI, …
+/// Spinel: header, command, property (both below 128, single byte), value.
+/// The STREAM_RAW value: PSDU length (LE), PSDU, RSSI, …
 fn describe_spinel(frame: &[u8]) -> Option<String> {
     let [_header, command, property, value @ ..] = frame else {
         return None;
@@ -112,7 +111,7 @@ fn address(bytes: &[u8], mode: u16) -> Option<(String, usize)> {
     }
 }
 
-/// Yalnızca MAC komut çerçeveleri: katılma ve yoklama burada görünür
+/// MAC command frames only: joining and polling show up here
 pub fn describe_mac_command(psdu: &[u8], rssi: i8) -> Option<String> {
     let fcf = u16::from_le_bytes([*psdu.first()?, *psdu.get(1)?]);
     if fcf & 0x07 != 0x03 {
@@ -143,10 +142,10 @@ pub fn describe_mac_command(psdu: &[u8], rssi: i8) -> Option<String> {
         0x02 => "AssociationResponse".to_owned(),
         0x04 => "DataRequest".to_owned(),
         0x07 => "BeaconRequest".to_owned(),
-        other => format!("komut 0x{other:02x}"),
+        other => format!("command 0x{other:02x}"),
     };
     Some(format!(
-        "{command} kaynak={src} hedef={dst} hedefPAN={dst_pan} sürüm={version} ackİstek={ack_request} sıra={seq} rssi={rssi}"
+        "{command} src={src} dst={dst} dst_pan={dst_pan} version={version} ack_request={ack_request} seq={seq} rssi={rssi}"
     ))
 }
 
@@ -156,22 +155,22 @@ mod tests {
 
     #[test]
     fn describes_data_request_without_destination() {
-        // FCF: komut, ACK iste, hedef adressiz, kaynak 64 bit (PAN sıkıştırması yok)
+        // FCF: command, ACK request, no destination, 64-bit source (no PAN compression)
         let mut psdu = vec![0x23, 0xC0, 0x42, 0x13, 0x2B];
         psdu.extend_from_slice(&[0xeb, 0x5b, 0xb4, 0xfe, 0xff, 0x5f, 0xae, 0x0c]);
         psdu.push(0x04);
         let line = describe_mac_command(&psdu, -55).unwrap();
-        assert!(line.starts_with("DataRequest kaynak=0c:ae:5f:ff:fe:b4:5b:eb hedef=-"), "{line}");
+        assert!(line.starts_with("DataRequest src=0c:ae:5f:ff:fe:b4:5b:eb dst=-"), "{line}");
     }
 
     #[test]
     fn describes_association_request_to_coordinator() {
-        // FCF 0xc823: komut, ACK iste, hedef kısa, kaynak 64 bit
+        // FCF 0xc823: command, ACK request, short destination, 64-bit source
         let mut psdu = vec![0x23, 0xC8, 0x10, 0x13, 0x2B, 0x00, 0x00, 0xFF, 0xFF];
         psdu.extend_from_slice(&[0xeb, 0x5b, 0xb4, 0xfe, 0xff, 0x5f, 0xae, 0x0c]);
         psdu.extend_from_slice(&[0x01, 0x80]);
         let line = describe_mac_command(&psdu, -40).unwrap();
-        assert!(line.contains("AssociationRequest kaynak=0c:ae:5f:ff:fe:b4:5b:eb hedef=0x0000 hedefPAN=0x2b13"), "{line}");
+        assert!(line.contains("AssociationRequest src=0c:ae:5f:ff:fe:b4:5b:eb dst=0x0000 dst_pan=0x2b13"), "{line}");
     }
 
     #[test]
@@ -182,7 +181,7 @@ mod tests {
     #[test]
     fn tap_decodes_escaped_stream_raw_frame() {
         let mut tap = Tap::new(());
-        // Spinel: başlık 0x80, PROP_VALUE_IS, STREAM_RAW, uzunluk 4, PSDU, RSSI; 0x7E kaçışlı
+        // Spinel: header 0x80, PROP_VALUE_IS, STREAM_RAW, length 4, PSDU, RSSI; 0x7E escaped
         let body = [0x80, 6, 113, 4, 0, 0x23, 0xC8, 0x7E, 0x00, 0xC4, 0xAA, 0xBB];
         let mut wire = vec![HDLC_FLAG];
         for b in body {

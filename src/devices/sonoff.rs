@@ -1,10 +1,10 @@
-//! SONOFF cihazları (zigbee-herdsman-converters `src/devices/sonoff.ts`).
+//! SONOFF devices (zigbee-herdsman-converters `src/devices/sonoff.ts`).
 
 use super::common::{self, numeric, thermostat};
 use super::{Card, Conv, Definition, Feature, Fingerprint, Kind, Place, Source, TimeBase, Write};
 use crate::zcl::{cluster, types};
 
-/// SONOFF'un kendi kümesi
+/// SONOFF's manufacturer-specific cluster
 const SONOFF: u16 = 0xFC11;
 
 const fn fc11(attr: u16, ty: u8, conv: Conv, write: Write) -> Source {
@@ -34,10 +34,12 @@ const fn raw_number() -> Conv {
 
 const ON_OFF_BOOL: Conv = Conv::Bool { on: 1, off: 0 };
 
-// ---- SNZB-02P: sıcaklık ve nem sensörü ----
+// ---- SNZB-02P: temperature and humidity sensor ----
 
 pub static SNZB_02P: Definition = Definition {
     fingerprint: &[Fingerprint::Model("SNZB-02P")],
+    vendor: "SONOFF",
+    description: "Temperature and humidity sensor",
     name: None,
     card: Card::Sensor,
     features: &[
@@ -46,30 +48,32 @@ pub static SNZB_02P: Definition = Definition {
         common::BATTERY,
         Feature::new(
             "temperature_calibration",
-            "Sıcaklık düzeltmesi",
+            "Temperature calibration",
             numeric("°C", Some(-50.0), Some(50.0), Some(0.1)),
             Place::Config,
             fc11(0x2003, types::INT16, hundredths(), Write::Attribute),
-        ),
+        )
+        .describe("Offset to add/subtract to the reported temperature"),
         Feature::new(
             "humidity_calibration",
-            "Nem düzeltmesi",
+            "Humidity calibration",
             numeric("%", Some(-50.0), Some(50.0), Some(0.1)),
             Place::Config,
             fc11(0x2004, types::INT16, hundredths(), Write::Attribute),
-        ),
+        )
+        .describe("Offset to add/subtract to the reported relative humidity"),
     ],
     binds: &[cluster::POLL_CONTROL],
     time_base: TimeBase::Zigbee2000,
     tuya_time_since_2000: false,
 };
 
-// ---- TRVZB: termostatik radyatör vanası ----
+// ---- TRVZB: thermostatic radiator valve ----
 
 const SYSTEM_MODES: &[(i64, &str)] = &[(0, "off"), (1, "auto"), (4, "heat")];
 const SYSTEM_MODE_NAMES: &[&str] = &["off", "auto", "heat"];
 
-/// 3: harici sensör yeniden bağlandı, yine harici sayılır
+/// 3: the external sensor reconnected, still counts as external
 const SENSOR_SELECT: &[(i64, &str)] = &[
     (0, "local_temperature"),
     (1, "remote_temperature"),
@@ -83,7 +87,9 @@ const TEMPORARY_MODE_NAMES: &[&str] = &["boost", "timer"];
 
 pub static TRVZB: Definition = Definition {
     fingerprint: &[Fingerprint::Model("TRVZB")],
-    name: Some("Radyatör vanası"),
+    vendor: "SONOFF",
+    description: "Zigbee thermostatic radiator valve",
+    name: Some("Radiator valve"),
     card: Card::Thermostat,
     features: &[
         thermostat::LOCAL_TEMPERATURE,
@@ -94,82 +100,124 @@ pub static TRVZB: Definition = Definition {
         thermostat::calibration(-12.7, 12.7, 0.2),
         Feature::new(
             "child_lock",
-            "Çocuk kilidi",
+            "Child lock",
             Kind::Binary,
             Place::Config,
             fc11(0x0000, types::BOOL, ON_OFF_BOOL, Write::Attribute),
-        ),
+        )
+        .describe("Enables/disables physical input on the device"),
         Feature::new(
             "open_window",
-            "Açık pencere algılama",
+            "Open window",
             Kind::Binary,
             Place::Config,
             fc11(0x6000, types::BOOL, ON_OFF_BOOL, Write::Attribute),
-        ),
+        )
+        .describe("Automatically turns off the radiator when local temperature drops by more than 1.5°C in 4.5 minutes."),
         Feature::new(
             "frost_protection_temperature",
-            "Donma koruması sıcaklığı",
+            "Frost protection temperature",
             numeric("°C", Some(4.0), Some(35.0), Some(0.5)),
             Place::Config,
             fc11(0x6002, types::INT16, hundredths(), Write::Attribute),
+        )
+        .describe(
+            "Minimum temperature at which to automatically turn on the radiator, if system mode is off, to prevent pipes freezing.",
         ),
         Feature::new(
             "valve_opening_degree",
-            "Vana açılma oranı",
+            "Valve opening degree",
             numeric("%", Some(0.0), Some(100.0), Some(1.0)),
             Place::Config,
             fc11(0x600B, types::UINT8, raw_number(), Write::Attribute),
+        )
+        .describe(
+            "Valve open position (percentage) control. If the opening degree is set to 100%, the valve is fully open \
+             when it is opened. If the opening degree is set to 0%, the valve is fully closed when it is opened, and the \
+             default value is 100%. Note: only version v1.1.4 or higher is supported.",
         ),
         Feature::new(
             "valve_closing_degree",
-            "Vana kapanma oranı",
+            "Valve closing degree",
             numeric("%", Some(0.0), Some(100.0), Some(1.0)),
             Place::Config,
             fc11(0x600C, types::UINT8, raw_number(), Write::Attribute),
+        )
+        .describe(
+            "Valve closed position (percentage) control. If the closing degree is set to 100%, the valve is fully \
+             closed when it is closed. If the closing degree is set to 0%, the valve is fully opened when it is closed, \
+             and the default value is 100%. Note: Only version v1.1.4 or higher is supported.",
         ),
         Feature::new(
             "temperature_accuracy",
-            "Sıcaklık hassasiyeti",
+            "Temperature accuracy",
             numeric("°C", Some(-1.0), Some(-0.2), Some(0.2)),
             Place::Config,
             fc11(0x6011, types::INT16, hundredths(), Write::Attribute),
+        )
+        .describe(
+            "Temperature control accuracy. The range is -0.2 ~ -1°C, with an interval of 0.2, and the default is -1. \
+             If the temperature control accuracy is selected as -1°C (default value) and the target temperature is 26 \
+             degrees, then TRVZB will close the valve when the room temperature reaches 26 degrees and open the valve \
+             at 25 degrees. If -0.4°C is chosen as the temperature control accuracy, then the valve will close when the \
+             room temperature reaches 26 degrees and open at 25.6 degrees. Note: Only version v1.3.0 or higher is \
+             supported.",
         ),
         Feature::new(
             "smart_temperature_control",
-            "Akıllı sıcaklık kontrolü (PID)",
+            "Smart temperature control",
             Kind::Binary,
             Place::Config,
             fc11(0x6017, types::BITMAP8, Conv::Bool { on: 0x02, off: 0x00 }, Write::Attribute),
+        )
+        .describe(
+            "Enable adaptive valve control using a PID algorithm. When enabled, \"Valve Opening Percentage\" and \
+             \"Temperature Accuracy\" are unavailable.",
         ),
         Feature::new(
             "temperature_sensor_select",
-            "Sıcaklık kaynağı",
+            "Temperature sensor",
             Kind::Enum {
                 values: SENSOR_SELECT_NAMES,
             },
             Place::Config,
             fc11(0x600E, types::UINT8, Conv::Enum(SENSOR_SELECT), Write::Attribute),
+        )
+        .describe(
+            "Select the temperature source used for control. local_temperature: Uses the built-in sensor. \
+             remote_temperature: Uses the external temperature sensor. remote_source_offline: The external sensor is \
+             offline, so the device automatically uses the built-in sensor. When the external sensor reconnects, the \
+             device reports 0x03 and switches back to the external temperature sensor.",
         ),
         Feature::new(
             "external_temperature_input",
-            "Harici sıcaklık",
+            "External temperature",
             numeric("°C", Some(0.0), Some(99.9), Some(0.1)),
             Place::Config,
             fc11(0x600D, types::INT16, hundredths(), Write::Attribute),
+        )
+        .describe(
+            "The value of an external temperature sensor. Note: synchronisation of this value with the external \
+             temperature sensor needs to happen outside of the hub.",
         ),
         Feature::new(
             "temporary_mode_select",
-            "Geçici mod",
+            "Temporary mode",
             Kind::Enum {
                 values: TEMPORARY_MODE_NAMES,
             },
             Place::Config,
             fc11(0x6014, types::UINT8, Conv::Enum(TEMPORARY_MODES), Write::Attribute),
+        )
+        .describe(
+            "Boost mode: Activates maximum TRV temperature for a user-defined duration, enabling rapid heating. Timer \
+             Mode: Allows customization of temperature and duration for precise heating control. After the set \
+             duration, the system will return to its previous normal mode and temperature.",
         ),
         Feature::new(
             "temporary_mode_duration",
-            "Geçici mod süresi",
-            numeric("dk", Some(0.0), Some(1440.0), Some(1.0)),
+            "Temporary mode duration",
+            numeric("min", Some(0.0), Some(1440.0), Some(1.0)),
             Place::Config,
             fc11(
                 0x6015,
@@ -180,13 +228,17 @@ pub static TRVZB: Definition = Definition {
                 },
                 Write::Attribute,
             ),
+        )
+        .describe(
+            "Boost Mode: Sets maximum TRV temperature for up to 180 minutes. Timer Mode: Customizes temperature and \
+             duration, up to 24 hours.",
         ),
         Feature::new(
             "timer_mode_target_temp",
-            "Zamanlayıcı hedef sıcaklığı",
+            "Timer mode target temperature",
             numeric("°C", Some(4.0), Some(35.0), Some(0.5)),
             Place::Config,
-            // 0 "ayarlanmamış" demek
+            // 0 means "not set"
             fc11(
                 0x6016,
                 types::INT16,
@@ -196,42 +248,48 @@ pub static TRVZB: Definition = Definition {
                 },
                 Write::Attribute,
             ),
-        ),
+        )
+        .describe("In timer mode, the temperature can be set to 4-35 ℃."),
         Feature::new(
             "idle_steps",
-            "Boşta adım sayısı",
+            "Idle steps",
             numeric("", None, None, None),
             Place::Diagnostic,
             fc11(0x6003, types::UINT16, raw_number(), Write::No),
-        ),
+        )
+        .describe("Number of steps used for calibration (no-load steps)"),
         Feature::new(
             "closing_steps",
-            "Kapanma adım sayısı",
+            "Closing steps",
             numeric("", None, None, None),
             Place::Diagnostic,
             fc11(0x6004, types::UINT16, raw_number(), Write::No),
-        ),
+        )
+        .describe("Number of steps it takes to close the valve"),
         Feature::new(
             "valve_opening_limit_voltage",
-            "Açılma sınır voltajı",
+            "Valve opening limit voltage",
             numeric("mV", None, None, None),
             Place::Diagnostic,
             fc11(0x6005, types::UINT16, raw_number(), Write::No),
-        ),
+        )
+        .describe("Valve opening limit voltage"),
         Feature::new(
             "valve_closing_limit_voltage",
-            "Kapanma sınır voltajı",
+            "Valve closing limit voltage",
             numeric("mV", None, None, None),
             Place::Diagnostic,
             fc11(0x6006, types::UINT16, raw_number(), Write::No),
-        ),
+        )
+        .describe("Valve closing limit voltage"),
         Feature::new(
             "valve_motor_running_voltage",
-            "Motor çalışma voltajı",
+            "Valve motor running voltage",
             numeric("mV", None, None, None),
             Place::Diagnostic,
             fc11(0x6007, types::UINT16, raw_number(), Write::No),
-        ),
+        )
+        .describe("Valve motor running voltage"),
     ],
     binds: &[cluster::POLL_CONTROL],
     time_base: TimeBase::Unix1970,

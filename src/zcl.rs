@@ -1,5 +1,5 @@
-//! ZCL (Zigbee Cluster Library) çerçeveleri: başlık, genel komutlar ve öznitelik
-//! veri türleri. Yalnızca ışık ve sensörler için gereken kısım.
+//! ZCL (Zigbee Cluster Library) frames: header, global commands and attribute data
+//! types. Only the part needed for lights, sensors and thermostats.
 
 pub const FC_CLUSTER_SPECIFIC: u8 = 0x01;
 pub const FC_MANUFACTURER_SPECIFIC: u8 = 0x04;
@@ -48,7 +48,7 @@ pub mod types {
     pub const EUI64: u8 = 0xF0;
 }
 
-/// Tamsayıyı öznitelik türünde kodlar; tür sayısal değilse ya da değer sığmıyorsa `None`
+/// Encodes an integer as the attribute type; `None` if the type is not numeric or the value does not fit
 pub fn encode_int(ty: u8, raw: i64) -> Option<Vec<u8>> {
     let signed = matches!(ty, 0x28..=0x2F);
     let numeric = matches!(ty, 0x08..=0x10 | 0x18..=0x2F | 0x30 | 0x31 | 0xE0..=0xE2);
@@ -148,7 +148,7 @@ impl Value {
     }
 }
 
-/// Sabit uzunluklu türlerin bayt sayısı
+/// Byte size of the fixed-length types
 fn fixed_size(ty: u8) -> Option<usize> {
     Some(match ty {
         0x00 => 0,
@@ -178,13 +178,13 @@ fn le_uint(bytes: &[u8]) -> u64 {
         .fold(0u64, |acc, &b| (acc << 8) | u64::from(b))
 }
 
-/// Bir öznitelik değerini çözer; değeri ve tükettiği bayt sayısını döndürür
+/// Decodes an attribute value; returns the value and the bytes it consumed
 pub fn parse_value(ty: u8, data: &[u8]) -> Option<(Value, usize)> {
     match ty {
         0x41..=0x44 => {
             let (len, header) = if ty <= 0x42 {
                 let len = *data.first()?;
-                // 0xFF geçersiz (tanımsız) dize demek
+                // 0xFF means an invalid (undefined) string
                 (if len == 0xFF { 0 } else { usize::from(len) }, 1)
             } else {
                 let len = u16::from_le_bytes([*data.first()?, *data.get(1)?]);
@@ -192,7 +192,7 @@ pub fn parse_value(ty: u8, data: &[u8]) -> Option<(Value, usize)> {
             };
             let body = data.get(header..header + len)?;
             let value = if ty == 0x42 || ty == 0x44 {
-                // Bazı cihazlar dizeyi NUL ile doldurur
+                // Some devices pad strings with NUL
                 Value::Str(
                     String::from_utf8_lossy(body)
                         .trim_end_matches('\0')
@@ -231,7 +231,7 @@ pub struct AttributeRecord {
     pub value: Option<Value>,
 }
 
-/// Read Attributes Response: (id, durum, [tür, değer])*
+/// Read Attributes Response: (id, status, [type, value])*
 pub fn parse_read_response(mut payload: &[u8]) -> Vec<AttributeRecord> {
     let mut records = Vec::new();
     while payload.len() >= 3 {
@@ -250,7 +250,7 @@ pub fn parse_read_response(mut payload: &[u8]) -> Vec<AttributeRecord> {
             break;
         };
         let Some((value, used)) = parse_value(ty, rest) else {
-            // Tanımadığımız bir tür: kalan kayıtların sınırı belirsiz
+            // An unknown type: the bounds of the remaining records are unknown
             break;
         };
         records.push(AttributeRecord {
@@ -263,7 +263,7 @@ pub fn parse_read_response(mut payload: &[u8]) -> Vec<AttributeRecord> {
     records
 }
 
-/// Report Attributes: (id, tür, değer)*
+/// Report Attributes: (id, type, value)*
 pub fn parse_report(mut payload: &[u8]) -> Vec<AttributeRecord> {
     let mut records = Vec::new();
     while payload.len() >= 3 {
@@ -299,7 +299,7 @@ pub struct ReportConfig {
     pub ty: u8,
     pub min_interval: u16,
     pub max_interval: u16,
-    /// Yalnızca analog türlerde gönderilir; uzunluğu türün boyutudur
+    /// Only sent for analog types; its length is the type's size
     pub reportable_change: u64,
 }
 
@@ -310,7 +310,7 @@ fn is_analog(ty: u8) -> bool {
 pub fn configure_reporting_payload(configs: &[ReportConfig]) -> Vec<u8> {
     let mut out = Vec::new();
     for config in configs {
-        out.push(0x00); // yön: raporları cihaz gönderir
+        out.push(0x00); // direction: the device sends the reports
         out.extend_from_slice(&config.attribute.to_le_bytes());
         out.push(config.ty);
         out.extend_from_slice(&config.min_interval.to_le_bytes());
@@ -323,12 +323,12 @@ pub fn configure_reporting_payload(configs: &[ReportConfig]) -> Vec<u8> {
     out
 }
 
-/// Default Response yükündeki durum baytı
+/// The status byte of a Default Response payload
 pub fn default_response_status(payload: &[u8]) -> Option<u8> {
     payload.get(1).copied()
 }
 
-/// Write/Configure Reporting yanıtı: tek bir başarı baytı ya da (durum, ...) kayıtları
+/// Write/Configure Reporting response: a single success byte or (status, ...) records
 pub fn all_success(payload: &[u8]) -> bool {
     payload.first() == Some(&STATUS_SUCCESS)
 }
@@ -380,7 +380,7 @@ mod tests {
     fn parses_read_response_with_failures_and_strings() {
         let payload = [
             0x04, 0x00, 0x00, 0x42, 0x05, b'I', b'K', b'E', b'A', 0x00, // ManufacturerName
-            0xFE, 0xFF, 0x86, // desteklenmeyen öznitelik
+            0xFE, 0xFF, 0x86, // unsupported attribute
             0x07, 0x00, 0x00, 0x30, 0x01, // PowerSource enum8
         ];
         let records = parse_read_response(&payload);
@@ -412,7 +412,7 @@ mod tests {
         assert_eq!(
             payload,
             [
-                0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x2C, 0x01, // bool, değişim yok
+                0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x2C, 0x01, // bool, no reportable change
                 0x00, 0x00, 0x00, 0x29, 0x1E, 0x00, 0x10, 0x0E, 0x0A, 0x00,
             ]
         );
