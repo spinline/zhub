@@ -8,6 +8,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use serde_json::Value as Json;
 
 use ziggurat_driver::ziggurat_ieee_802154::types::{Eui64, Key};
 
@@ -54,62 +55,6 @@ pub struct Endpoint {
     pub out_clusters: Vec<u16>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct DeviceState {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub on: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub level: Option<u8>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub color_temp: Option<u16>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub temperature: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub humidity: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub occupancy: Option<bool>,
-    /// IAS Zone alarm1 biti: kapı sensöründe açık, hareket sensöründe hareket
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub alarm: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub battery_low: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub battery: Option<u8>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub voltage: Option<f64>,
-    /// Termostat: "heat" ya da "off"
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub system_mode: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub setpoint: Option<f64>,
-    /// Termostat şu an ısıtıyor mu
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub heating: Option<bool>,
-    /// Termostat: "manual" ya da "program"
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub preset: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub frost: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub child_lock: Option<bool>,
-    /// Termostatın arıza bit alanı; 0 arıza yok
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub fault: Option<u32>,
-    /// Haftalık programın gün düzeni: "5_2", "6_1" ya da "7"
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub working_week: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub schedule: Option<Vec<ScheduleSlot>>,
-}
-
-/// Haftalık programın bir dilimi: bu saatten itibaren hedef sıcaklık
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ScheduleSlot {
-    /// "SS:DD"
-    pub time: String,
-    pub temperature: f64,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Device {
     pub ieee: String,
@@ -127,19 +72,20 @@ pub struct Device {
     pub endpoints: Vec<Endpoint>,
     #[serde(default)]
     pub interviewed: bool,
+    /// Özellik anahtarı → değer (bkz. `devices`)
     #[serde(default)]
-    pub zone_type: Option<u16>,
-    #[serde(default)]
-    pub color_temp_min: Option<u16>,
-    #[serde(default)]
-    pub color_temp_max: Option<u16>,
-    #[serde(default)]
-    pub state: DeviceState,
+    pub state: BTreeMap<String, Json>,
     #[serde(default)]
     pub firmware: Option<String>,
-    /// Modele özel ayarların cihazdan okunan değerleri
-    #[serde(default)]
-    pub settings: BTreeMap<String, f64>,
+    /// Eski sürümlerin ayrı tuttuğu alanlar; yüklemede `state`e taşınır
+    #[serde(default, skip_serializing)]
+    settings: BTreeMap<String, f64>,
+    #[serde(default, skip_serializing)]
+    zone_type: Option<u16>,
+    #[serde(default, skip_serializing)]
+    color_temp_min: Option<u16>,
+    #[serde(default, skip_serializing)]
+    color_temp_max: Option<u16>,
     #[serde(default)]
     pub last_seen: Option<u64>,
     #[serde(default)]
@@ -167,15 +113,33 @@ impl Device {
             rx_on_when_idle: true,
             endpoints: Vec::new(),
             interviewed: false,
+            state: BTreeMap::new(),
+            firmware: None,
             zone_type: None,
             color_temp_min: None,
             color_temp_max: None,
-            state: DeviceState::default(),
-            firmware: None,
             settings: BTreeMap::new(),
             last_seen: None,
             lqi: None,
             rssi: None,
+        }
+    }
+
+    /// Eski sürümün ayrı alanlarını özellik haritasına taşır; anahtarlar aynı adlarla
+    /// özellik olarak tanımlı
+    fn migrate_legacy(&mut self) {
+        for (key, value) in std::mem::take(&mut self.settings) {
+            self.state.entry(key).or_insert_with(|| serde_json::json!(value));
+        }
+        let legacy = [
+            ("zone_type", self.zone_type.take()),
+            ("color_temp_min", self.color_temp_min.take()),
+            ("color_temp_max", self.color_temp_max.take()),
+        ];
+        for (key, value) in legacy {
+            if let Some(value) = value {
+                self.state.entry(key.into()).or_insert_with(|| serde_json::json!(value));
+            }
         }
     }
 
@@ -206,8 +170,14 @@ pub struct Persisted {
 impl Persisted {
     pub fn load(path: &Path) -> Result<Self> {
         match std::fs::read(path) {
-            Ok(bytes) => serde_json::from_slice(&bytes)
-                .with_context(|| format!("{} okunamadı", path.display())),
+            Ok(bytes) => {
+                let mut data: Self = serde_json::from_slice(&bytes)
+                    .with_context(|| format!("{} okunamadı", path.display()))?;
+                for device in data.devices.values_mut() {
+                    device.migrate_legacy();
+                }
+                Ok(data)
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e).with_context(|| format!("{} açılamadı", path.display())),
         }
@@ -317,6 +287,35 @@ mod tests {
     fn key_round_trips() {
         let key = Key(*b"ZigBeeAlliance09");
         assert_eq!(parse_key(&key_to_string(&key)).unwrap(), key);
+    }
+
+    /// Önceki sürümün yazdığı bir kayıt yeni yapıya kayıpsız taşınmalı
+    #[test]
+    fn migrates_previous_state_format() {
+        let old = serde_json::json!({
+            "network": null,
+            "devices": {
+                "38:39:8f:ff:fe:de:0d:70": {
+                    "ieee": "38:39:8f:ff:fe:de:0d:70", "nwk": 27483, "name": "SNZB-02P",
+                    "model": "SNZB-02P", "zone_type": null, "color_temp_min": 153,
+                    "state": {"battery": 100, "temperature": 21.3},
+                    "settings": {"temperature_calibration": 1.0}
+                }
+            }
+        });
+        let dir = std::env::temp_dir().join(format!("zhub-migrate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        std::fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+
+        let data = Persisted::load(&path).unwrap();
+        let device = &data.devices["38:39:8f:ff:fe:de:0d:70"];
+        assert_eq!(device.state["temperature"], serde_json::json!(21.3));
+        assert_eq!(device.state["temperature_calibration"], serde_json::json!(1.0));
+        assert_eq!(device.state["color_temp_min"], serde_json::json!(153));
+        let saved = serde_json::to_value(device).unwrap();
+        assert!(saved.get("settings").is_none() && saved.get("zone_type").is_none());
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]

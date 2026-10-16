@@ -21,6 +21,8 @@ pub mod cluster {
     pub const BASIC: u16 = 0x0000;
     pub const POWER_CONFIG: u16 = 0x0001;
     pub const POLL_CONTROL: u16 = 0x0020;
+    pub const TIME: u16 = 0x000A;
+    pub const THERMOSTAT: u16 = 0x0201;
     pub const ON_OFF: u16 = 0x0006;
     pub const LEVEL: u16 = 0x0008;
     pub const COLOR: u16 = 0x0300;
@@ -33,10 +35,35 @@ pub mod cluster {
 pub mod types {
     pub const BOOL: u8 = 0x10;
     pub const BITMAP8: u8 = 0x18;
+    pub const BITMAP16: u8 = 0x19;
     pub const UINT8: u8 = 0x20;
     pub const UINT16: u8 = 0x21;
+    pub const UINT32: u8 = 0x23;
+    pub const INT8: u8 = 0x28;
     pub const INT16: u8 = 0x29;
+    pub const INT32: u8 = 0x2B;
+    pub const ENUM8: u8 = 0x30;
+    pub const ENUM16: u8 = 0x31;
+    pub const UTC_TIME: u8 = 0xE2;
     pub const EUI64: u8 = 0xF0;
+}
+
+/// Tamsayıyı öznitelik türünde kodlar; tür sayısal değilse ya da değer sığmıyorsa `None`
+pub fn encode_int(ty: u8, raw: i64) -> Option<Vec<u8>> {
+    let signed = matches!(ty, 0x28..=0x2F);
+    let numeric = matches!(ty, 0x08..=0x10 | 0x18..=0x2F | 0x30 | 0x31 | 0xE0..=0xE2);
+    if !numeric {
+        return None;
+    }
+    let size = fixed_size(ty)?;
+    let bits = 8 * size as u32;
+    let fits = if signed {
+        let limit = 1i64 << (bits - 1);
+        (-limit..limit).contains(&raw)
+    } else {
+        raw >= 0 && (bits >= 64 || raw < (1i64 << bits))
+    };
+    fits.then(|| raw.to_le_bytes()[..size].to_vec())
 }
 
 pub const STATUS_SUCCESS: u8 = 0x00;
@@ -104,15 +131,6 @@ pub enum Value {
 }
 
 impl Value {
-    pub fn as_u64(&self) -> Option<u64> {
-        match *self {
-            Self::Bool(b) => Some(u64::from(b)),
-            Self::Uint(v) => Some(v),
-            Self::Int(v) => u64::try_from(v).ok(),
-            _ => None,
-        }
-    }
-
     pub fn as_i64(&self) -> Option<i64> {
         match *self {
             Self::Bool(b) => Some(i64::from(b)),
@@ -318,6 +336,18 @@ pub fn all_success(payload: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encodes_integers_by_attribute_type() {
+        assert_eq!(encode_int(types::INT16, -130), Some(vec![0x7E, 0xFF]));
+        assert_eq!(encode_int(types::INT8, -127), Some(vec![0x81]));
+        assert_eq!(encode_int(types::INT8, 128), None);
+        assert_eq!(encode_int(types::UINT8, 255), Some(vec![0xFF]));
+        assert_eq!(encode_int(types::UINT8, -1), None);
+        assert_eq!(encode_int(types::UINT32, 5400), Some(vec![0x18, 0x15, 0x00, 0x00]));
+        assert_eq!(encode_int(types::BOOL, 1), Some(vec![0x01]));
+        assert_eq!(encode_int(types::EUI64, 1), None);
+    }
 
     #[test]
     fn parses_header_with_manufacturer_code() {

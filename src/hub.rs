@@ -9,7 +9,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
+use serde_json::{Value as Json, json};
 use tokio::sync::{Notify, broadcast, oneshot};
 use tracing::{debug, info, warn};
 
@@ -24,13 +25,12 @@ use ziggurat_phy::{ExclusiveRadio, RadioPhy, TxFrame};
 use ziggurat_phy_spinel::SpinelPhy;
 use ziggurat_protocol as proto;
 
+use crate::devices::{self, Card, Feature, Kind, Source, TimeBase, Write};
 use crate::store::{
-    ScheduleSlot,
     self, Child, Device, LinkKey, NetworkData, Persisted, eui64_to_string, key_to_string,
     parse_eui64, parse_key,
 };
 use crate::zcl::{self, ReportConfig, Value, cluster, types};
-use crate::profiles::{self, Setting};
 use crate::{tuya, zdo};
 
 /// Koordinatörün kendi uç noktası; bağlamalar ve raporlar buraya gelir
@@ -54,6 +54,9 @@ const MAX_PERMIT_SECONDS: u8 = 254;
 const FAST_POLL_QUARTER_SECONDS: u16 = 80;
 /// Uyuyan cihaz bir şey gönderdikten sonra bu kadar saniye uyanık sayılır
 const AWAKE_WINDOW_SECONDS: u64 = 2;
+/// Tek okuma isteğindeki öznitelik sayısı: yanıt tek çerçeveye sığsın
+const READ_CHUNK: usize = 4;
+const SECONDS_1970_TO_2000: u64 = 946_684_800;
 
 pub struct Options {
     pub device: String,
@@ -77,54 +80,15 @@ pub enum Event {
 pub struct DeviceView {
     #[serde(flatten)]
     pub device: Device,
-    pub capabilities: Vec<&'static str>,
+    pub card: Card,
+    /// Arayüz şeması: cihazın özellikleri
+    pub features: Vec<Feature>,
     pub interviewing: bool,
     /// Uyuyan cihaz uyanınca tanınacak
     pub waiting_for_wake: bool,
-    /// Termostat hedef sıcaklığı için [en az, en çok, adım]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub setpoint_range: Option<[f64; 3]>,
-    /// Modele özel ayarların tanımı
+    /// Cihaz uyanınca yazılacak özellikler
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub settings_schema: Vec<Setting>,
-    /// Cihaz uyanınca yazılacak ayarlar
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub pending_settings: Vec<&'static str>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "action", content = "value", rename_all = "snake_case")]
-pub enum Action {
-    On,
-    Off,
-    Toggle,
-    Level(u8),
-    ColorTemp(u16),
-    Setpoint(f64),
-    /// "heat" ya da "off"
-    SystemMode(String),
-    /// "manual" ya da "program"
-    Preset(String),
-    Frost(bool),
-    ChildLock(bool),
-    /// "5_2", "6_1" ya da "7"
-    WorkingWeek(String),
-    Schedule(Vec<ScheduleSlot>),
-}
-
-impl Action {
-    fn is_thermostat(&self) -> bool {
-        matches!(
-            self,
-            Self::Setpoint(_)
-                | Self::SystemMode(_)
-                | Self::Preset(_)
-                | Self::Frost(_)
-                | Self::ChildLock(_)
-                | Self::WorkingWeek(_)
-                | Self::Schedule(_)
-        )
-    }
+    pub pending: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -146,12 +110,12 @@ pub struct Hub {
     events: broadcast::Sender<Event>,
     permit_until: Mutex<Option<Instant>>,
     interviews: Mutex<HashSet<String>>,
-    /// Uyuyan cihazlara, uyandıklarında yazılacak ayarlar: ieee → (anahtar → değer)
-    pending_settings: Mutex<HashMap<String, BTreeMap<&'static str, f64>>>,
+    /// Uyuyan cihazlara, uyandıklarında yazılacak değerler: ieee → (özellik → değer)
+    pending_writes: Mutex<HashMap<String, BTreeMap<String, Json>>>,
     /// Uyanınca yeniden tanınacak uyuyan cihazlar
     wake_interviews: Mutex<HashSet<String>>,
-    /// Şu an ayar yazılan cihazlar: aynı cihaza aynı anda tek yazma gider
-    writing_settings: Mutex<HashSet<String>>,
+    /// Şu an yazma yapılan cihazlar: aynı cihaza aynı anda tek yazma gider
+    writing: Mutex<HashSet<String>>,
 }
 
 fn now_unix() -> u64 {
@@ -179,62 +143,13 @@ fn network_config(network: &NetworkData) -> Result<NetworkConfig> {
     })
 }
 
-/// Cihazın sunduğu kümelerden arayüzün kullanacağı yetenek listesi
-pub fn capabilities(device: &Device) -> Vec<&'static str> {
-    let mut caps = Vec::new();
-    if device.has_cluster(cluster::ON_OFF) {
-        caps.push("on_off");
-    }
-    if device.has_cluster(cluster::LEVEL) {
-        caps.push("level");
-    }
-    if device.has_cluster(cluster::COLOR) {
-        caps.push("color_temp");
-    }
-    if device.has_cluster(cluster::TEMPERATURE) {
-        caps.push("temperature");
-    }
-    if device.has_cluster(cluster::HUMIDITY) {
-        caps.push("humidity");
-    }
-    if device.has_cluster(cluster::OCCUPANCY) {
-        caps.push("occupancy");
-    }
-    if device.has_cluster(cluster::IAS_ZONE) {
-        caps.push(match device.zone_type {
-            Some(0x0015) => "contact",
-            Some(0x000D) => "motion",
-            Some(0x002A) => "water_leak",
-            Some(0x0028) => "smoke",
-            _ => "alarm",
-        });
-    }
-    if device.has_cluster(cluster::POWER_CONFIG) && !device.router {
-        caps.push("battery");
-    }
-    if device.has_cluster(tuya::CLUSTER)
-        && let Some(profile) = tuya::thermostat_profile(device.manufacturer.as_deref())
-    {
-        caps.push("thermostat");
-        if profile.battery.is_some() {
-            caps.push("battery");
-        }
-    }
-    caps
-}
-
 /// Yazılan değer hâlâ kuyruktaki değerse kuyruktan düşer; yazma sürerken yeni bir
 /// değer girildiyse o kalır ve sonraki uyanışta yazılır
-fn settle_pending(
-    pending: &mut HashMap<String, BTreeMap<&'static str, f64>>,
-    ieee: &str,
-    key: &'static str,
-    written: f64,
-) {
+fn settle_pending(pending: &mut HashMap<String, BTreeMap<String, Json>>, ieee: &str, key: &str, written: &Json) {
     let Some(entries) = pending.get_mut(ieee) else {
         return;
     };
-    if entries.get(key) == Some(&written) {
+    if entries.get(key) == Some(written) {
         entries.remove(key);
     }
     if entries.is_empty() {
@@ -242,15 +157,29 @@ fn settle_pending(
     }
 }
 
-/// Cihazın modele özel ayarları: ZCL öznitelikleri ya da Tuya DP'leri
-fn device_settings(device: &Device) -> &'static [Setting] {
-    if let Some(profile) = profiles::profile(device.model.as_deref()) {
-        return profile.settings;
+/// Aynı adlı iki cihaz olmasın: gerekirse IEEE'nin son dört hanesi eklenir
+fn unique_name(base: String, ieee: &str, taken: &[String]) -> String {
+    if !taken.contains(&base) {
+        return base;
     }
-    tuya::thermostat_profile(device.manufacturer.as_deref()).map_or(&[], |p| p.settings)
+    let suffix = ieee.replace(':', "");
+    format!("{base} {}", &suffix[suffix.len().saturating_sub(4)..])
 }
 
-/// Adı hâlâ "Cihaz xxxx" olan tanınmış cihazlara modelden ad verir
+/// Kullanıcı adı değiştirmemiş mi: "Cihaz xxxx" ya da önceki sürümün verdiği model kodu
+fn untouched_name(device: &Device) -> bool {
+    device.name == Device::new(device.ieee.clone(), device.nwk).name
+        || device.model.as_deref() == Some(device.name.as_str())
+}
+
+/// Tanımda karşılığı olmayan eski durum anahtarlarını atar (ör. tanım değişince)
+fn prune_state(device: &mut Device) {
+    let keys: Vec<&str> = devices::features(device).iter().map(|f| f.key).collect();
+    device.state.retain(|key, _| keys.contains(&key.as_str()));
+}
+
+/// Adı hâlâ otomatik olan tanınmış cihazlara tanımdan ya da modelden ad verir; eski
+/// durum anahtarlarını temizler
 fn apply_default_names(data: &mut Persisted) {
     let ieees: Vec<String> = data.devices.keys().cloned().collect();
     for ieee in ieees {
@@ -263,120 +192,113 @@ fn apply_default_names(data: &mut Persisted) {
         let Some(device) = data.devices.get_mut(&ieee) else {
             continue;
         };
-        let untouched = device.name == Device::new(device.ieee.clone(), device.nwk).name;
-        if device.interviewed
-            && untouched
-            && let Some(name) = default_name(device, &taken)
+        if !device.interviewed {
+            continue;
+        }
+        prune_state(device);
+        if untouched_name(device)
+            && let Some(base) = devices::default_name(device)
         {
-            device.name = name;
+            device.name = unique_name(base, &device.ieee, &taken);
         }
     }
 }
 
-/// Kullanıcı adı vermediyse modelden anlamlı bir ad; Tuya modelleri (TS0601 gibi)
-/// hiçbir şey söylemediği için profil adı tercih edilir
-fn default_name(device: &Device, taken: &[String]) -> Option<String> {
-    let base = match tuya::thermostat_profile(device.manufacturer.as_deref()) {
-        Some(profile) => profile.name.to_owned(),
-        None => device.model.clone()?,
-    };
-    if !taken.contains(&base) {
-        return Some(base);
+/// ZCL öznitelik kayıtlarını cihazın durumuna, tanımındaki özellikler üzerinden yansıtır
+fn apply_zcl_records(device: &mut Device, cluster_id: u16, records: &[zcl::AttributeRecord]) {
+    if cluster_id == cluster::BASIC {
+        for record in records {
+            let text = record.value.as_ref().and_then(Value::as_str).filter(|s| !s.is_empty());
+            match record.id {
+                0x0004 => device.manufacturer = text.map(str::to_owned),
+                0x0005 => device.model = text.map(str::to_owned),
+                0x4000 => device.firmware = text.map(str::to_owned),
+                _ => {}
+            }
+        }
     }
-    let suffix = device.ieee.replace(':', "");
-    Some(format!("{base} {}", &suffix[suffix.len().saturating_sub(4)..]))
-}
-
-/// Bir özniteliği cihaz durumuna yansıtır
-fn apply_attribute(device: &mut Device, cluster_id: u16, attribute: u16, value: &Value) {
-    let state = &mut device.state;
-    match (cluster_id, attribute) {
-        (cluster::BASIC, 0x0004) => device.manufacturer = value.as_str().map(str::to_owned),
-        (cluster::BASIC, 0x0005) => device.model = value.as_str().map(str::to_owned),
-        (cluster::BASIC, 0x4000) => {
-            device.firmware = value.as_str().filter(|s| !s.is_empty()).map(str::to_owned);
+    // Model az önce öğrenildiyse tanım da değişmiş olabilir: özellikler şimdi alınır
+    for feature in devices::features(device) {
+        let Source::Attr { cluster, attr, conv, .. } = feature.source else {
+            continue;
+        };
+        if cluster != cluster_id {
+            continue;
         }
-        (cluster::ON_OFF, 0x0000) => state.on = value.as_u64().map(|v| v != 0),
-        (cluster::LEVEL, 0x0000) => state.level = value.as_u64().and_then(|v| u8::try_from(v).ok()),
-        (cluster::COLOR, 0x0007) => {
-            state.color_temp = value.as_u64().and_then(|v| u16::try_from(v).ok());
-        }
-        (cluster::COLOR, 0x400B) => {
-            device.color_temp_min = value.as_u64().and_then(|v| u16::try_from(v).ok());
-        }
-        (cluster::COLOR, 0x400C) => {
-            device.color_temp_max = value.as_u64().and_then(|v| u16::try_from(v).ok());
-        }
-        (cluster::TEMPERATURE, 0x0000) => {
-            // 0x8000 "ölçüm yok" demek
-            if let Some(v) = value.as_i64().filter(|&v| v != -0x8000) {
-                state.temperature = Some(v as f64 / 100.0);
+        for record in records.iter().filter(|r| r.id == attr) {
+            let decoded = match &record.value {
+                Some(Value::Str(text)) => conv.decode_text(text),
+                Some(value) => value.as_i64().and_then(|raw| conv.decode_int(raw)),
+                None => None,
+            };
+            if let Some(decoded) = decoded {
+                device.state.insert(feature.key.to_owned(), decoded);
             }
         }
-        (cluster::HUMIDITY, 0x0000) => {
-            if let Some(v) = value.as_u64().filter(|&v| v != 0xFFFF) {
-                state.humidity = Some(v as f64 / 100.0);
-            }
-        }
-        (cluster::OCCUPANCY, 0x0000) => state.occupancy = value.as_u64().map(|v| v & 0x01 != 0),
-        (cluster::POWER_CONFIG, 0x0020) => {
-            if let Some(v) = value.as_u64().filter(|&v| v != 0xFF) {
-                state.voltage = Some(v as f64 / 10.0);
-            }
-        }
-        (cluster::POWER_CONFIG, 0x0021) => {
-            // Yarım yüzde birimiyle; 0xFF bilinmiyor
-            if let Some(v) = value.as_u64().filter(|&v| v != 0xFF) {
-                state.battery = Some((v / 2).min(100) as u8);
-            }
-        }
-        (cluster::IAS_ZONE, 0x0001) => {
-            device.zone_type = value.as_u64().and_then(|v| u16::try_from(v).ok());
-        }
-        (cluster::IAS_ZONE, 0x0002) => {
-            if let Some(v) = value.as_u64() {
-                apply_zone_status(state, v as u16);
-            }
-        }
-        _ => {}
     }
 }
 
-fn apply_zone_status(state: &mut store::DeviceState, status: u16) {
-    state.alarm = Some(status & 0x0001 != 0);
-    state.battery_low = Some(status & 0x0008 != 0);
+/// Tuya DP'lerini cihazın durumuna yansıtır; tanımda karşılığı olmayan DP'leri döndürür
+fn apply_tuya_datapoints<'a>(device: &mut Device, datapoints: &'a [tuya::Datapoint]) -> Vec<&'a tuya::Datapoint> {
+    let features = devices::features(device);
+    let mut unknown = Vec::new();
+    for dp in datapoints {
+        let matching: Vec<_> = features.iter().filter(|f| f.matches_dp(dp.id)).collect();
+        if matching.is_empty() {
+            unknown.push(dp);
+        }
+        for feature in matching {
+            let value = match feature.source {
+                Source::Tuya { conv, .. } => match dp.as_int() {
+                    Some(raw) => conv.decode_int(raw),
+                    None => conv.decode_text(&String::from_utf8_lossy(&dp.data)),
+                },
+                Source::TuyaSchedule { divisor, .. } => Some(tuya::decode_schedule(&dp.data, divisor)),
+                Source::Attr { .. } => None,
+            };
+            if let Some(value) = value {
+                device.state.insert(feature.key.to_owned(), value);
+            }
+        }
+    }
+    unknown
 }
 
-/// Her kümenin bağlanıp raporlanacak özniteliği
-fn report_config(cluster_id: u16) -> Option<ReportConfig> {
-    let (attribute, ty, min_interval, max_interval, reportable_change) = match cluster_id {
-        cluster::ON_OFF => (0x0000, types::BOOL, 0, 300, 0),
-        cluster::LEVEL => (0x0000, types::UINT8, 1, 300, 1),
-        cluster::COLOR => (0x0007, types::UINT16, 1, 300, 1),
-        cluster::TEMPERATURE => (0x0000, types::INT16, 30, 1800, 20),
-        cluster::HUMIDITY => (0x0000, types::UINT16, 30, 1800, 100),
-        cluster::OCCUPANCY => (0x0000, types::BITMAP8, 0, 1800, 0),
-        cluster::POWER_CONFIG => (0x0021, types::UINT8, 3600, 21600, 2),
-        _ => return None,
-    };
-    Some(ReportConfig {
-        attribute,
-        ty,
-        min_interval,
-        max_interval,
-        reportable_change,
+/// Özellik değerini Tuya DP'sine çevirir
+fn tuya_datapoint(id: u8, dp_type: u8, raw: i64) -> Result<tuya::Datapoint> {
+    Ok(match dp_type {
+        tuya::dp_type::BOOL => tuya::Datapoint::bool(id, raw != 0),
+        tuya::dp_type::ENUM => tuya::Datapoint::enumeration(id, u8::try_from(raw).context("seçim değeri sığmıyor")?),
+        tuya::dp_type::VALUE => tuya::Datapoint::value(id, i32::try_from(raw).context("değer sığmıyor")?),
+        other => bail!("Tuya DP türü {other} yazılamaz"),
     })
 }
 
-/// Raporlamadan sonra güncel değerleri okumak için öznitelikler
-fn initial_reads(cluster_id: u16) -> &'static [u16] {
-    match cluster_id {
-        cluster::COLOR => &[0x0007, 0x400B, 0x400C],
-        cluster::POWER_CONFIG => &[0x0020, 0x0021],
-        cluster::ON_OFF | cluster::LEVEL | cluster::TEMPERATURE | cluster::HUMIDITY
-        | cluster::OCCUPANCY => &[0x0000],
-        _ => &[],
+/// Merkezin Time kümesi: cihazın okuduğu özniteliklere Read Attributes Response yükü
+fn time_read_response(ids: &[u16], unix_now: u64, utc_offset: i64, base: TimeBase) -> Vec<u8> {
+    let time = match base {
+        TimeBase::Zigbee2000 => unix_now.saturating_sub(SECONDS_1970_TO_2000),
+        TimeBase::Unix1970 => unix_now,
+    } as i64;
+    let mut out = Vec::new();
+    for &id in ids {
+        out.extend_from_slice(&id.to_le_bytes());
+        let (ty, value): (u8, Vec<u8>) = match id {
+            0x0000 => (types::UTC_TIME, (time as u32).to_le_bytes().to_vec()),
+            // Bit 0: bu cihaz zaman kaynağı (master)
+            0x0001 => (types::BITMAP8, vec![0x01]),
+            0x0002 => (types::INT32, (utc_offset as i32).to_le_bytes().to_vec()),
+            0x0007 => (types::UINT32, ((time + utc_offset) as u32).to_le_bytes().to_vec()),
+            _ => {
+                out.push(0x86); // UNSUPPORTED_ATTRIBUTE
+                continue;
+            }
+        };
+        out.push(zcl::STATUS_SUCCESS);
+        out.push(ty);
+        out.extend(value);
     }
+    out
 }
 
 async fn retry<T, F, Fut>(what: &str, mut attempt: F) -> Result<T>
@@ -480,9 +402,9 @@ impl Hub {
             events,
             permit_until: Mutex::new(None),
             interviews: Mutex::new(HashSet::new()),
-            pending_settings: Mutex::new(HashMap::new()),
+            pending_writes: Mutex::new(HashMap::new()),
             wake_interviews: Mutex::new(HashSet::new()),
-            writing_settings: Mutex::new(HashSet::new()),
+            writing: Mutex::new(HashSet::new()),
         });
 
         tokio::spawn(hub.clone().notification_loop());
@@ -517,21 +439,16 @@ impl Hub {
 
     fn view(&self, device: &Device) -> DeviceView {
         DeviceView {
-            capabilities: capabilities(device),
+            card: devices::card(device),
+            features: devices::features(device).into_iter().copied().collect(),
             interviewing: self.interviews.lock().unwrap().contains(&device.ieee),
             waiting_for_wake: self.wake_interviews.lock().unwrap().contains(&device.ieee),
-            setpoint_range: tuya::thermostat_profile(device.manufacturer.as_deref())
-                .map(|p| {
-                    let (min, max) = p.setpoint_range(device);
-                    [min, max, p.setpoint_step]
-                }),
-            settings_schema: device_settings(device).to_vec(),
-            pending_settings: self
-                .pending_settings
+            pending: self
+                .pending_writes
                 .lock()
                 .unwrap()
                 .get(&device.ieee)
-                .map(|m| m.keys().copied().collect())
+                .map(|m| m.keys().cloned().collect())
                 .unwrap_or_default(),
             device: device.clone(),
         }
@@ -605,18 +522,19 @@ impl Hub {
                 profile_id,
                 cluster_id,
                 src_ep,
+                dst_ep,
                 lqi,
                 rssi,
                 data,
                 ..
             } => {
                 self.touch(source.0, lqi, rssi);
-                self.flush_pending_settings(source.0);
+                self.flush_pending_writes(source.0);
                 self.start_wake_interview(source.0);
                 if profile_id == ZDO_PROFILE {
                     self.handle_zdo(source.0, destination.0, cluster_id, &data);
                 } else {
-                    self.handle_zcl(source.0, src_ep, cluster_id, &data);
+                    self.handle_zcl(source.0, src_ep, dst_ep, cluster_id, &data);
                 }
             }
             ZigbeeNotification::FrameCounterUpdate { frame_counter } => {
@@ -780,7 +698,7 @@ impl Hub {
         }
     }
 
-    fn handle_zcl(self: &Arc<Self>, source: u16, src_ep: u8, cluster_id: u16, data: &[u8]) {
+    fn handle_zcl(self: &Arc<Self>, source: u16, src_ep: u8, dst_ep: u8, cluster_id: u16, data: &[u8]) {
         let Some((header, payload)) = zcl::Header::parse(data) else {
             return;
         };
@@ -788,6 +706,13 @@ impl Hub {
 
         if !header.cluster_specific() {
             match header.command {
+                // Cihaz merkezden okuyor: yalnızca Time kümesini sunuyoruz
+                zcl::cmd::READ_ATTRIBUTES if !header.server_to_client() => {
+                    if cluster_id == cluster::TIME {
+                        self.answer_time_read(source, src_ep, dst_ep, &header, payload, ieee.as_deref());
+                    }
+                    return;
+                }
                 zcl::cmd::REPORT_ATTRIBUTES => {
                     if let Some(ieee) = &ieee {
                         self.apply_records(ieee, cluster_id, &zcl::parse_report(payload));
@@ -813,11 +738,16 @@ impl Hub {
 
         if cluster_id == cluster::IAS_ZONE && header.server_to_client() {
             match header.command {
-                // Zone Status Change Notification
+                // Zone Status Change Notification: durum özniteliği raporu gibi işlenir
                 0x00 => {
                     if let (Some(ieee), Some(bytes)) = (&ieee, payload.get(..2)) {
                         let status = u16::from_le_bytes([bytes[0], bytes[1]]);
-                        self.update_device(ieee, |d| apply_zone_status(&mut d.state, status));
+                        let record = zcl::AttributeRecord {
+                            id: 0x0002,
+                            status: zcl::STATUS_SUCCESS,
+                            value: Some(Value::Uint(u64::from(status))),
+                        };
+                        self.apply_records(ieee, cluster::IAS_ZONE, &[record]);
                     }
                     self.default_response(source, src_ep, cluster_id, &header);
                 }
@@ -825,7 +755,9 @@ impl Hub {
                 0x01 => {
                     if let (Some(ieee), Some(bytes)) = (&ieee, payload.get(..2)) {
                         let zone_type = u16::from_le_bytes([bytes[0], bytes[1]]);
-                        self.update_device(ieee, |d| d.zone_type = Some(zone_type));
+                        self.update_device(ieee, |d| {
+                            d.state.insert("zone_type".into(), json!(zone_type));
+                        });
                     }
                     self.send_enroll_response(source, src_ep);
                 }
@@ -835,10 +767,10 @@ impl Hub {
         }
 
         if cluster_id == cluster::POLL_CONTROL && header.server_to_client() && header.command == 0x00 {
-            // Check-in: bekleyen ayar varsa cihaz hızlı yoklamaya geçsin ki yazma yetişsin
+            // Check-in: bekleyen yazma varsa cihaz hızlı yoklamaya geçsin ki yazma yetişsin
             let has_pending = ieee
                 .as_ref()
-                .is_some_and(|ieee| self.pending_settings.lock().unwrap().contains_key(ieee));
+                .is_some_and(|ieee| self.pending_writes.lock().unwrap().contains_key(ieee));
             let mut body = vec![u8::from(has_pending)];
             body.extend_from_slice(&FAST_POLL_QUARTER_SECONDS.to_le_bytes());
             let frame = zcl::frame(
@@ -864,6 +796,25 @@ impl Hub {
         );
     }
 
+    fn answer_time_read(&self, nwk: u16, src_ep: u8, dst_ep: u8, header: &zcl::Header, payload: &[u8], ieee: Option<&str>) {
+        let ids: Vec<u16> = payload.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        let base = ieee
+            .and_then(|ieee| self.device(ieee))
+            .map_or(TimeBase::Zigbee2000, |d| devices::time_base(&d));
+        let body = time_read_response(&ids, now_unix(), tuya::utc_offset_seconds(), base);
+        let frame = zcl::frame(
+            zcl::FC_SERVER_TO_CLIENT | zcl::FC_DISABLE_DEFAULT_RESPONSE,
+            header.seq,
+            zcl::cmd::READ_ATTRIBUTES_RSP,
+            &body,
+        );
+        debug!("Saat isteği yanıtlandı: nwk 0x{nwk:04x} {ids:04x?} ({base:?})");
+        let src = if dst_ep == 0 { HUB_ENDPOINT } else { dst_ep };
+        if let Err(e) = self.send(nwk, HA_PROFILE, cluster::TIME, src, src_ep, frame, false) {
+            debug!("Saat yanıtı gönderilemedi: {e:#}");
+        }
+    }
+
     fn handle_tuya(&self, nwk: u16, ep: u8, ieee: Option<&str>, header: &zcl::Header, payload: &[u8]) {
         match header.command {
             tuya::cmd::DATA_RESPONSE
@@ -874,27 +825,18 @@ impl Hub {
                     return;
                 };
                 let datapoints = tuya::parse_datapoints(payload);
-                let profile = self
-                    .device(ieee)
-                    .and_then(|d| tuya::thermostat_profile(d.manufacturer.as_deref()));
                 self.update_device(ieee, |device| {
-                    for dp in &datapoints {
-                        let known = profile.is_some_and(|p| p.apply(device, dp));
-                        if !known {
-                            // Yeni bir model eklerken DP haritasını çıkarmak için
-                            info!(
-                                "{ieee} Tuya DP {} (tür {}): {:02x?}",
-                                dp.id, dp.ty, dp.data
-                            );
-                        }
+                    for dp in apply_tuya_datapoints(device, &datapoints) {
+                        // Yeni bir model eklerken DP haritasını çıkarmak için
+                        info!("{ieee} Tuya DP {} (tür {}): {:02x?}", dp.id, dp.ty, dp.data);
                     }
                 });
             }
             tuya::cmd::MCU_SYNC_TIME => {
                 let since_2000 = ieee
                     .and_then(|ieee| self.device(ieee))
-                    .and_then(|d| tuya::thermostat_profile(d.manufacturer.as_deref()))
-                    .is_none_or(|p| p.time_since_2000);
+                    .and_then(|d| devices::definition(&d))
+                    .is_none_or(|def| def.tuya_time_since_2000);
                 let body = tuya::time_sync_payload(now_unix(), tuya::utc_offset_seconds(), since_2000);
                 self.send_tuya(nwk, ep, tuya::cmd::MCU_SYNC_TIME, &body);
             }
@@ -920,26 +862,7 @@ impl Hub {
     }
 
     fn apply_records(&self, ieee: &str, cluster_id: u16, records: &[zcl::AttributeRecord]) {
-        self.update_device(ieee, |device| {
-            for record in records {
-                if let Some(value) = &record.value {
-                    apply_attribute(device, cluster_id, record.id, value);
-                }
-            }
-            if let Some(profile) = profiles::profile(device.model.as_deref()) {
-                for record in records {
-                    let setting = profile
-                        .settings
-                        .iter()
-                        .find(|s| s.is_attribute(cluster_id, record.id));
-                    if let (Some(setting), Some(value)) = (setting, &record.value)
-                        && let Some(decoded) = setting.decode(value)
-                    {
-                        device.settings.insert(setting.key.to_owned(), decoded);
-                    }
-                }
-            }
-        });
+        self.update_device(ieee, |device| apply_zcl_records(device, cluster_id, records));
     }
 
     fn default_response(&self, nwk: u16, ep: u8, cluster_id: u16, header: &zcl::Header) {
@@ -1187,7 +1110,7 @@ impl Hub {
 
         self.configure(ieee).await;
 
-        if let Some(ep) = device.endpoint_with(tuya::CLUSTER) {
+        if let Some(ep) = self.device(ieee).and_then(|d| d.endpoint_with(tuya::CLUSTER)) {
             // Bütün DP'leri bir kez iste; sonrası cihazın kendi raporlarıyla gelir
             self.send_tuya(nwk, ep, tuya::cmd::DATA_QUERY, &[]);
         }
@@ -1202,16 +1125,17 @@ impl Hub {
         };
         self.update_device(ieee, |d| {
             d.interviewed = true;
-            let untouched = d.name == Device::new(d.ieee.clone(), d.nwk).name;
-            if untouched && let Some(name) = default_name(d, &taken) {
-                d.name = name;
+            prune_state(d);
+            if untouched_name(d) && let Some(base) = devices::default_name(d) {
+                d.name = unique_name(base, &d.ieee, &taken);
             }
         });
         Ok(())
     }
 
-    /// Kümeleri merkeze bağlar, raporlamayı ayarlar ve güncel değerleri okur. Tek tek
-    /// hatalar tanımayı durdurmaz: bazı cihazlar bazı adımları desteklemiyor.
+    /// Cihazın özelliklerinden türetilir: raporlanan kümeleri merkeze bağlar, raporlamayı
+    /// ayarlar, IAS bölgesini kaydeder ve okunabilir bütün özniteliklerin güncel değerini
+    /// okur. Tek tek hatalar tanımayı durdurmaz: bazı cihazlar bazı adımları desteklemiyor.
     async fn configure(self: &Arc<Self>, ieee: &str) {
         let Some(device) = self.device(ieee) else {
             return;
@@ -1220,70 +1144,74 @@ impl Hub {
             return;
         };
         let nwk = device.nwk;
+        let features = devices::features(&device);
 
-        for endpoint in &device.endpoints {
-            for &cluster_id in &endpoint.in_clusters {
-                if cluster_id == cluster::IAS_ZONE {
-                    self.enroll(ieee, nwk, endpoint.id).await;
-                    continue;
-                }
-                let Some(report) = report_config(cluster_id) else {
-                    continue;
-                };
-
-                self.bind(ieee, nwk, device_ieee, endpoint.id, cluster_id).await;
-
-                match self
-                    .zcl_request(
-                        nwk,
-                        endpoint.id,
-                        cluster_id,
-                        0x00,
-                        zcl::cmd::CONFIGURE_REPORTING,
-                        &zcl::configure_reporting_payload(&[report]),
-                    )
-                    .await
-                {
-                    Ok((header, body))
-                        if header.command == zcl::cmd::CONFIGURE_REPORTING_RSP
-                            && zcl::all_success(&body) => {}
-                    Ok((header, body)) => warn!(
-                        "{ieee} küme 0x{cluster_id:04x} raporlama ayarı reddedildi (komut 0x{:02x}, {body:02x?})",
-                        header.command
-                    ),
-                    Err(e) => warn!("{ieee} küme 0x{cluster_id:04x} raporlama ayarlanamadı: {e:#}"),
-                }
-
-                let reads = initial_reads(cluster_id);
-                if !reads.is_empty()
-                    && let Err(e) = self.read_attributes(nwk, endpoint.id, cluster_id, reads).await
-                {
-                    debug!("{ieee} küme 0x{cluster_id:04x} okunamadı: {e:#}");
-                }
+        let mut reports: BTreeMap<u16, Vec<ReportConfig>> = BTreeMap::new();
+        let mut reads: BTreeMap<u16, Vec<u16>> = BTreeMap::new();
+        for feature in &features {
+            let Source::Attr { cluster, attr, ty, report, .. } = feature.source else {
+                continue;
+            };
+            let attrs = reads.entry(cluster).or_default();
+            if !attrs.contains(&attr) {
+                attrs.push(attr);
+            }
+            if let Some(report) = report {
+                reports.entry(cluster).or_default().push(ReportConfig {
+                    attribute: attr,
+                    ty,
+                    min_interval: report.min,
+                    max_interval: report.max,
+                    reportable_change: report.change,
+                });
             }
         }
 
-        let Some(profile) = profiles::profile(device.model.as_deref()) else {
-            return;
-        };
-        for &cluster_id in profile.binds {
+        for (&cluster_id, configs) in &reports {
+            let Some(ep) = device.endpoint_with(cluster_id) else {
+                continue;
+            };
+            self.bind(ieee, nwk, device_ieee, ep, cluster_id).await;
+            match self
+                .zcl_request(
+                    nwk,
+                    ep,
+                    cluster_id,
+                    0x00,
+                    zcl::cmd::CONFIGURE_REPORTING,
+                    &zcl::configure_reporting_payload(configs),
+                )
+                .await
+            {
+                Ok((header, body))
+                    if header.command == zcl::cmd::CONFIGURE_REPORTING_RSP && zcl::all_success(&body) => {}
+                Ok((header, body)) => warn!(
+                    "{ieee} küme 0x{cluster_id:04x} raporlama ayarı reddedildi (komut 0x{:02x}, {body:02x?})",
+                    header.command
+                ),
+                Err(e) => warn!("{ieee} küme 0x{cluster_id:04x} raporlama ayarlanamadı: {e:#}"),
+            }
+        }
+
+        for &cluster_id in devices::extra_binds(&device) {
             if let Some(ep) = device.endpoint_with(cluster_id) {
                 self.bind(ieee, nwk, device_ieee, ep, cluster_id).await;
             }
         }
-        // Ayarların güncel değerleri, kümeye göre gruplanmış tek okumayla
-        let mut by_cluster: BTreeMap<u16, Vec<u16>> = BTreeMap::new();
-        for setting in profile.settings {
-            if let profiles::Source::Attribute { cluster, attribute, .. } = setting.source {
-                by_cluster.entry(cluster).or_default().push(attribute);
-            }
+        if devices::has_ias_zone(&device)
+            && let Some(ep) = device.endpoint_with(cluster::IAS_ZONE)
+        {
+            self.enroll(ieee, nwk, ep).await;
         }
-        for (cluster_id, attributes) in by_cluster {
+
+        for (cluster_id, attrs) in reads {
             let Some(ep) = device.endpoint_with(cluster_id) else {
                 continue;
             };
-            if let Err(e) = self.read_attributes(nwk, ep, cluster_id, &attributes).await {
-                debug!("{ieee} ayarları okunamadı: {e:#}");
+            for chunk in attrs.chunks(READ_CHUNK) {
+                if let Err(e) = self.read_attributes(nwk, ep, cluster_id, chunk).await {
+                    debug!("{ieee} küme 0x{cluster_id:04x} {chunk:04x?} okunamadı: {e:#}");
+                }
             }
         }
     }
@@ -1318,40 +1246,111 @@ impl Hub {
             Ok((_, body)) => warn!("{ieee} IAS merkez adresi reddedildi: {body:02x?}"),
             Err(e) => warn!("{ieee} IAS merkez adresi yazılamadı: {e:#}"),
         }
-        if let Err(e) = self
-            .read_attributes(nwk, ep, cluster::IAS_ZONE, &[0x0001, 0x0002])
-            .await
-        {
-            debug!("{ieee} IAS durumu okunamadı: {e:#}");
-        }
         self.send_enroll_response(nwk, ep);
     }
 
     // ---- Kullanıcı işlemleri ----
 
-    pub async fn command(&self, ieee: &str, action: Action) -> Result<()> {
+    /// Bir özelliğe değer yazar: kaynağına göre öznitelik yazma, ışık komutu ya da Tuya
+    /// DP'si. Uyuyan cihaza öznitelik yazması kuyruğa alınır; dönüş `true` ise bekliyor.
+    pub async fn set(self: &Arc<Self>, ieee: &str, key: &str, value: Json) -> Result<bool> {
         let device = self.device(ieee).context("cihaz bulunamadı")?;
-        if action.is_thermostat() {
-            return self.thermostat_command(&device, action);
-        }
-        let (cluster_id, command, payload): (u16, u8, Vec<u8>) = match &action {
-            Action::On => (cluster::ON_OFF, 0x01, vec![]),
-            Action::Off => (cluster::ON_OFF, 0x00, vec![]),
-            Action::Toggle => (cluster::ON_OFF, 0x02, vec![]),
-            // Move to Level (with On/Off), yarım saniyelik geçiş
-            Action::Level(level) => (cluster::LEVEL, 0x04, vec![(*level).min(254), 5, 0]),
-            // Move to Color Temperature
-            Action::ColorTemp(mireds) => {
-                let mut payload = mireds.to_le_bytes().to_vec();
-                payload.extend_from_slice(&5u16.to_le_bytes());
-                (cluster::COLOR, 0x0A, payload)
-            }
-            _ => unreachable!("termostat komutları yukarıda ayrıldı"),
-        };
-        let ep = device
-            .endpoint_with(cluster_id)
-            .context("cihaz bu komutu desteklemiyor")?;
+        let feature = devices::features(&device)
+            .into_iter()
+            .find(|f| f.key == key)
+            .with_context(|| format!("bilinmeyen özellik: {key}"))?;
+        let value = feature.validate(&device, value)?;
 
+        match feature.source {
+            Source::Attr {
+                write: Write::Attribute,
+                ..
+            } => {
+                if device.rx_on_when_idle {
+                    self.write_attribute(&device, feature, &value).await?;
+                    return Ok(false);
+                }
+                self.pending_writes
+                    .lock()
+                    .unwrap()
+                    .entry(ieee.to_owned())
+                    .or_default()
+                    .insert(key.to_owned(), value);
+                self.emit_device(ieee);
+                // Uyuyan cihaza yazma ancak uyanıkken yetişir (dolaylı iletim 7,68 sn
+                // bekler). Cihaz az önce bir şey gönderdiyse şimdi dene.
+                if device
+                    .last_seen
+                    .is_some_and(|seen| now_unix().saturating_sub(seen) <= AWAKE_WINDOW_SECONDS)
+                {
+                    self.flush_pending_writes(device.nwk);
+                }
+                Ok(true)
+            }
+            Source::Attr { cluster, write, .. } => {
+                self.light_command(&device, feature, cluster, write, &value).await?;
+                Ok(false)
+            }
+            Source::Tuya { dp, dp_type, conv } => {
+                let datapoint = tuya_datapoint(dp, dp_type, conv.encode(&value)?)?;
+                self.send_tuya_datapoint(&device, datapoint)?;
+                // Onayı cihazın kendi DP raporu getirir; arayüz beklemesin
+                self.update_device(ieee, |d| {
+                    d.state.insert(key.to_owned(), value);
+                });
+                Ok(false)
+            }
+            Source::TuyaSchedule { dp, divisor } => {
+                let Kind::Schedule { min, max, step } = feature.kind else {
+                    bail!("program türü bekleniyordu");
+                };
+                let expected = device.state.get(key).and_then(Json::as_array).map(Vec::len);
+                let data = tuya::encode_schedule(&value, expected, (min, max, step), divisor).map_err(|e| anyhow!(e))?;
+                let normalized = tuya::decode_schedule(&data, divisor);
+                self.send_tuya_datapoint(
+                    &device,
+                    tuya::Datapoint {
+                        id: dp,
+                        ty: tuya::dp_type::RAW,
+                        data,
+                    },
+                )?;
+                self.update_device(ieee, |d| {
+                    d.state.insert(key.to_owned(), normalized);
+                });
+                Ok(false)
+            }
+        }
+    }
+
+    fn send_tuya_datapoint(&self, device: &Device, datapoint: tuya::Datapoint) -> Result<()> {
+        let ep = device.endpoint_with(tuya::CLUSTER).context("cihazda Tuya kümesi yok")?;
+        let seq = u16::from(self.next_seq());
+        self.send_tuya(device.nwk, ep, tuya::cmd::DATA_REQUEST, &tuya::data_request(seq, &[datapoint]));
+        Ok(())
+    }
+
+    /// Işık kümelerine komut: On/Off, Move to Level (with On/Off), Move to Color Temperature
+    async fn light_command(&self, device: &Device, feature: &Feature, cluster_id: u16, write: Write, value: &Json) -> Result<()> {
+        // Yarım saniyelik geçiş
+        const TRANSITION: u16 = 5;
+        let number = || value.as_f64().unwrap_or_default().round();
+        let (command, payload): (u8, Vec<u8>) = match write {
+            Write::OnOff => (u8::from(value.as_bool() == Some(true)), vec![]),
+            Write::Level => {
+                let level = number().clamp(0.0, 254.0) as u8;
+                let mut payload = vec![level];
+                payload.extend_from_slice(&TRANSITION.to_le_bytes());
+                (0x04, payload)
+            }
+            Write::ColorTemp => {
+                let mut payload = (number().clamp(0.0, 65_279.0) as u16).to_le_bytes().to_vec();
+                payload.extend_from_slice(&TRANSITION.to_le_bytes());
+                (0x0A, payload)
+            }
+            Write::No | Write::Attribute => bail!("{} komutla yazılmaz", feature.label),
+        };
+        let ep = device.endpoint_with(cluster_id).context("cihaz bu komutu desteklemiyor")?;
         let (header, body) = self
             .zcl_request(device.nwk, ep, cluster_id, zcl::FC_CLUSTER_SPECIFIC, command, &payload)
             .await?;
@@ -1361,59 +1360,33 @@ impl Hub {
         {
             bail!("cihaz komutu reddetti (durum 0x{status:02x})");
         }
-
         // Raporlar birazdan gelecek; arayüz beklemesin
-        self.update_device(ieee, |d| match action {
-            Action::On => d.state.on = Some(true),
-            Action::Off => d.state.on = Some(false),
-            Action::Toggle => d.state.on = d.state.on.map(|on| !on),
-            Action::Level(level) => {
-                d.state.level = Some(level);
-                d.state.on = Some(level > 0);
+        self.update_device(&device.ieee, |d| {
+            d.state.insert(feature.key.to_owned(), value.clone());
+            if write == Write::Level {
+                d.state.insert("on".into(), json!(number() > 0.0));
             }
-            Action::ColorTemp(mireds) => d.state.color_temp = Some(mireds),
-            _ => {}
         });
         Ok(())
     }
 
-    /// Tuya termostatına DP yazar. Cihaz uyuyan uç cihaz olduğu için komut bir sonraki
-    /// yoklamasında teslim edilir; onayı cihazın kendi DP raporu getirir.
-    fn thermostat_command(&self, device: &Device, action: Action) -> Result<()> {
-        let profile = tuya::thermostat_profile(device.manufacturer.as_deref())
-            .context("bu cihaz için termostat tanımı yok")?;
-        let ep = device
-            .endpoint_with(tuya::CLUSTER)
-            .context("cihazda Tuya kümesi yok")?;
-        let dp = match &action {
-            Action::Setpoint(celsius) => profile.setpoint_dp(device, *celsius).with_context(|| {
-                let (min, max) = profile.setpoint_range(device);
-                format!("hedef sıcaklık {min}-{max} °C arasında olmalı")
-            })?,
-            Action::SystemMode(mode) => match mode.as_str() {
-                "heat" => profile.system_mode_dp(true),
-                "off" => profile.system_mode_dp(false),
-                _ => bail!("geçersiz mod: {mode}"),
-            },
-            Action::Preset(preset) => match preset.as_str() {
-                "manual" => profile.preset_dp(false),
-                "program" => profile.preset_dp(true),
-                _ => bail!("geçersiz ön ayar: {preset}"),
-            }
-            .context("cihazda ön ayar yok")?,
-            Action::Frost(on) => profile.frost_dp(*on).context("cihazda donma koruması yok")?,
-            Action::ChildLock(on) => profile.child_lock_dp(*on).context("cihazda çocuk kilidi yok")?,
-            Action::WorkingWeek(name) => profile
-                .working_week_dp(name)
-                .with_context(|| format!("geçersiz çalışma haftası: {name}"))?,
-            Action::Schedule(slots) => profile.schedule_dp(device, slots).map_err(|e| anyhow!(e))?,
-            _ => bail!("termostat komutu değil"),
+    async fn write_attribute(&self, device: &Device, feature: &Feature, value: &Json) -> Result<()> {
+        let Source::Attr { cluster, attr, ty, conv, .. } = feature.source else {
+            bail!("öznitelik değil");
         };
-
-        let seq = u16::from(self.next_seq());
-        self.send_tuya(device.nwk, ep, tuya::cmd::DATA_REQUEST, &tuya::data_request(seq, &[dp.clone()]));
+        let raw = conv.encode(value)?;
+        let bytes = zcl::encode_int(ty, raw).context("değer özniteliğin türüne sığmıyor")?;
+        let ep = device.endpoint_with(cluster).context("cihazda özniteliğin kümesi yok")?;
+        let payload = zcl::write_attribute_payload(attr, ty, &bytes);
+        let (header, body) = self
+            .zcl_request(device.nwk, ep, cluster, 0x00, zcl::cmd::WRITE_ATTRIBUTES, &payload)
+            .await?;
+        if header.command != zcl::cmd::WRITE_ATTRIBUTES_RSP || !zcl::all_success(&body) {
+            bail!("cihaz değeri reddetti ({body:02x?})");
+        }
+        info!("{} {} = {value}", device.ieee, feature.key);
         self.update_device(&device.ieee, |d| {
-            profile.apply(d, &dp);
+            d.state.insert(feature.key.to_owned(), value.clone());
         });
         Ok(())
     }
@@ -1532,106 +1505,35 @@ impl Hub {
             .map_or(0, |until| until.saturating_duration_since(Instant::now()).as_secs())
     }
 
-    /// Modele özel bir ayarı yazar. Uyuyan cihazda ayar kuyruğa alınır ve cihaz bir
-    /// sonraki uyanışında (rapor ya da check-in) yazılır; dönüş `true` ise bekliyor.
-    pub async fn set_setting(self: &Arc<Self>, ieee: &str, key: &str, value: f64) -> Result<bool> {
-        let device = self.device(ieee).context("cihaz bulunamadı")?;
-        let setting = device_settings(&device)
-            .iter()
-            .find(|s| s.key == key)
-            .context("bilinmeyen ayar")?;
-        let (snapped, raw) = setting.to_raw(value).with_context(|| {
-            format!("{} {}…{} {} arasında olmalı", setting.label, setting.min, setting.max, setting.unit)
-        })?;
-
-        if let profiles::Source::TuyaDp(_) = setting.source {
-            // Tuya cihazı komutları yoklamasında hemen alıyor; onayı DP raporu getirir
-            let profile = tuya::thermostat_profile(device.manufacturer.as_deref())
-                .context("bu cihaz için Tuya tanımı yok")?;
-            let ep = device.endpoint_with(tuya::CLUSTER).context("cihazda Tuya kümesi yok")?;
-            let dp = profile.setting_dp(setting, raw).context("geçersiz değer")?;
-            let seq = u16::from(self.next_seq());
-            self.send_tuya(device.nwk, ep, tuya::cmd::DATA_REQUEST, &tuya::data_request(seq, &[dp]));
-            self.update_device(ieee, |d| {
-                d.settings.insert(setting.key.to_owned(), snapped);
-            });
-            return Ok(false);
-        }
-
-        if device.rx_on_when_idle {
-            self.write_setting(&device, setting, snapped).await?;
-            return Ok(false);
-        }
-        self.pending_settings
-            .lock()
-            .unwrap()
-            .entry(ieee.to_owned())
-            .or_default()
-            .insert(setting.key, snapped);
-        self.emit_device(ieee);
-        // Uyuyan cihaza yazma ancak uyanıkken yetişir (dolaylı iletim 7,68 sn bekler).
-        // Cihaz az önce bir şey gönderdiyse şimdi dene; değilse bir sonraki uyanışı bekle.
-        if device
-            .last_seen
-            .is_some_and(|seen| now_unix().saturating_sub(seen) <= AWAKE_WINDOW_SECONDS)
-        {
-            self.flush_pending_settings(device.nwk);
-        }
-        Ok(true)
-    }
-
-    async fn write_setting(&self, device: &Device, setting: &Setting, value: f64) -> Result<()> {
-        let profiles::Source::Attribute { cluster, attribute, ty } = setting.source else {
-            bail!("öznitelik ayarı değil");
-        };
-        let (_, raw) = setting.to_raw(value).context("geçersiz değer")?;
-        let bytes = setting.attribute_bytes(raw).context("geçersiz değer")?;
-        let ep = device.endpoint_with(cluster).context("cihazda ayarın kümesi yok")?;
-        let payload = zcl::write_attribute_payload(attribute, ty, &bytes);
-        let (header, body) = self
-            .zcl_request(device.nwk, ep, cluster, 0x00, zcl::cmd::WRITE_ATTRIBUTES, &payload)
-            .await?;
-        if header.command != zcl::cmd::WRITE_ATTRIBUTES_RSP || !zcl::all_success(&body) {
-            bail!("cihaz ayarı reddetti ({body:02x?})");
-        }
-        info!("{} {} = {value} {}", device.ieee, setting.key, setting.unit);
-        self.update_device(&device.ieee, |d| {
-            d.settings.insert(setting.key.to_owned(), value);
-        });
-        Ok(())
-    }
-
-    /// Cihaz az önce bir şey gönderdiyse uyanıktır: bekleyen ayarları şimdi yaz. Ayar,
+    /// Cihaz az önce bir şey gönderdiyse uyanıktır: bekleyen yazmaları şimdi yap. Değer,
     /// cihaz onaylayana kadar kuyrukta kalır; başarısız yazma sonraki uyanışta yinelenir.
-    fn flush_pending_settings(self: &Arc<Self>, nwk: u16) {
+    fn flush_pending_writes(self: &Arc<Self>, nwk: u16) {
         let Some(device) = self.data.lock().unwrap().devices.values().find(|d| d.nwk == nwk).cloned() else {
             return;
         };
-        let Some(pending) = self.pending_settings.lock().unwrap().get(&device.ieee).cloned() else {
-            return;
-        };
-        let Some(profile) = profiles::profile(device.model.as_deref()) else {
+        let Some(pending) = self.pending_writes.lock().unwrap().get(&device.ieee).cloned() else {
             return;
         };
         // Yazmanın yanıtı da buraya düşer; süren yazma varken ikincisini başlatma
-        if !self.writing_settings.lock().unwrap().insert(device.ieee.clone()) {
+        if !self.writing.lock().unwrap().insert(device.ieee.clone()) {
             return;
         }
         let hub = self.clone();
         tokio::spawn(async move {
+            let features = devices::features(&device);
             for (key, value) in pending {
-                let Some(setting) = profile.setting(key) else {
+                let Some(feature) = features.iter().find(|f| f.key == key) else {
                     continue;
                 };
-                match hub.write_setting(&device, setting, value).await {
-                    Ok(()) => settle_pending(&mut hub.pending_settings.lock().unwrap(), &device.ieee, key, value),
+                match hub.write_attribute(&device, feature, &value).await {
+                    Ok(()) => settle_pending(&mut hub.pending_writes.lock().unwrap(), &device.ieee, &key, &value),
                     Err(e) => warn!(
                         "{} {key} yazılamadı, sonraki uyanışta yeniden denenecek: {e:#}",
                         device.ieee
                     ),
                 }
             }
-            hub.writing_settings.lock().unwrap().remove(&device.ieee);
+            hub.writing.lock().unwrap().remove(&device.ieee);
             hub.emit_device(&device.ieee);
         });
     }
@@ -1819,78 +1721,133 @@ mod tests {
         device
     }
 
-    #[test]
-    fn hue_white_ambiance_capabilities() {
-        let mut device = device_with(&[0x0000, 0x0006, 0x0008, 0x0300]);
-        device.router = true;
-        assert_eq!(capabilities(&device), ["on_off", "level", "color_temp"]);
+    fn record(id: u16, value: Value) -> zcl::AttributeRecord {
+        zcl::AttributeRecord {
+            id,
+            status: zcl::STATUS_SUCCESS,
+            value: Some(value),
+        }
     }
 
     #[test]
-    fn contact_sensor_capabilities() {
-        let mut device = device_with(&[0x0000, 0x0001, 0x0500]);
-        device.zone_type = Some(0x0015);
-        assert_eq!(capabilities(&device), ["contact", "battery"]);
-    }
-
-    #[test]
-    fn applies_sensor_attributes() {
-        let mut device = device_with(&[]);
-        apply_attribute(&mut device, cluster::TEMPERATURE, 0, &Value::Int(2153));
-        apply_attribute(&mut device, cluster::HUMIDITY, 0, &Value::Uint(4512));
-        apply_attribute(&mut device, cluster::POWER_CONFIG, 0x0021, &Value::Uint(200));
-        apply_attribute(&mut device, cluster::IAS_ZONE, 0x0002, &Value::Uint(0x0009));
-        assert_eq!(device.state.temperature, Some(21.53));
-        assert_eq!(device.state.humidity, Some(45.12));
-        assert_eq!(device.state.battery, Some(100));
-        assert_eq!(device.state.alarm, Some(true));
-        assert_eq!(device.state.battery_low, Some(true));
-    }
-
-    #[test]
-    fn default_names_prefer_tuya_profile_and_stay_unique() {
-        let mut sensor = device_with(&[0x0000]);
-        sensor.model = Some("SNZB-02P".into());
-        assert_eq!(default_name(&sensor, &[]).as_deref(), Some("SNZB-02P"));
-        assert_eq!(
-            default_name(&sensor, &["SNZB-02P".into()]).as_deref(),
-            Some("SNZB-02P 0405")
-        );
-
-        let mut thermostat = device_with(&[0x0000, 0xEF00]);
-        thermostat.manufacturer = Some("_TZE200_g9a3awaj".into());
-        thermostat.model = Some("TS0601".into());
-        assert_eq!(default_name(&thermostat, &[]).as_deref(), Some("Termostat"));
-        assert!(capabilities(&thermostat).contains(&"thermostat"));
-    }
-
-    #[test]
-    fn settled_write_leaves_newer_pending_value() {
-        let mut pending: HashMap<String, BTreeMap<&'static str, f64>> = HashMap::new();
-        let ieee = "38:39:8f:ff:fe:de:0d:70";
-        pending.entry(ieee.into()).or_default().insert("temperature_calibration", 1.0);
-
-        // Yazma sürerken kullanıcı değeri değiştirdi: eski yazma yenisini silmemeli
-        pending.get_mut(ieee).unwrap().insert("temperature_calibration", -0.5);
-        settle_pending(&mut pending, ieee, "temperature_calibration", 1.0);
-        assert_eq!(pending[ieee]["temperature_calibration"], -0.5);
-
-        settle_pending(&mut pending, ieee, "temperature_calibration", -0.5);
-        assert!(!pending.contains_key(ieee));
+    fn applies_standard_sensor_attributes() {
+        let mut device = device_with(&[0x0001, 0x0402, 0x0405, 0x0500]);
+        apply_zcl_records(&mut device, cluster::TEMPERATURE, &[record(0, Value::Int(2153))]);
+        apply_zcl_records(&mut device, cluster::HUMIDITY, &[record(0, Value::Uint(4512))]);
+        apply_zcl_records(&mut device, cluster::POWER_CONFIG, &[record(0x0021, Value::Uint(200))]);
+        apply_zcl_records(&mut device, cluster::IAS_ZONE, &[record(0x0002, Value::Uint(0x0009))]);
+        assert_eq!(device.state["temperature"], json!(21.53));
+        assert_eq!(device.state["humidity"], json!(45.12));
+        assert_eq!(device.state["battery"], json!(100));
+        assert_eq!(device.state["alarm"], json!(true));
+        assert_eq!(device.state["battery_low"], json!(true));
     }
 
     #[test]
     fn ignores_invalid_temperature() {
-        let mut device = device_with(&[]);
-        apply_attribute(&mut device, cluster::TEMPERATURE, 0, &Value::Int(-0x8000));
-        assert_eq!(device.state.temperature, None);
+        let mut device = device_with(&[0x0402]);
+        apply_zcl_records(&mut device, cluster::TEMPERATURE, &[record(0, Value::Int(-0x8000))]);
+        assert!(!device.state.contains_key("temperature"));
     }
 
     #[test]
-    fn action_json_shape() {
-        let action: Action = serde_json::from_str(r#"{"action":"level","value":128}"#).unwrap();
-        assert!(matches!(action, Action::Level(128)));
-        let action: Action = serde_json::from_str(r#"{"action":"on"}"#).unwrap();
-        assert!(matches!(action, Action::On));
+    fn learning_the_model_switches_to_its_definition() {
+        let mut device = device_with(&[0x0000, 0x0001, 0x0006, 0x0201, 0xFC11]);
+        let basic = [record(0x0004, Value::Str("SONOFF".into())), record(0x0005, Value::Str("TRVZB".into()))];
+        apply_zcl_records(&mut device, cluster::BASIC, &basic);
+        apply_zcl_records(&mut device, cluster::THERMOSTAT, &[record(0x0012, Value::Int(2150)), record(0x001C, Value::Uint(4))]);
+        apply_zcl_records(&mut device, 0xFC11, &[record(0x0000, Value::Bool(true))]);
+        assert_eq!(device.state["setpoint"], json!(21.5));
+        assert_eq!(device.state["system_mode"], json!("heat"));
+        assert_eq!(device.state["child_lock"], json!(true));
+        // Tanımda olmayan On/Off kümesi artık özellik değil
+        apply_zcl_records(&mut device, cluster::ON_OFF, &[record(0, Value::Bool(true))]);
+        assert!(!device.state.contains_key("on"));
+    }
+
+    #[test]
+    fn applies_tuya_datapoints_and_reports_unknown_ones() {
+        let mut device = device_with(&[0xEF00]);
+        device.manufacturer = Some("_TZE200_g9a3awaj".into());
+        let dps = [tuya::Datapoint::value(16, 225), tuya::Datapoint::bool(1, true), tuya::Datapoint::bool(99, true)];
+        let unknown = apply_tuya_datapoints(&mut device, &dps);
+        assert_eq!(device.state["setpoint"], json!(22.5));
+        assert_eq!(device.state["system_mode"], json!("heat"));
+        assert_eq!(unknown.iter().map(|d| d.id).collect::<Vec<_>>(), [99]);
+    }
+
+    #[test]
+    fn tuya_writes_use_the_datapoint_type() {
+        assert_eq!(tuya_datapoint(1, tuya::dp_type::BOOL, 1).unwrap(), tuya::Datapoint::bool(1, true));
+        assert_eq!(tuya_datapoint(2, tuya::dp_type::ENUM, 0).unwrap(), tuya::Datapoint::enumeration(2, 0));
+        assert_eq!(tuya_datapoint(16, tuya::dp_type::VALUE, 215).unwrap(), tuya::Datapoint::value(16, 215));
+        assert!(tuya_datapoint(45, tuya::dp_type::BITMAP, 0).is_err());
+    }
+
+    #[test]
+    fn time_response_supports_both_epochs() {
+        // 2026-01-01 00:00:00 UTC, UTC+3
+        let now = 1_767_225_600;
+        let standard = time_read_response(&[0x0000, 0x0007, 0x0005], now, 10_800, TimeBase::Zigbee2000);
+        let since_2000 = (now - SECONDS_1970_TO_2000) as u32;
+        let mut expected = vec![0x00, 0x00, 0x00, types::UTC_TIME];
+        expected.extend_from_slice(&since_2000.to_le_bytes());
+        expected.extend_from_slice(&[0x07, 0x00, 0x00, types::UINT32]);
+        expected.extend_from_slice(&(since_2000 + 10_800).to_le_bytes());
+        expected.extend_from_slice(&[0x05, 0x00, 0x86]);
+        assert_eq!(standard, expected);
+
+        let unix = time_read_response(&[0x0000], now, 0, TimeBase::Unix1970);
+        assert_eq!(&unix[4..], &(now as u32).to_le_bytes());
+    }
+
+    #[test]
+    fn default_names_come_from_definitions_and_stay_unique() {
+        let mut sensor = device_with(&[0x0000]);
+        sensor.model = Some("SNZB-02P".into());
+        let base = devices::default_name(&sensor).unwrap();
+        assert_eq!(base, "SNZB-02P");
+        assert_eq!(unique_name(base, &sensor.ieee, &["SNZB-02P".into()]), "SNZB-02P 0405");
+
+        let mut thermostat = device_with(&[0x0000, 0xEF00]);
+        thermostat.manufacturer = Some("_TZE200_g9a3awaj".into());
+        thermostat.model = Some("TS0601".into());
+        assert_eq!(devices::default_name(&thermostat).as_deref(), Some("Termostat"));
+    }
+
+    #[test]
+    fn model_named_devices_get_their_definition_name_and_stale_keys_go() {
+        let mut device = device_with(&[0x0000, 0x0201, 0xFC11]);
+        device.model = Some("TRVZB".into());
+        device.name = "TRVZB".into();
+        device.interviewed = true;
+        device.state.insert("on".into(), json!(false));
+        device.state.insert("setpoint".into(), json!(19.0));
+        let mut data = Persisted::default();
+        data.devices.insert(device.ieee.clone(), device.clone());
+        apply_default_names(&mut data);
+        let device = &data.devices[&device.ieee];
+        assert_eq!(device.name, "Radyatör vanası");
+        assert!(!device.state.contains_key("on"));
+        assert_eq!(device.state["setpoint"], json!(19.0));
+
+        let mut renamed = device.clone();
+        renamed.name = "Salon".into();
+        assert!(!untouched_name(&renamed));
+    }
+
+    #[test]
+    fn settled_write_leaves_newer_pending_value() {
+        let mut pending: HashMap<String, BTreeMap<String, Json>> = HashMap::new();
+        let ieee = "38:39:8f:ff:fe:de:0d:70";
+        pending.entry(ieee.into()).or_default().insert("temperature_calibration".into(), json!(1.0));
+
+        // Yazma sürerken kullanıcı değeri değiştirdi: eski yazma yenisini silmemeli
+        pending.get_mut(ieee).unwrap().insert("temperature_calibration".into(), json!(-0.5));
+        settle_pending(&mut pending, ieee, "temperature_calibration", &json!(1.0));
+        assert_eq!(pending[ieee]["temperature_calibration"], json!(-0.5));
+
+        settle_pending(&mut pending, ieee, "temperature_calibration", &json!(-0.5));
+        assert!(!pending.contains_key(ieee));
     }
 }

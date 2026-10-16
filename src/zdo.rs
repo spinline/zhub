@@ -193,7 +193,8 @@ pub fn our_active_ep_rsp(nwk: u16, endpoint: u8) -> Vec<u8> {
 }
 
 pub fn our_simple_desc_rsp(nwk: u16, endpoint: u8) -> Vec<u8> {
-    let in_clusters: [u16; 2] = [0x0000, 0x0003];
+    // Basic, Identify ve Time: bazı cihazlar (Sonoff TRVZB) saati merkezden okur
+    let in_clusters: [u16; 3] = [0x0000, 0x0003, 0x000A];
     let out_clusters: [u16; 7] = [0x0001, 0x0006, 0x0008, 0x0300, 0x0402, 0x0405, 0x0500];
     let mut desc = vec![endpoint];
     desc.extend_from_slice(&0x0104u16.to_le_bytes());

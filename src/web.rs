@@ -15,7 +15,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio_stream::wrappers::BroadcastStream;
 
-use crate::hub::{Action, Hub};
+use crate::hub::Hub;
 
 const INDEX_HTML: &str = include_str!("../assets/index.html");
 
@@ -27,9 +27,8 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .route("/api/permit_join", post(permit_join))
         .route("/api/hue_reset", post(hue_reset))
         .route("/api/devices/{ieee}", axum::routing::delete(remove))
-        .route("/api/devices/{ieee}/command", post(command))
+        .route("/api/devices/{ieee}/set", post(set))
         .route("/api/devices/{ieee}/rename", post(rename))
-        .route("/api/devices/{ieee}/setting", post(setting))
         .route("/api/devices/{ieee}/interview", post(interview))
         .with_state(hub)
 }
@@ -107,13 +106,15 @@ async fn permit_join(State(hub): State<Arc<Hub>>, Json(body): Json<PermitJoin>) 
     ok()
 }
 
-async fn command(
-    State(hub): State<Arc<Hub>>,
-    Path(ieee): Path<String>,
-    Json(action): Json<Action>,
-) -> ApiResult {
-    hub.command(&ieee, action).await?;
-    ok()
+#[derive(Deserialize)]
+struct SetBody {
+    key: String,
+    value: serde_json::Value,
+}
+
+async fn set(State(hub): State<Arc<Hub>>, Path(ieee): Path<String>, Json(body): Json<SetBody>) -> ApiResult {
+    let pending = hub.set(&ieee, &body.key, body.value).await?;
+    Ok(Json(json!({ "ok": true, "pending": pending })))
 }
 
 #[derive(Deserialize)]
@@ -128,21 +129,6 @@ async fn rename(
 ) -> ApiResult {
     hub.rename(&ieee, &body.name)?;
     ok()
-}
-
-#[derive(Deserialize)]
-struct SettingBody {
-    key: String,
-    value: f64,
-}
-
-async fn setting(
-    State(hub): State<Arc<Hub>>,
-    Path(ieee): Path<String>,
-    Json(body): Json<SettingBody>,
-) -> ApiResult {
-    let pending = hub.set_setting(&ieee, &body.key, body.value).await?;
-    Ok(Json(json!({ "ok": true, "pending": pending })))
 }
 
 async fn interview(State(hub): State<Arc<Hub>>, Path(ieee): Path<String>) -> ApiResult {

@@ -88,7 +88,14 @@
   .slot { display: grid; grid-template-columns: 22px 1fr 1fr; gap: 8px; align-items: center; margin: 4px 0; font-size: 13px; }
   .slot input { font: inherit; width: 100%; padding: 5px 6px; border-radius: 8px; border: 1px solid var(--line); background: var(--card); color: var(--text); }
   .slot span { color: var(--muted); }
-  .menu { display: flex; gap: 8px; }
+  .ctl { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 8px; font-size: 13px; margin: 6px 0; }
+  .ctl > span { color: var(--muted); }
+  .ctl select, .ctl input[type=number] { font: inherit; padding: 5px 8px; border-radius: 8px; border: 1px solid var(--line); background: var(--card); color: var(--text); }
+  .ctl .row { display: flex; gap: 6px; align-items: center; }
+  .ctl input[type=number] { width: 90px; }
+  .ctl .note { grid-column: 1 / -1; color: var(--warn); font-size: 12px; }
+  details.more h4 { font-size: 13px; margin: 12px 0 4px; color: var(--muted); font-weight: 600; }
+  .menu { display: flex; gap: 8px; margin-top: 10px; }
   .menu button { padding: 4px 10px; font-size: 13px; }
   .empty { color: var(--muted); padding: 24px; text-align: center; border: 1px dashed var(--line); border-radius: 14px; }
   #toast {
@@ -169,270 +176,370 @@ function ago(ts) {
   return `${Math.floor(s / 86400)} gün önce`;
 }
 
-function group(d) {
-  const c = d.capabilities;
-  if (c.includes("thermostat")) return "climate";
-  if (c.includes("on_off")) return "lights";
-  if (c.some(x => ["temperature", "humidity", "occupancy", "contact", "motion", "water_leak", "smoke", "alarm"].includes(x))) return "sensors";
-  return "other";
+// ---- Özellik yardımcıları ----
+
+const LABELS = {
+  off: "Kapalı", heat: "Isıt", auto: "Otomatik", manual: "Manuel", program: "Program",
+  "5_2": "5+2 gün", "6_1": "6+1 gün", "7": "7 gün",
+  local_temperature: "Dahili sensör", remote_temperature: "Harici sensör",
+  remote_source_offline: "Harici sensör (çevrimdışı)", boost: "Boost", timer: "Zamanlayıcı",
+};
+const tr = (v) => LABELS[v] ?? v;
+
+// IAS bölge türleri: [ad, alarm var, alarm yok]
+const ZONES = { 0x15: ["Kapı/pencere", "Açık", "Kapalı"], 0x0D: ["Hareket", "Algılandı", "Yok"], 0x2A: ["Su", "Sızıntı!", "Kuru"], 0x28: ["Duman", "Alarm!", "Normal"] };
+
+const feature = (d, key) => d.features.find(f => f.key === key);
+const writable = (f) => f && f.access === "read_write";
+
+function featureLabel(f, d) {
+  if (f.key === "alarm" && ZONES[d.state.zone_type]) return ZONES[d.state.zone_type][0];
+  return f.label;
 }
 
-function value(label, text, alert = false) {
-  return el("div", { className: "value" + (alert ? " alert" : "") }, el("b", { textContent: text }), el("span", { textContent: label }));
-}
-
-function sensorValues(d) {
-  const s = d.state, c = d.capabilities, out = [];
-  if ((c.includes("temperature") || c.includes("thermostat")) && s.temperature != null) out.push(value(c.includes("thermostat") ? "Oda" : "Sıcaklık", `${s.temperature.toFixed(1)} °C`));
-  if (c.includes("humidity") && s.humidity != null) out.push(value("Nem", `%${Math.round(s.humidity)}`));
-  if (c.includes("occupancy") && s.occupancy != null) out.push(value("Varlık", s.occupancy ? "Var" : "Yok", s.occupancy));
-  if (s.alarm != null) {
-    if (c.includes("contact")) out.push(value("Kapı/pencere", s.alarm ? "Açık" : "Kapalı", s.alarm));
-    else if (c.includes("motion")) out.push(value("Hareket", s.alarm ? "Algılandı" : "Yok", s.alarm));
-    else if (c.includes("water_leak")) out.push(value("Su", s.alarm ? "Sızıntı!" : "Kuru", s.alarm));
-    else if (c.includes("smoke")) out.push(value("Duman", s.alarm ? "Alarm!" : "Normal", s.alarm));
-    else if (c.includes("alarm")) out.push(value("Alarm", s.alarm ? "Etkin" : "Normal", s.alarm));
+function formatValue(f, v, d) {
+  if (v == null) return "–";
+  const k = f.kind;
+  if (k.type === "binary") {
+    if (f.key === "alarm") {
+      const z = ZONES[d.state.zone_type];
+      return z ? (v ? z[1] : z[2]) : (v ? "Etkin" : "Normal");
+    }
+    return v ? "Evet" : "Hayır";
   }
-  return out;
+  if (k.type === "enum") return tr(v);
+  if (k.type === "numeric") {
+    const n = Number(v);
+    const text = Number.isInteger(n) ? String(n) : n.toFixed(1);
+    return k.unit ? `${text} ${k.unit}` : text;
+  }
+  return String(v);
 }
 
-function buildCard(d) {
-  const card = el("div", { className: "card" });
+// Aralık: tanımdaki sınırlar, cihazın bildirdikleriyle daraltılmış
+function range(f, d) {
+  const k = f.kind;
+  let min = k.min, max = k.max;
+  if (k.range_keys) {
+    const [lo, hi] = k.range_keys;
+    if (d.state[lo] != null) min = min == null ? d.state[lo] : Math.max(min, d.state[lo]);
+    if (d.state[hi] != null) max = max == null ? d.state[hi] : Math.min(max, d.state[hi]);
+  }
+  return [min, max, k.step ?? 1];
+}
 
-  const name = el("button", { className: "name", title: "Yeniden adlandır" });
-  name.onclick = () => {
-    const current = devices.get(d.ieee);
-    const next = prompt("Cihazın adı", current.name);
-    if (next && next.trim() && next !== current.name) run(api(`/api/devices/${current.ieee}/rename`, { name: next }));
+function setValue(ieee, key, value) {
+  return api(`/api/devices/${ieee}/set`, { key, value }).then(r => {
+    if (r.pending) toast("Cihaz uyanınca uygulanacak (hemen uygulamak için cihazın düğmesine kısa bas).");
+    return r;
+  });
+}
+
+const focused = (...nodes) => nodes.includes(document.activeElement);
+
+// ---- Denetimler: her biri {node, update(d)} ----
+
+function valueTile(key) {
+  const b = el("b"), span = el("span");
+  const node = el("div", { className: "value" }, b, span);
+  return {
+    node,
+    update(d) {
+      const f = feature(d, key), v = d.state[key];
+      node.hidden = !f || v == null;
+      if (!f) return;
+      b.textContent = formatValue(f, v, d);
+      span.textContent = featureLabel(f, d);
+      node.classList.toggle("alert", f.kind.type === "binary" && !!v && ["alarm", "occupancy"].includes(key));
+    },
   };
-  const sub = el("div", { className: "sub" });
-  const toggle = el("input", { type: "checkbox" });
-  toggle.onchange = () => {
-    const thermostat = devices.get(d.ieee).capabilities.includes("thermostat");
-    const body = thermostat
-      ? { action: "system_mode", value: toggle.checked ? "heat" : "off" }
-      : { action: toggle.checked ? "on" : "off" };
-    run(api(`/api/devices/${d.ieee}/command`, body).catch(e => {
-      toggle.checked = !toggle.checked;
-      throw e;
-    }));
+}
+
+function pendingNote(key) {
+  const node = el("div", { className: "note", hidden: true, textContent: "Cihaz uyanınca uygulanacak" });
+  return { node, update(d) { node.hidden = !(d.pending || []).includes(key); } };
+}
+
+// Ayrıntılar'daki genel denetim: türüne göre anahtar, seçim, sayı ya da salt değer
+function control(ieee, f) {
+  const note = pendingNote(f.key);
+  const title = el("span", { textContent: f.kind.unit ? `${f.label} (${f.kind.unit})` : f.label });
+  if (f.access !== "read_write") {
+    const out = el("b", { style: "font-weight:500" });
+    return {
+      node: el("div", { className: "ctl" }, title, out),
+      update(d) { out.textContent = formatValue(f, d.state[f.key], d); title.textContent = featureLabel(f, d); },
+    };
+  }
+  if (f.kind.type === "binary") {
+    const input = el("input", { type: "checkbox" });
+    input.onchange = () => run(setValue(ieee, f.key, input.checked).catch(e => { input.checked = !input.checked; throw e; }));
+    return {
+      node: el("div", { className: "ctl" }, title, el("label", { className: "switch" }, input, el("span")), note.node),
+      update(d) { if (!focused(input)) input.checked = !!d.state[f.key]; note.update(d); },
+    };
+  }
+  if (f.kind.type === "enum") {
+    const select = el("select", {}, ...f.kind.values.map(v => el("option", { value: v, textContent: tr(v) })));
+    select.onchange = () => run(setValue(ieee, f.key, select.value));
+    return {
+      node: el("div", { className: "ctl" }, title, select, note.node),
+      update(d) { if (!focused(select) && d.state[f.key] != null) select.value = d.state[f.key]; note.update(d); },
+    };
+  }
+  if (f.kind.type === "numeric") {
+    const input = el("input", { type: "number" });
+    const save = el("button", { textContent: "Kaydet" });
+    let last;
+    save.onclick = () => run(setValue(ieee, f.key, Number(input.value)).then(r => { if (!r.pending) toast(`${f.label} kaydedildi`); }));
+    return {
+      node: el("div", { className: "ctl" }, title, el("div", { className: "row" }, input, save), note.node),
+      update(d) {
+        const [min, max, step] = range(f, d);
+        Object.assign(input, { min: min ?? "", max: max ?? "", step });
+        // Kaydedilmemiş girişi ezme: yalnızca cihazın değeri değiştiyse güncelle
+        const v = d.state[f.key];
+        if (!focused(input) && v !== last) { input.value = v ?? ""; last = v; }
+        note.update(d);
+      },
+    };
+  }
+  if (f.kind.type === "schedule") return scheduleControl(ieee, f);
+  return { node: el("div"), update() {} };
+}
+
+// Haftalık program: dilim sayısı cihazın bildirdiği düzende sabit
+function scheduleControl(ieee, f) {
+  const box = el("div", { className: "schedule" });
+  let inputs = [], last;
+  const groups = (d, n) => d.state.working_week === "5_2" && n === 8
+    ? [["Hafta içi (Pzt–Cum)", 0, 6], ["Hafta sonu (Cmt–Paz)", 6, 8]]
+    : [["Dilimler", 0, n]];
+  return {
+    node: box,
+    update(d) {
+      const slots = d.state[f.key];
+      const json = JSON.stringify(slots);
+      if (!Array.isArray(slots) || json === last) return;
+      last = json;
+      const [min, max, step] = [f.kind.min, f.kind.max, f.kind.step];
+      const rows = [];
+      inputs = [];
+      for (const [title, from, to] of groups(d, slots.length)) {
+        rows.push(el("h4", { textContent: title }));
+        for (let i = from; i < to; i++) {
+          const time = el("input", { type: "time", value: slots[i].time });
+          const temp = el("input", { type: "number", min, max, step, value: slots[i].temperature });
+          inputs.push({ time, temp });
+          rows.push(el("div", { className: "slot" }, el("span", { textContent: `${i - from + 1}.` }), time, temp));
+        }
+      }
+      const save = el("button", { textContent: "Programı kaydet" });
+      save.onclick = () => {
+        const value = inputs.map(({ time, temp }) => ({ time: time.value, temperature: Number(temp.value) }));
+        run(setValue(ieee, f.key, value).then(() => toast("Program gönderildi")));
+      };
+      box.replaceChildren(el("h4", { textContent: `${f.label} (saat · °C)` }), ...rows, save);
+    },
   };
-  const sw = el("label", { className: "switch", hidden: true }, toggle, el("span"));
-  card.append(el("div", { className: "top" }, el("div", { className: "names" }, name, sub), sw));
+}
 
-  const values = el("div", { className: "values" });
-  card.append(values);
+// ---- Kartlar ----
 
+function lightControls(ieee) {
   const level = el("input", { type: "range", min: 1, max: 254 });
   const levelText = el("span");
   level.oninput = () => levelText.textContent = `%${Math.round(level.value / 2.54)}`;
-  level.onchange = () => run(api(`/api/devices/${d.ieee}/command`, { action: "level", value: Number(level.value) }));
-  const levelRow = el("label", { className: "slider", hidden: true }, "Parlaklık", level, levelText);
+  level.onchange = () => run(setValue(ieee, "level", Number(level.value)));
+  const levelRow = el("label", { className: "slider" }, "Parlaklık", level, levelText);
 
   const ct = el("input", { type: "range" });
   const ctText = el("span");
   ct.oninput = () => ctText.textContent = `${Math.round(1e6 / ct.value / 100) * 100}K`;
-  ct.onchange = () => run(api(`/api/devices/${d.ieee}/command`, { action: "color_temp", value: Number(ct.value) }));
-  const ctRow = el("label", { className: "slider", hidden: true }, "Renk", ct, ctText);
-  // Hedef sıcaklık: art arda tıklamalar tek komutta birleşir
+  ct.onchange = () => run(setValue(ieee, "color_temp", Number(ct.value)));
+  const ctRow = el("label", { className: "slider" }, "Renk", ct, ctText);
+
+  return {
+    node: el("div", {}, levelRow, ctRow),
+    update(d) {
+      levelRow.hidden = !writable(feature(d, "level"));
+      if (!focused(level) && d.state.level != null) { level.value = d.state.level; level.oninput(); }
+      const f = feature(d, "color_temp");
+      ctRow.hidden = !writable(f);
+      if (f) {
+        const [min, max] = range(f, d);
+        Object.assign(ct, { min: min ?? 153, max: max ?? 500 });
+        if (!focused(ct) && d.state.color_temp != null) { ct.value = d.state.color_temp; ct.oninput(); }
+      }
+    },
+  };
+}
+
+function thermostatControls(ieee) {
+  const room = valueTile("temperature");
   const target = el("span", { className: "target" });
-  let pendingSetpoint = null, setpointTimer = null;
-  const showSetpoint = (v) => target.textContent = v == null ? "–" : `${v.toFixed(1)} °C`;
-  const stepSetpoint = (dir) => {
-    const current = devices.get(d.ieee);
-    const [min, max, step] = current.setpoint_range || [5, 35, 0.5];
-    const base = pendingSetpoint ?? current.state.setpoint ?? 20;
-    pendingSetpoint = Math.min(max, Math.max(min, Math.round((base + dir * step) / step) * step));
-    showSetpoint(pendingSetpoint);
-    clearTimeout(setpointTimer);
-    setpointTimer = setTimeout(() => {
-      const value = pendingSetpoint;
-      run(api(`/api/devices/${d.ieee}/command`, { action: "setpoint", value }).finally(() => { pendingSetpoint = null; }));
+  let pending = null, timer = null;
+  const show = (v) => target.textContent = v == null ? "–" : `${Number(v).toFixed(1)} °C`;
+  let current = {};
+  const step = (dir) => {
+    const f = feature(current, "setpoint");
+    const [min, max, stepSize] = range(f, current);
+    const base = pending ?? current.state.setpoint ?? 20;
+    pending = Math.min(max ?? 99, Math.max(min ?? 0, Math.round((base + dir * stepSize) / stepSize) * stepSize));
+    show(pending);
+    // Art arda tıklamalar tek komutta birleşir
+    clearTimeout(timer);
+    timer = setTimeout(() => {
+      const value = pending;
+      run(setValue(ieee, "setpoint", value).finally(() => { pending = null; }));
     }, 800);
   };
   const minus = el("button", { className: "step", textContent: "−", title: "Azalt" });
   const plus = el("button", { className: "step", textContent: "+", title: "Artır" });
-  minus.onclick = () => stepSetpoint(-1);
-  plus.onclick = () => stepSetpoint(1);
-  const preset = el("select", {},
-    el("option", { value: "manual", textContent: "Manuel" }),
-    el("option", { value: "program", textContent: "Program" }));
-  preset.onchange = () => run(api(`/api/devices/${d.ieee}/command`, { action: "preset", value: preset.value }));
-  const frost = el("input", { type: "checkbox" });
-  frost.onchange = () => run(api(`/api/devices/${d.ieee}/command`, { action: "frost", value: frost.checked }));
-  const childLock = el("input", { type: "checkbox" });
-  childLock.onchange = () => run(api(`/api/devices/${d.ieee}/command`, { action: "child_lock", value: childLock.checked }));
-  const week = el("select", { title: "Haftalık programın gün düzeni" },
-    el("option", { value: "5_2", textContent: "5+2 gün" }),
-    el("option", { value: "6_1", textContent: "6+1 gün" }),
-    el("option", { value: "7", textContent: "7 gün" }));
-  week.onchange = () => run(api(`/api/devices/${d.ieee}/command`, { action: "working_week", value: week.value }));
-  const thermoRow = el("div", { className: "thermo", hidden: true }, minus, target, plus, preset, week,
-    el("label", { className: "check" }, frost, "Donma koruması"),
-    el("label", { className: "check" }, childLock, "Çocuk kilidi"));
-  const isPending = () => pendingSetpoint != null;
-  card.append(levelRow, ctRow, thermoRow);
+  minus.onclick = () => step(-1);
+  plus.onclick = () => step(1);
+  const setpointRow = el("div", { className: "thermo" }, minus, target, plus);
+  return {
+    node: el("div", {}, el("div", { className: "values" }, room.node), setpointRow),
+    update(d) {
+      current = d;
+      room.update(d);
+      setpointRow.hidden = !writable(feature(d, "setpoint"));
+      if (pending == null) show(d.state.setpoint);
+    },
+  };
+}
+
+// Kart düzeninin kullandığı anahtarlar; geri kalan "kart" özellikleri genel denetim alır
+const CONSUMED = {
+  light: ["on", "level", "color_temp"],
+  thermostat: ["temperature", "setpoint", "heating"],
+  sensor: [],
+  generic: [],
+};
+const CHIP_KEYS = ["battery", "battery_low", "fault"];
+
+function buildCard(d) {
+  const ieee = d.ieee;
+  const updaters = [];
+  const card = el("div", { className: "card" });
+
+  const name = el("button", { className: "name", title: "Yeniden adlandır" });
+  name.onclick = () => {
+    const current = devices.get(ieee);
+    const next = prompt("Cihazın adı", current.name);
+    if (next && next.trim() && next !== current.name) run(api(`/api/devices/${ieee}/rename`, { name: next }));
+  };
+  const sub = el("div", { className: "sub" });
+  const top = el("div", { className: "top" }, el("div", { className: "names" }, name, sub));
+  card.append(top);
+
+  // Işıkta başlıkta aç/kapa anahtarı
+  if (d.card === "light" && writable(feature(d, "on"))) {
+    const toggle = el("input", { type: "checkbox" });
+    toggle.onchange = () => run(setValue(ieee, "on", toggle.checked).catch(e => { toggle.checked = !toggle.checked; throw e; }));
+    top.append(el("label", { className: "switch" }, toggle, el("span")));
+    updaters.push(d => { if (!focused(toggle)) toggle.checked = !!d.state.on; });
+  }
+  if (d.card === "light") {
+    const c = lightControls(ieee); card.append(c.node); updaters.push(c.update);
+  }
+  if (d.card === "thermostat") {
+    const c = thermostatControls(ieee); card.append(c.node); updaters.push(c.update);
+  }
+
+  // Kalan "kart" özellikleri: salt okunurlar değer olarak, yazılabilirler denetim olarak
+  const consumed = new Set([...(CONSUMED[d.card] || []), ...CHIP_KEYS]);
+  const cardFeatures = d.features.filter(f => f.place === "card" && !consumed.has(f.key));
+  const tiles = cardFeatures.filter(f => !writable(f)).map(f => valueTile(f.key));
+  if (tiles.length) {
+    card.append(el("div", { className: "values" }, ...tiles.map(t => t.node)));
+    tiles.forEach(t => updaters.push(t.update));
+  }
+  for (const f of cardFeatures.filter(writable)) {
+    const c = control(ieee, f); card.append(c.node); updaters.push(c.update);
+  }
 
   const chips = el("div", { className: "chips" });
   card.append(chips);
+  updaters.push(d => chips.replaceChildren(...chipList(d)));
+
+  // Ayrıntılar: bilgi, ayarlar, tanı
+  const info = el("dl", { className: "info" });
+  updaters.push(d => info.replaceChildren(...infoRows(d)));
+  const config = d.features.filter(f => f.place === "config").map(f => control(ieee, f));
+  const diagnostic = d.features.filter(f => f.place === "diagnostic").map(f => control(ieee, f));
+  [...config, ...diagnostic].forEach(c => updaters.push(c.update));
 
   const reinterview = el("button", { textContent: "Yeniden tanı" });
-  reinterview.onclick = () => run(api(`/api/devices/${d.ieee}/interview`).then(r => toast(r.waiting_for_wake
+  reinterview.onclick = () => run(api(`/api/devices/${ieee}/interview`).then(r => toast(r.waiting_for_wake
     ? "Pilli cihaz: düğmesine kısa basarak uyandır, tanıma o an başlayacak."
     : "Cihaz yeniden tanınıyor.")));
   const remove = el("button", { textContent: "Kaldır" });
   remove.onclick = () => {
-    const current = devices.get(d.ieee);
-    if (confirm(`"${current.name}" ağdan çıkarılsın mı?`)) run(api(`/api/devices/${d.ieee}`, null, "DELETE"));
+    const current = devices.get(ieee);
+    if (confirm(`"${current.name}" ağdan çıkarılsın mı?`)) run(api(`/api/devices/${ieee}`, null, "DELETE"));
   };
-  const info = el("dl", { className: "info" });
-  const scheduleBox = el("div");
-  const settings = el("div");
   card.append(el("details", { className: "more" },
     el("summary", { textContent: "Ayrıntılar" }),
-    info, settings, scheduleBox,
+    info,
+    config.length ? el("h4", { textContent: "Ayarlar" }) : null, ...config.map(c => c.node),
+    diagnostic.length ? el("h4", { textContent: "Tanı" }) : null, ...diagnostic.map(c => c.node),
     el("div", { className: "menu" }, reinterview, remove)));
 
-  return { info, settings, scheduleBox, settingRows: new Map(), card, name, sub, sw, toggle, values, level, levelText, levelRow, ct, ctText, ctRow, chips,
-    thermoRow, showSetpoint, isPending, preset, frost, childLock, week, schedule: el("div", { className: "schedule" }), scheduleInputs: [] };
+  updaters.push(d => {
+    name.textContent = d.name;
+    sub.textContent = [d.manufacturer, d.model].filter(Boolean).join(" · ") || d.ieee;
+  });
+
+  return { card, update: (d) => updaters.forEach(u => u(d)) };
 }
 
-function updateCard(parts, d) {
-  const s = d.state, c = d.capabilities;
-  parts.name.textContent = d.name;
-  parts.sub.textContent = [d.manufacturer, d.model].filter(Boolean).join(" · ") || d.ieee;
+function chipList(d) {
+  const s = d.state, chips = [];
+  const chip = (text, cls = "") => el("span", { className: `chip ${cls}`, textContent: text });
+  if (d.interviewing) chips.push(chip("Tanınıyor…"));
+  else if (d.waiting_for_wake) chips.push(chip("Uyanınca tanınacak", "warn"));
+  else if (!d.interviewed) chips.push(chip("Tanınamadı", "warn"));
+  if (feature(d, "heating") && s.heating != null) chips.push(s.heating ? chip("Isıtıyor", "heat") : chip("Beklemede"));
+  if (s.fault) chips.push(chip(`Arıza kodu ${s.fault}`, "warn"));
+  if (s.battery != null) chips.push(chip(`Pil %${Math.round(s.battery)}`, s.battery < 15 ? "warn" : ""));
+  if (s.battery_low) chips.push(chip("Pil zayıf", "warn"));
+  if ((d.pending || []).length) chips.push(chip("Ayar bekliyor", "warn"));
+  if (d.rssi != null) chips.push(el("span", { className: "chip" + (d.rssi < -80 ? " warn" : ""), textContent: `Sinyal ${d.rssi} dBm`, title: `LQI ${d.lqi ?? "?"}` }));
+  chips.push(chip(ago(d.last_seen)));
+  return chips;
+}
 
-  const thermostat = c.includes("thermostat");
-  parts.sw.hidden = !c.includes("on_off") && !thermostat;
-  if (document.activeElement !== parts.toggle) parts.toggle.checked = thermostat ? s.system_mode === "heat" : !!s.on;
-
-  parts.thermoRow.hidden = !thermostat;
-  if (thermostat) {
-    if (!parts.isPending()) parts.showSetpoint(s.setpoint);
-    if (document.activeElement !== parts.preset && s.preset) parts.preset.value = s.preset;
-    if (document.activeElement !== parts.frost) parts.frost.checked = !!s.frost;
-    if (document.activeElement !== parts.childLock) parts.childLock.checked = !!s.child_lock;
-    if (document.activeElement !== parts.week && s.working_week) parts.week.value = s.working_week;
-  }
-  updateSchedule(parts, d);
-
-  parts.levelRow.hidden = !c.includes("level");
-  if (document.activeElement !== parts.level && s.level != null) {
-    parts.level.value = s.level;
-    parts.level.oninput();
-  }
-
-  parts.ctRow.hidden = !c.includes("color_temp");
-  parts.ct.min = d.color_temp_min || 153;
-  parts.ct.max = d.color_temp_max || 500;
-  if (document.activeElement !== parts.ct && s.color_temp != null) {
-    parts.ct.value = s.color_temp;
-    parts.ct.oninput();
-  }
-
-  parts.values.replaceChildren(...sensorValues(d));
-
+function infoRows(d) {
   const kind = d.router ? "Yönlendirici (şebeke)" : d.rx_on_when_idle ? "Uç cihaz" : "Pilli uç cihaz (uyuyan)";
-  const rows = [
+  return [
     ["IEEE", d.ieee],
     ["Ağ adresi", "0x" + d.nwk.toString(16).padStart(4, "0")],
     ["Üretici", d.manufacturer],
     ["Model", d.model],
     ["Yazılım", d.firmware],
     ["Tür", kind],
-    ["Pil voltajı", s.voltage != null ? `${s.voltage.toFixed(1)} V` : null],
-  ].filter(([, v]) => v != null && v !== "");
-  parts.info.replaceChildren(...rows.flatMap(([k, v]) => [el("dt", { textContent: k }), el("dd", { textContent: v })]));
-  updateSettings(parts, d);
-
-  const chips = [];
-  if (s.fault) chips.push(el("span", { className: "chip warn", textContent: `Arıza kodu ${s.fault}` }));
-  if (s.heating) chips.push(el("span", { className: "chip heat", textContent: "Isıtıyor" }));
-  else if (thermostat && s.heating === false) chips.push(el("span", { className: "chip", textContent: "Beklemede" }));
-  if (d.interviewing) chips.push(el("span", { className: "chip", textContent: "Tanınıyor…" }));
-  else if (d.waiting_for_wake) chips.push(el("span", { className: "chip warn", textContent: "Uyanınca tanınacak" }));
-  else if (!d.interviewed) chips.push(el("span", { className: "chip warn", textContent: "Tanınamadı" }));
-  if (s.battery != null) chips.push(el("span", { className: "chip" + (s.battery < 15 ? " warn" : ""), textContent: `Pil %${s.battery}` }));
-  if (s.battery_low) chips.push(el("span", { className: "chip warn", textContent: "Pil zayıf" }));
-  if (d.rssi != null) {
-    // Kabaca: -60 dBm üstü iyi, -80 altı zayıf
-    const weak = d.rssi < -80;
-    chips.push(el("span", { className: "chip" + (weak ? " warn" : ""), textContent: `Sinyal ${d.rssi} dBm`, title: `LQI ${d.lqi ?? "?"}` }));
-  } else if (d.lqi != null) {
-    chips.push(el("span", { className: "chip", textContent: `LQI ${d.lqi}` }));
-  }
-  chips.push(el("span", { className: "chip", textContent: ago(d.last_seen) }));
-  parts.chips.replaceChildren(...chips);
+  ].filter(([, v]) => v != null && v !== "")
+    .flatMap(([k, v]) => [el("dt", { textContent: k }), el("dd", { textContent: v })]);
 }
 
-function updateSettings(parts, d) {
-  for (const def of d.settings_schema || []) {
-    let row = parts.settingRows.get(def.key);
-    if (!row) {
-      const input = el("input", { type: "number", min: def.min, max: def.max, step: def.step });
-      const save = el("button", { textContent: "Kaydet" });
-      const note = el("div", { className: "note", hidden: true, textContent: "Cihaz uyanınca uygulanacak (hemen uygulamak için cihazın düğmesine kısa bas)." });
-      save.onclick = () => {
-        const value = Number(input.value);
-        run(api(`/api/devices/${d.ieee}/setting`, { key: def.key, value }).then(r => {
-          if (!r.pending) toast(`${def.label} kaydedildi`);
-        }));
-      };
-      row = { input, note };
-      parts.settingRows.set(def.key, row);
-      parts.settings.append(el("div", { className: "setting" },
-        el("span", { textContent: `${def.label} (${def.unit})` }), input, save, note));
-    }
-    const current = d.settings?.[def.key];
-    if (document.activeElement !== row.input && current != null) row.input.value = current;
-    row.note.hidden = !(d.pending_settings || []).includes(def.key);
-  }
-}
+const GROUPS = { thermostat: "climate", light: "lights", sensor: "sensors", generic: "other" };
 
-// Programın dilimleri cihazdan geldiği düzende; 5+2'de 8 dilim = 6 hafta içi + 2 hafta sonu
-function scheduleGroups(d) {
-  const n = d.state.schedule.length;
-  if (d.state.working_week === "5_2" && n === 8) return [["Hafta içi (Pzt–Cum)", 0, 6], ["Hafta sonu (Cmt–Paz)", 6, 8]];
-  return [["Program", 0, n]];
-}
-
-function updateSchedule(parts, d) {
-  const slots = d.state.schedule;
-  if (!slots) { parts.scheduleBox.replaceChildren(); parts.scheduleInputs = []; return; }
-  const editing = parts.scheduleInputs.some(({ time, temp }) => document.activeElement === time || document.activeElement === temp);
-  if (editing) return;
-  const [min, max] = d.setpoint_range || [5, 35];
-  const rows = [], inputs = [];
-  for (const [title, from, to] of scheduleGroups(d)) {
-    rows.push(el("h4", { textContent: title }));
-    for (let i = from; i < to; i++) {
-      const time = el("input", { type: "time", value: slots[i].time });
-      const temp = el("input", { type: "number", min, max, step: 0.5, value: slots[i].temperature });
-      inputs.push({ time, temp });
-      rows.push(el("div", { className: "slot" }, el("span", { textContent: `${i - from + 1}.` }), time, temp));
-    }
-  }
-  const save = el("button", { textContent: "Programı kaydet" });
-  save.onclick = () => {
-    const value = inputs.map(({ time, temp }) => ({ time: time.value, temperature: Number(temp.value) }));
-    run(api(`/api/devices/${d.ieee}/command`, { action: "schedule", value }).then(() => toast("Program gönderildi")));
-  };
-  parts.scheduleInputs = inputs;
-  parts.scheduleBox.replaceChildren(el("div", { className: "schedule" },
-    el("h4", { textContent: "Haftalık program (saat · °C)" }), ...rows, save));
-}
+// Tanım değişirse (ör. tanıma sonrası model öğrenildi) kart baştan kurulur
+const signature = (d) => d.card + "|" + d.features.map(f => f.key + f.access + f.place).join(",");
 
 function render() {
   const sorted = [...devices.values()].sort((a, b) => a.name.localeCompare(b.name, "tr"));
   const groups = { climate: [], lights: [], sensors: [], other: [] };
   for (const d of sorted) {
-    let parts = cards.get(d.ieee);
-    if (!parts) {
-      parts = buildCard(d);
-      cards.set(d.ieee, parts);
+    let entry = cards.get(d.ieee);
+    if (!entry || entry.signature !== signature(d)) {
+      entry = { ...buildCard(d), signature: signature(d) };
+      cards.set(d.ieee, entry);
     }
-    updateCard(parts, d);
-    groups[group(d)].push(parts.card);
+    entry.update(d);
+    groups[GROUPS[d.card] || "other"].push(entry.card);
   }
   for (const [id, list] of Object.entries(groups)) {
     const container = $("#" + id);

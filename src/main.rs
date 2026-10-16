@@ -1,6 +1,6 @@
 mod hub;
 mod hue_reset;
-mod profiles;
+mod devices;
 mod radio;
 mod sniff;
 mod store;
