@@ -40,7 +40,7 @@ impl NodeDescriptor {
 fn check_status(payload: &[u8]) -> Result<&[u8]> {
     match payload.first() {
         Some(&STATUS_SUCCESS) => Ok(&payload[1..]),
-        Some(&status) => bail!("ZDO durum kodu 0x{status:02x}"),
+        Some(&status) => bail!("ZDO status 0x{status:02x}"),
         None => bail!("empty ZDO response"),
     }
 }

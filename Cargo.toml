@@ -2,7 +2,7 @@
 name = "zhub"
 version = "0.1.0"
 edition = "2024"
-description = "Ziggurat Zigbee yığını üzerinde hafif bir ev otomasyonu merkezi"
+description = "A lightweight Zigbee hub on the Ziggurat stack"
 license = "Apache-2.0"
 
 [dependencies]

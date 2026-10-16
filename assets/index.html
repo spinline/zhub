@@ -84,6 +84,8 @@
   .ctl input[type=number] { width: 96px; }
   .ctl .note { grid-column: 1 / -1; color: var(--warn); font-size: 12px; }
   .ctl .ro { font-weight: 600; }
+  .ctl .presets { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 4px; }
+  .ctl .presets button { padding: 2px 10px; font-size: 12px; }
   .card-foot { display: flex; justify-content: flex-end; }
   .card-foot button { padding: 4px 12px; font-size: 13px; }
   .empty { color: var(--muted); padding: 24px; text-align: center; border: 1px dashed var(--line); border-radius: 14px; }
@@ -209,13 +211,14 @@ const LABELS = {
   local_temperature: "Built-in sensor", remote_temperature: "External sensor",
   remote_source_offline: "External sensor (offline)", boost: "Boost", timer: "Timer",
 };
-const label = (v) => LABELS[v] ?? v;
+// Option names without a label: "stop_hue_effect" → "Stop hue effect"
+const label = (v) => LABELS[v] ?? (typeof v === "string" ? (v.charAt(0).toUpperCase() + v.slice(1)).replaceAll("_", " ") : v);
 
 // IAS zone types: [name, alarm on, alarm off]
 const ZONES = { 0x15: ["Contact", "Open", "Closed"], 0x0D: ["Motion", "Detected", "Clear"], 0x2A: ["Water leak", "Leak!", "Dry"], 0x28: ["Smoke", "Alarm!", "Clear"] };
 
 const feature = (d, key) => d.features.find(f => f.key === key);
-const writable = (f) => f && f.access === "read_write";
+const writable = (f) => f && (f.access === "read_write" || f.access === "write");
 
 function featureLabel(f, d) {
   if (f.key === "alarm" && ZONES[d.state.zone_type]) return ZONES[d.state.zone_type][0];
@@ -235,6 +238,8 @@ function formatValue(f, v, d) {
   }
   if (k.type === "enum") return label(v);
   if (k.type === "numeric") {
+    // A special value such as "previous"
+    if (typeof v === "string") return label(v);
     const n = Number(v);
     const text = Number.isInteger(n) ? String(n) : n.toFixed(1);
     return k.unit ? `${text} ${k.unit}` : text;
@@ -292,6 +297,29 @@ function control(ieee, f) {
   };
   const row = (widget) => el("div", { className: "ctl" }, title, widget, desc, note);
 
+  // Commands (identify, effects): sent, never read back
+  if (f.access === "write" && f.kind.type === "enum") {
+    if (f.kind.values.length === 1) {
+      const button = el("button", { textContent: label(f.kind.values[0]) });
+      button.onclick = () => run(setValue(ieee, f.key, f.kind.values[0]));
+      return { node: row(button), update(d) { setTitle(d); } };
+    }
+    const placeholder = el("option", { value: "", textContent: "Choose…" });
+    const select = el("select", {}, placeholder, ...f.kind.values.map(v => el("option", { value: v, textContent: label(v) })));
+    select.onchange = () => {
+      const value = select.value;
+      select.value = "";
+      if (value) run(setValue(ieee, f.key, value));
+    };
+    return {
+      node: row(select),
+      update(d) {
+        setTitle(d);
+        const v = d.state[f.key];
+        placeholder.textContent = v != null && v !== "none" ? `${label(v)} (active)` : "Choose…";
+      },
+    };
+  }
   if (f.access !== "read_write") {
     const out = el("span", { className: "ro" });
     return { node: row(out), update(d) { setTitle(d); out.textContent = formatValue(f, d.state[f.key], d); } };
@@ -316,16 +344,30 @@ function control(ieee, f) {
     const input = el("input", { type: "number" });
     const save = el("button", { textContent: "Save" });
     let last;
-    save.onclick = () => run(setValue(ieee, f.key, Number(input.value)).then(r => { if (!r.pending) toast(`${f.label} saved`); }));
+    const send = (value) => run(setValue(ieee, f.key, value).then(r => { if (!r.pending) toast(`${f.label} saved`); }));
+    save.onclick = () => send(Number(input.value));
+    // Presets: shortcuts for a value, or special values such as "previous"
+    const presets = (f.presets || []).map(p => {
+      const b = el("button", { textContent: label(p.name), title: p.description });
+      b.onclick = () => send(p.name);
+      return b;
+    });
+    const node = row(el("div", { className: "row" }, input, save));
+    if (presets.length) node.insertBefore(el("div", { className: "presets" }, ...presets), node.querySelector(".note"));
     return {
-      node: row(el("div", { className: "row" }, input, save)),
+      node,
       update(d) {
         setTitle(d);
         const [min, max, step] = range(f, d);
         Object.assign(input, { min: min ?? "", max: max ?? "", step });
         // Do not overwrite unsaved input: only follow changes of the device's value
         const v = d.state[f.key];
-        if (!focused(input) && v !== last) { input.value = v ?? ""; last = v; }
+        if (!focused(input) && v !== last) {
+          const special = typeof v === "string";
+          input.value = special ? "" : v ?? "";
+          input.placeholder = special ? label(v) : "";
+          last = v;
+        }
       },
     };
   }
@@ -392,7 +434,9 @@ function lightControls(ieee) {
   return {
     node: el("div", {}, levelRow, ctRow),
     update(d) {
-      levelRow.hidden = !writable(feature(d, "level"));
+      const lf = feature(d, "level");
+      levelRow.hidden = !writable(lf);
+      if (lf) { const [min, max] = range(lf, d); Object.assign(level, { min: min ?? 1, max: max ?? 254 }); }
       if (!focused(level) && d.state.level != null) { level.value = d.state.level; level.oninput(); }
       const f = feature(d, "color_temp");
       ctRow.hidden = !writable(f);

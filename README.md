@@ -8,7 +8,7 @@ Zigbee2MQTT needed: a single static binary with an embedded web UI.
   `/opt/var/lib/zhub/state.json`.
 - Interviews joining devices (ZDO), binds their clusters to the hub and configures
   reporting.
-- Lights: on/off, brightness, color temperature.
+- Lights: on/off, brightness, color temperature, startup and transition settings, effects.
 - Sensors: temperature, humidity, occupancy, IAS zones (contact, motion, water), battery.
 - Thermostats: SONOFF TRVZB (ZCL thermostat cluster) and Tuya thermostats (datapoints),
   including weekly schedules where supported.
@@ -34,7 +34,8 @@ Adding a device: open its definition in Zigbee2MQTT (`zigbee-herdsman-converters
 write the same information as a `Definition` in `devices/<vendor>.rs` and add it to the
 list in `devices/mod.rs`. Feature labels and descriptions are taken from Zigbee2MQTT.
 
-Defined devices: SONOFF SNZB-02P, SONOFF TRVZB, Tuya ZWT07 (`_TZE200_g9a3awaj`).
+Defined devices: Philips Hue LTA009, SONOFF SNZB-02D, SONOFF SNZB-02P, SONOFF TRVZB,
+Tuya ZWT07 (`_TZE200_g9a3awaj`).
 
 ## Hardware
 

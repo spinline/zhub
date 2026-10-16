@@ -7,10 +7,11 @@
 //! has more detail).
 
 pub mod common;
+pub mod philips;
 pub mod sonoff;
 pub mod tuya;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use serde_json::{Value as Json, json};
 
@@ -22,6 +23,8 @@ use crate::zcl::cluster;
 pub enum Access {
     Read,
     ReadWrite,
+    /// Commands such as identify or effects: sent, never read
+    Write,
 }
 
 /// Where the feature appears in the UI
@@ -153,6 +156,52 @@ pub struct Report {
     pub change: u64,
 }
 
+/// A named value of a numeric feature. Inside the value range it is a shortcut (e.g.
+/// "coolest"); outside it is a special value the device reports as such (e.g. 0xFFFF
+/// "previous"), which then shows by its name.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct Preset {
+    pub name: &'static str,
+    #[serde(skip)]
+    pub raw: i64,
+    pub description: &'static str,
+}
+
+/// Cluster commands that carry no state of their own
+#[derive(Debug, Clone, Copy)]
+pub enum Command {
+    /// Identify cluster: makes the device identify itself for a few seconds
+    Identify,
+    /// The Hue effect list: ZCL Trigger Effect or Signify's effect command
+    HueEffect,
+}
+
+/// One ZCL cluster command to send
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandFrame {
+    pub cluster: u16,
+    pub manufacturer: Option<u16>,
+    pub command: u8,
+    pub payload: Vec<u8>,
+}
+
+impl Command {
+    pub fn frames(&self, value: &Json) -> Result<Vec<CommandFrame>> {
+        match self {
+            Self::Identify => Ok(vec![common::identify_frame()]),
+            Self::HueEffect => philips::effect_frames(value.as_str().unwrap_or_default()),
+        }
+    }
+
+    /// The state the command leaves behind, if any
+    pub fn state_after(&self, value: &Json) -> Option<Json> {
+        match self {
+            Self::Identify => None,
+            Self::HueEffect => philips::effect_state(value.as_str().unwrap_or_default()).map(|s| json!(s)),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum Source {
     Attr {
@@ -170,14 +219,24 @@ pub enum Source {
     },
     /// Tuya's raw weekly schedule (4-byte slots)
     TuyaSchedule { dp: u8, divisor: f64 },
+    Command(Command),
 }
 
 impl Source {
-    const fn writable(&self) -> bool {
-        match self {
+    const fn access(&self) -> Access {
+        let writable = match self {
             Self::Attr { write, .. } => !matches!(write, Write::No),
             Self::Tuya { conv, .. } => matches!(conv, Conv::Number { .. } | Conv::Bool { .. } | Conv::Enum(_)),
             Self::TuyaSchedule { .. } => true,
+            Self::Command(_) => return Access::Write,
+        };
+        if writable { Access::ReadWrite } else { Access::Read }
+    }
+
+    const fn conv(&self) -> Option<Conv> {
+        match *self {
+            Self::Attr { conv, .. } | Self::Tuya { conv, .. } => Some(conv),
+            Self::TuyaSchedule { .. } | Self::Command(_) => None,
         }
     }
 }
@@ -191,26 +250,29 @@ pub struct Feature {
     pub kind: Kind,
     pub access: Access,
     pub place: Place,
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    pub presets: &'static [Preset],
     #[serde(skip)]
     pub source: Source,
 }
 
 impl Feature {
     pub const fn new(key: &'static str, label: &'static str, kind: Kind, place: Place, source: Source) -> Self {
-        let access = if source.writable() {
-            Access::ReadWrite
-        } else {
-            Access::Read
-        };
         Self {
             key,
             label,
             description: "",
             kind,
-            access,
+            access: source.access(),
             place,
+            presets: &[],
             source,
         }
+    }
+
+    pub const fn presets(mut self, presets: &'static [Preset]) -> Self {
+        self.presets = presets;
+        self
     }
 
     /// The help text shown under the feature (taken from Zigbee2MQTT where it has one)
@@ -223,6 +285,36 @@ impl Feature {
     pub const fn read_only(mut self) -> Self {
         self.access = Access::Read;
         self
+    }
+
+    /// A preset outside the definition's value range: a special value, shown by name
+    fn special_preset(&self, raw: i64) -> Option<&'static Preset> {
+        let Kind::Numeric { min, max, .. } = self.kind else {
+            return None;
+        };
+        let preset = self.presets.iter().find(|p| p.raw == raw)?;
+        let value = self.source.conv()?.decode_int(raw)?.as_f64()?;
+        let outside = min.is_some_and(|m| value < m - 1e-9) || max.is_some_and(|m| value > m + 1e-9);
+        outside.then_some(preset)
+    }
+
+    /// Decodes a raw value the device reported
+    pub fn decode_int(&self, raw: i64) -> Option<Json> {
+        if let Some(preset) = self.special_preset(raw) {
+            return Some(json!(preset.name));
+        }
+        self.source.conv()?.decode_int(raw)
+    }
+
+    /// Converts a validated value to the raw integer to write
+    pub fn encode(&self, value: &Json) -> Result<i64> {
+        if let Some(preset) = value.as_str().and_then(|name| self.presets.iter().find(|p| p.name == name)) {
+            return Ok(preset.raw);
+        }
+        match self.source.conv() {
+            Some(conv) => conv.encode(value),
+            None => bail!("{} has no raw value", self.label),
+        }
     }
 
     pub fn matches_dp(&self, id: u8) -> bool {
@@ -252,10 +344,24 @@ impl Feature {
 
     /// Validates a value to be written and snaps numbers to the step
     pub fn validate(&self, device: &Device, value: Json) -> Result<Json> {
-        if self.access != Access::ReadWrite {
+        if self.access == Access::Read {
             bail!("{} is read-only", self.label);
         }
         match self.kind {
+            Kind::Numeric { .. } if value.is_string() => {
+                let name = value.as_str().unwrap_or_default();
+                let Some(preset) = self.presets.iter().find(|p| p.name == name) else {
+                    bail!("{}: invalid option {name}", self.label);
+                };
+                if self.special_preset(preset.raw).is_some() {
+                    return Ok(value);
+                }
+                // A shortcut stands for its value
+                self.source
+                    .conv()
+                    .and_then(|conv| conv.decode_int(preset.raw))
+                    .context("the preset has no value")
+            }
             Kind::Numeric { step, unit, .. } => {
                 let Some(mut v) = value.as_f64().filter(|v| v.is_finite()) else {
                     bail!("{}: expected a number", self.label);
@@ -334,7 +440,13 @@ pub struct DefinitionInfo {
     pub description: &'static str,
 }
 
-const DEFINITIONS: &[&Definition] = &[&sonoff::SNZB_02P, &sonoff::TRVZB, &tuya::ZWT07];
+const DEFINITIONS: &[&Definition] = &[
+    &philips::LTA009,
+    &sonoff::SNZB_02D,
+    &sonoff::SNZB_02P,
+    &sonoff::TRVZB,
+    &tuya::ZWT07,
+];
 
 pub fn definition(device: &Device) -> Option<&'static Definition> {
     DEFINITIONS.iter().copied().find(|def| {

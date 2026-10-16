@@ -102,6 +102,6 @@ async fn run(args: Args) -> Result<()> {
 
     hub.refresh_tables();
     hub.save_now().await?;
-    info!("Durum kaydedildi");
+    info!("State saved");
     Ok(())
 }

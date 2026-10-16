@@ -25,7 +25,7 @@ use ziggurat_phy::{ExclusiveRadio, RadioPhy, TxFrame};
 use ziggurat_phy_spinel::SpinelPhy;
 use ziggurat_protocol as proto;
 
-use crate::devices::{self, Card, Feature, Kind, Source, TimeBase, Write};
+use crate::devices::{self, Card, CommandFrame, Feature, Kind, Source, TimeBase, Write};
 use crate::store::{
     self, Child, Device, LinkKey, NetworkData, Persisted, eui64_to_string, key_to_string,
     parse_eui64, parse_key,
@@ -237,7 +237,7 @@ fn apply_zcl_records(device: &mut Device, cluster_id: u16, records: &[zcl::Attri
         for record in records.iter().filter(|r| r.id == attr) {
             let decoded = match &record.value {
                 Some(Value::Str(text)) => conv.decode_text(text),
-                Some(value) => value.as_i64().and_then(|raw| conv.decode_int(raw)),
+                Some(value) => value.as_i64().and_then(|raw| feature.decode_int(raw)),
                 None => None,
             };
             if let Some(decoded) = decoded {
@@ -259,11 +259,11 @@ fn apply_tuya_datapoints<'a>(device: &mut Device, datapoints: &'a [tuya::Datapoi
         for feature in matching {
             let value = match feature.source {
                 Source::Tuya { conv, .. } => match dp.as_int() {
-                    Some(raw) => conv.decode_int(raw),
+                    Some(raw) => feature.decode_int(raw),
                     None => conv.decode_text(&String::from_utf8_lossy(&dp.data)),
                 },
                 Source::TuyaSchedule { divisor, .. } => Some(tuya::decode_schedule(&dp.data, divisor)),
-                Source::Attr { .. } => None,
+                Source::Attr { .. } | Source::Command(_) => None,
             };
             if let Some(value) = value {
                 device.state.insert(feature.key.to_owned(), value);
@@ -994,8 +994,23 @@ impl Hub {
         command: u8,
         payload: &[u8],
     ) -> Result<(zcl::Header, Vec<u8>)> {
+        self.zcl_request_with(nwk, ep, cluster_id, frame_control, None, command, payload)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn zcl_request_with(
+        &self,
+        nwk: u16,
+        ep: u8,
+        cluster_id: u16,
+        frame_control: u8,
+        manufacturer: Option<u16>,
+        command: u8,
+        payload: &[u8],
+    ) -> Result<(zcl::Header, Vec<u8>)> {
         let seq = self.next_seq();
-        let frame = zcl::frame(frame_control, seq, command, payload);
+        let frame = zcl::manufacturer_frame(frame_control, manufacturer, seq, command, payload);
         let key = PendingKey::Zcl { nwk, seq };
         let response = self
             .request(key, nwk, HA_PROFILE, cluster_id, HUB_ENDPOINT, ep, frame)
@@ -1302,8 +1317,19 @@ impl Hub {
                 self.light_command(&device, feature, cluster, write, &value).await?;
                 Ok(false)
             }
-            Source::Tuya { dp, dp_type, conv } => {
-                let datapoint = tuya_datapoint(dp, dp_type, conv.encode(&value)?)?;
+            Source::Command(command) => {
+                for frame in command.frames(&value)? {
+                    self.cluster_command(&device, frame).await?;
+                }
+                if let Some(state) = command.state_after(&value) {
+                    self.update_device(ieee, |d| {
+                        d.state.insert(key.to_owned(), state);
+                    });
+                }
+                Ok(false)
+            }
+            Source::Tuya { dp, dp_type, .. } => {
+                let datapoint = tuya_datapoint(dp, dp_type, feature.encode(&value)?)?;
                 self.send_tuya_datapoint(&device, datapoint)?;
                 // The device's own datapoint report confirms it; the UI need not wait
                 self.update_device(ieee, |d| {
@@ -1361,16 +1387,16 @@ impl Hub {
             }
             Write::No | Write::Attribute => bail!("{} is not written with a command", feature.label),
         };
-        let ep = device.endpoint_with(cluster_id).context("the device does not support this command")?;
-        let (header, body) = self
-            .zcl_request(device.nwk, ep, cluster_id, zcl::FC_CLUSTER_SPECIFIC, command, &payload)
-            .await?;
-        if header.command == zcl::cmd::DEFAULT_RSP
-            && let Some(status) = zcl::default_response_status(&body)
-            && status != zcl::STATUS_SUCCESS
-        {
-            bail!("the device rejected the command (status 0x{status:02x})");
-        }
+        self.cluster_command(
+            device,
+            CommandFrame {
+                cluster: cluster_id,
+                manufacturer: None,
+                command,
+                payload,
+            },
+        )
+        .await?;
         // Reports follow shortly; the UI need not wait
         self.update_device(&device.ieee, |d| {
             d.state.insert(feature.key.to_owned(), value.clone());
@@ -1381,11 +1407,34 @@ impl Hub {
         Ok(())
     }
 
+    /// Sends a cluster-specific command and checks the device's Default Response
+    async fn cluster_command(&self, device: &Device, frame: CommandFrame) -> Result<()> {
+        let ep = device.endpoint_with(frame.cluster).context("the device does not support this command")?;
+        let (header, body) = self
+            .zcl_request_with(
+                device.nwk,
+                ep,
+                frame.cluster,
+                zcl::FC_CLUSTER_SPECIFIC,
+                frame.manufacturer,
+                frame.command,
+                &frame.payload,
+            )
+            .await?;
+        if header.command == zcl::cmd::DEFAULT_RSP
+            && let Some(status) = zcl::default_response_status(&body)
+            && status != zcl::STATUS_SUCCESS
+        {
+            bail!("the device rejected the command (status 0x{status:02x})");
+        }
+        Ok(())
+    }
+
     async fn write_attribute(&self, device: &Device, feature: &Feature, value: &Json) -> Result<()> {
-        let Source::Attr { cluster, attr, ty, conv, .. } = feature.source else {
+        let Source::Attr { cluster, attr, ty, .. } = feature.source else {
             bail!("not an attribute");
         };
-        let raw = conv.encode(value)?;
+        let raw = feature.encode(value)?;
         let bytes = zcl::encode_int(ty, raw).context("the value does not fit the attribute type")?;
         let ep = device.endpoint_with(cluster).context("the device lacks the attribute's cluster")?;
         let payload = zcl::write_attribute_payload(attr, ty, &bytes);
@@ -1596,7 +1645,7 @@ impl Hub {
             self.dirty.notified().await;
             tokio::time::sleep(SAVE_DELAY).await;
             if let Err(e) = self.save_now().await {
-                warn!("Durum kaydedilemedi: {e:#}");
+                warn!("State not saved: {e:#}");
             }
         }
     }

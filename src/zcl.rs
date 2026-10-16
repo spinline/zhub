@@ -20,6 +20,7 @@ pub mod cmd {
 pub mod cluster {
     pub const BASIC: u16 = 0x0000;
     pub const POWER_CONFIG: u16 = 0x0001;
+    pub const IDENTIFY: u16 = 0x0003;
     pub const POLL_CONTROL: u16 = 0x0020;
     pub const TIME: u16 = 0x000A;
     pub const THERMOSTAT: u16 = 0x0201;
@@ -112,8 +113,19 @@ impl Header {
 }
 
 pub fn frame(frame_control: u8, seq: u8, command: u8, payload: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(3 + payload.len());
-    out.push(frame_control);
+    manufacturer_frame(frame_control, None, seq, command, payload)
+}
+
+/// A frame with the manufacturer code when given (manufacturer-specific commands)
+pub fn manufacturer_frame(frame_control: u8, manufacturer: Option<u16>, seq: u8, command: u8, payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(5 + payload.len());
+    match manufacturer {
+        Some(code) => {
+            out.push(frame_control | FC_MANUFACTURER_SPECIFIC);
+            out.extend_from_slice(&code.to_le_bytes());
+        }
+        None => out.push(frame_control),
+    }
     out.push(seq);
     out.push(command);
     out.extend_from_slice(payload);
@@ -347,6 +359,17 @@ mod tests {
         assert_eq!(encode_int(types::UINT32, 5400), Some(vec![0x18, 0x15, 0x00, 0x00]));
         assert_eq!(encode_int(types::BOOL, 1), Some(vec![0x01]));
         assert_eq!(encode_int(types::EUI64, 1), None);
+    }
+
+    #[test]
+    fn manufacturer_frame_carries_the_code() {
+        // Hue candle effect: cluster specific + manufacturer specific, Signify
+        let hue = manufacturer_frame(FC_CLUSTER_SPECIFIC, Some(0x100B), 7, 0x00, &[0x21, 0x00, 0x01, 0x01]);
+        assert_eq!(hue, [0x05, 0x0B, 0x10, 7, 0x00, 0x21, 0x00, 0x01, 0x01]);
+        let (header, body) = Header::parse(&hue).unwrap();
+        assert_eq!(header.manufacturer, Some(0x100B));
+        assert_eq!(body, [0x21, 0x00, 0x01, 0x01]);
+        assert_eq!(frame(0x00, 1, 0x02, &[]), [0x00, 1, 0x02]);
     }
 
     #[test]

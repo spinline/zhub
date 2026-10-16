@@ -68,6 +68,101 @@ pub static SNZB_02P: Definition = Definition {
     tuya_time_since_2000: false,
 };
 
+// ---- SNZB-02D: temperature and humidity sensor with screen ----
+
+pub static SNZB_02D: Definition = Definition {
+    fingerprint: &[Fingerprint::Model("SNZB-02D")],
+    vendor: "SONOFF",
+    description: "Temperature and humidity sensor with screen",
+    name: None,
+    card: Card::Sensor,
+    features: &[
+        common::TEMPERATURE,
+        common::HUMIDITY,
+        common::BATTERY,
+        Feature::new(
+            "comfort_temperature_min",
+            "Comfort temperature min",
+            numeric("°C", Some(-10.0), Some(60.0), Some(0.1)),
+            Place::Config,
+            fc11(0x0004, types::INT16, hundredths(), Write::Attribute),
+        )
+        .describe(concat!(
+            "Minimum temperature that is considered comfortable. The device will display ❄️ when the temperature \
+             is lower than this value. ",
+            "Note: wake up the device by pressing the button on the back before changing this value."
+        )),
+        Feature::new(
+            "comfort_temperature_max",
+            "Comfort temperature max",
+            numeric("°C", Some(-10.0), Some(60.0), Some(0.1)),
+            Place::Config,
+            fc11(0x0003, types::INT16, hundredths(), Write::Attribute),
+        )
+        .describe(concat!(
+            "Maximum temperature that is considered comfortable. The device will display 🔥 when the temperature \
+             is higher than this value. ",
+            "Note: wake up the device by pressing the button on the back before changing this value."
+        )),
+        Feature::new(
+            "comfort_humidity_min",
+            "Comfort humidity min",
+            numeric("%", Some(5.0), Some(95.0), Some(0.1)),
+            Place::Config,
+            fc11(0x0005, types::UINT16, hundredths(), Write::Attribute),
+        )
+        .describe(concat!(
+            "Minimum relative humidity that is considered comfortable. The device will display ☀️ when the \
+             humidity is lower than this value. ",
+            "Note: wake up the device by pressing the button on the back before changing this value."
+        )),
+        Feature::new(
+            "comfort_humidity_max",
+            "Comfort humidity max",
+            numeric("%", Some(5.0), Some(95.0), Some(0.1)),
+            Place::Config,
+            fc11(0x0006, types::UINT16, hundredths(), Write::Attribute),
+        )
+        .describe(concat!(
+            "Maximum relative humidity that is considered comfortable. The device will display 💧 when the \
+             humidity is higher than this value. ",
+            "Note: wake up the device by pressing the button on the back before changing this value."
+        )),
+        Feature::new(
+            "temperature_units",
+            "Temperature units",
+            Kind::Enum {
+                values: &["celsius", "fahrenheit"],
+            },
+            Place::Config,
+            fc11(0x0007, types::UINT16, Conv::Enum(&[(0, "celsius"), (1, "fahrenheit")]), Write::Attribute),
+        )
+        .describe(concat!(
+            "The unit of the temperature displayed on the device screen. ",
+            "Note: wake up the device by pressing the button on the back before changing this value."
+        )),
+        Feature::new(
+            "temperature_calibration",
+            "Temperature calibration",
+            numeric("°C", Some(-50.0), Some(50.0), Some(0.1)),
+            Place::Config,
+            fc11(0x2003, types::INT16, hundredths(), Write::Attribute),
+        )
+        .describe("Offset to add/subtract to the reported temperature"),
+        Feature::new(
+            "humidity_calibration",
+            "Humidity calibration",
+            numeric("%", Some(-50.0), Some(50.0), Some(0.1)),
+            Place::Config,
+            fc11(0x2004, types::INT16, hundredths(), Write::Attribute),
+        )
+        .describe("Offset to add/subtract to the reported relative humidity"),
+    ],
+    binds: &[cluster::POLL_CONTROL],
+    time_base: TimeBase::Zigbee2000,
+    tuya_time_since_2000: false,
+};
+
 // ---- TRVZB: thermostatic radiator valve ----
 
 const SYSTEM_MODES: &[(i64, &str)] = &[(0, "off"), (1, "auto"), (4, "heat")];
