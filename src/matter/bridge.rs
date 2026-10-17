@@ -13,15 +13,21 @@ use rs_matter::dm::clusters::decl::bridged_device_basic_information as bridged;
 use rs_matter::dm::clusters::decl::color_control;
 use rs_matter::dm::clusters::decl::level_control;
 use rs_matter::dm::clusters::decl::on_off;
+use rs_matter::dm::clusters::decl::power_source;
+use rs_matter::dm::clusters::decl::relative_humidity_measurement as humidity;
+use rs_matter::dm::clusters::decl::temperature_measurement as temperature;
+use rs_matter::dm::clusters::decl::thermostat;
 use rs_matter::dm::clusters::desc::{self, ClusterHandler as _};
 use rs_matter::dm::clusters::groups::{self, ClusterHandler as _};
-use rs_matter::dm::devices::{DEV_TYPE_AGGREGATOR, DEV_TYPE_BRIDGED_NODE, DEV_TYPE_DIMMABLE_LIGHT, DEV_TYPE_ON_OFF_LIGHT};
+use rs_matter::dm::devices::{
+    DEV_TYPE_AGGREGATOR, DEV_TYPE_BRIDGED_NODE, DEV_TYPE_DIMMABLE_LIGHT, DEV_TYPE_ON_OFF_LIGHT, DEV_TYPE_THERMOSTAT,
+};
 use rs_matter::dm::{
-    AsyncHandler, Cluster, ClusterId, Dataver, DeviceType, EndptId, Endpoint, InvokeContext, InvokeReply, MatchContext,
-    Metadata, Node, ReadContext, ReadReply, WriteContext,
+    ArrayAttributeRead, AsyncHandler, Cluster, ClusterId, Dataver, DeviceType, EndptId, Endpoint, InvokeContext, InvokeReply,
+    MatchContext, Metadata, Node, ReadContext, ReadReply, WriteContext,
 };
 use rs_matter::error::{Error, ErrorCode};
-use rs_matter::tlv::{Nullable, TLVBuilderParent, Utf8StrBuilder};
+use rs_matter::tlv::{Nullable, TLVBuilderParent, ToTLVArrayBuilder, ToTLVBuilder, Utf8StrBuilder};
 use rs_matter::{clusters, devices, root_endpoint, with};
 use serde_json::{Value as Json, json};
 use tracing::{debug, info, warn};
@@ -35,8 +41,15 @@ const ON_OFF_ID: ClusterId = on_off::FULL_CLUSTER.id;
 const LEVEL_ID: ClusterId = level_control::FULL_CLUSTER.id;
 const COLOR_ID: ClusterId = color_control::FULL_CLUSTER.id;
 const BRIDGED_ID: ClusterId = bridged::FULL_CLUSTER.id;
+const TEMPERATURE_ID: ClusterId = temperature::FULL_CLUSTER.id;
+const HUMIDITY_ID: ClusterId = humidity::FULL_CLUSTER.id;
+const POWER_ID: ClusterId = power_source::FULL_CLUSTER.id;
+const THERMOSTAT_ID: ClusterId = thermostat::FULL_CLUSTER.id;
 
 const DEV_TYPE_COLOR_TEMPERATURE_LIGHT: DeviceType = DeviceType { dtype: 0x010C, drev: 4 };
+const DEV_TYPE_TEMPERATURE_SENSOR: DeviceType = DeviceType { dtype: 0x0302, drev: 2 };
+const DEV_TYPE_HUMIDITY_SENSOR: DeviceType = DeviceType { dtype: 0x0307, drev: 2 };
+const DEV_TYPE_POWER_SOURCE: DeviceType = DeviceType { dtype: 0x0011, drev: 1 };
 
 const ON_OFF_CLUSTER: Cluster<'static> = on_off::FULL_CLUSTER
     .with_revision(6)
@@ -119,26 +132,76 @@ const BRIDGED_CLUSTER: Cluster<'static> = bridged::FULL_CLUSTER
     ))
     .with_cmds(with!());
 
+const TEMPERATURE_CLUSTER: Cluster<'static> = temperature::FULL_CLUSTER
+    .with_revision(4)
+    .with_attrs(with!(required; temperature::AttributeId::MeasuredValue | temperature::AttributeId::MinMeasuredValue | temperature::AttributeId::MaxMeasuredValue))
+    .with_cmds(with!());
+
+const HUMIDITY_CLUSTER: Cluster<'static> = humidity::FULL_CLUSTER
+    .with_revision(3)
+    .with_attrs(with!(required; humidity::AttributeId::MeasuredValue | humidity::AttributeId::MinMeasuredValue | humidity::AttributeId::MaxMeasuredValue))
+    .with_cmds(with!());
+
+const POWER_CLUSTER: Cluster<'static> = power_source::FULL_CLUSTER
+    .with_revision(2)
+    .with_features(power_source::Feature::BATTERY.bits())
+    .with_attrs(with!(
+        required;
+        power_source::AttributeId::Status
+            | power_source::AttributeId::Order
+            | power_source::AttributeId::Description
+            | power_source::AttributeId::BatPercentRemaining
+            | power_source::AttributeId::BatChargeLevel
+            | power_source::AttributeId::BatReplacementNeeded
+            | power_source::AttributeId::BatReplaceability
+            | power_source::AttributeId::EndpointList
+    ))
+    .with_cmds(with!());
+
+const THERMOSTAT_CLUSTER: Cluster<'static> = thermostat::FULL_CLUSTER
+    .with_revision(7)
+    .with_features(thermostat::Feature::HEATING.bits())
+    .with_attrs(with!(
+        required;
+        thermostat::AttributeId::LocalTemperature
+            | thermostat::AttributeId::AbsMinHeatSetpointLimit
+            | thermostat::AttributeId::AbsMaxHeatSetpointLimit
+            | thermostat::AttributeId::OccupiedHeatingSetpoint
+            | thermostat::AttributeId::ControlSequenceOfOperation
+            | thermostat::AttributeId::SystemMode
+            | thermostat::AttributeId::ThermostatRunningState
+    ))
+    .with_cmds(with!(thermostat::CommandId::SetpointRaiseLower));
+
 /// The kinds of bridged devices, by what the Matter side offers
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     OnOffLight,
     DimmableLight,
     ColorTemperatureLight,
+    TemperatureSensor { humidity: bool, battery: bool },
+    Thermostat { battery: bool },
 }
 
 impl Kind {
     /// What a hub device becomes; `None` for devices not bridged (yet)
     pub fn of(view: &DeviceView) -> Option<Self> {
         let writable = |key: &str| view.features.iter().any(|f| f.key == key && f.access != Access::Read);
-        if view.card != Card::Light || !writable("on") {
-            return None;
+        let has = |key: &str| view.features.iter().any(|f| f.key == key);
+        let battery = has("battery");
+        match view.card {
+            Card::Light if writable("on") => Some(match (writable("level"), writable("color_temp")) {
+                (true, true) => Self::ColorTemperatureLight,
+                (true, false) => Self::DimmableLight,
+                _ => Self::OnOffLight,
+            }),
+            Card::Thermostat if writable("setpoint") && has("temperature") => Some(Self::Thermostat { battery }),
+            Card::Sensor if has("temperature") => Some(Self::TemperatureSensor {
+                humidity: has("humidity"),
+                battery,
+            }),
+            _ => None,
         }
-        Some(match (writable("level"), writable("color_temp")) {
-            (true, true) => Self::ColorTemperatureLight,
-            (true, false) => Self::DimmableLight,
-            _ => Self::OnOffLight,
-        })
     }
 
     fn device_types(self) -> &'static [DeviceType] {
@@ -146,6 +209,21 @@ impl Kind {
             Self::OnOffLight => devices!(DEV_TYPE_ON_OFF_LIGHT, DEV_TYPE_BRIDGED_NODE),
             Self::DimmableLight => devices!(DEV_TYPE_DIMMABLE_LIGHT, DEV_TYPE_BRIDGED_NODE),
             Self::ColorTemperatureLight => devices!(DEV_TYPE_COLOR_TEMPERATURE_LIGHT, DEV_TYPE_BRIDGED_NODE),
+            Self::TemperatureSensor { humidity: false, battery: false } => devices!(DEV_TYPE_TEMPERATURE_SENSOR, DEV_TYPE_BRIDGED_NODE),
+            Self::TemperatureSensor { humidity: true, battery: false } => {
+                devices!(DEV_TYPE_TEMPERATURE_SENSOR, DEV_TYPE_HUMIDITY_SENSOR, DEV_TYPE_BRIDGED_NODE)
+            }
+            Self::TemperatureSensor { humidity: false, battery: true } => {
+                devices!(DEV_TYPE_TEMPERATURE_SENSOR, DEV_TYPE_POWER_SOURCE, DEV_TYPE_BRIDGED_NODE)
+            }
+            Self::TemperatureSensor { humidity: true, battery: true } => devices!(
+                DEV_TYPE_TEMPERATURE_SENSOR,
+                DEV_TYPE_HUMIDITY_SENSOR,
+                DEV_TYPE_POWER_SOURCE,
+                DEV_TYPE_BRIDGED_NODE
+            ),
+            Self::Thermostat { battery: false } => devices!(DEV_TYPE_THERMOSTAT, DEV_TYPE_BRIDGED_NODE),
+            Self::Thermostat { battery: true } => devices!(DEV_TYPE_THERMOSTAT, DEV_TYPE_POWER_SOURCE, DEV_TYPE_BRIDGED_NODE),
         }
     }
 
@@ -167,6 +245,26 @@ impl Kind {
                 LEVEL_CLUSTER,
                 COLOR_CLUSTER
             ),
+            Self::TemperatureSensor { humidity: false, battery: false } => {
+                clusters!(desc::DescHandler::CLUSTER, BRIDGED_CLUSTER, TEMPERATURE_CLUSTER)
+            }
+            Self::TemperatureSensor { humidity: true, battery: false } => {
+                clusters!(desc::DescHandler::CLUSTER, BRIDGED_CLUSTER, TEMPERATURE_CLUSTER, HUMIDITY_CLUSTER)
+            }
+            Self::TemperatureSensor { humidity: false, battery: true } => {
+                clusters!(desc::DescHandler::CLUSTER, BRIDGED_CLUSTER, TEMPERATURE_CLUSTER, POWER_CLUSTER)
+            }
+            Self::TemperatureSensor { humidity: true, battery: true } => clusters!(
+                desc::DescHandler::CLUSTER,
+                BRIDGED_CLUSTER,
+                TEMPERATURE_CLUSTER,
+                HUMIDITY_CLUSTER,
+                POWER_CLUSTER
+            ),
+            Self::Thermostat { battery: false } => clusters!(desc::DescHandler::CLUSTER, BRIDGED_CLUSTER, THERMOSTAT_CLUSTER),
+            Self::Thermostat { battery: true } => {
+                clusters!(desc::DescHandler::CLUSTER, BRIDGED_CLUSTER, THERMOSTAT_CLUSTER, POWER_CLUSTER)
+            }
         }
     }
 }
@@ -269,6 +367,21 @@ impl Bridge {
             Ok(Err(e)) => {
                 warn!("Matter → {ieee} cluster 0x{cluster:04x} command 0x{command:02x}: {e:#}");
                 Err(ErrorCode::Failure.into())
+            }
+            Err(_) => Err(ErrorCode::Failure.into()),
+        }
+    }
+
+    /// Writes a feature value through the hub, as the UI does (sleepy devices included)
+    async fn set(&self, endpoint: EndptId, key: &'static str, value: Json) -> Result<(), Error> {
+        let ieee = self.ieee_of(endpoint)?;
+        let hub = self.hub.clone();
+        let target = ieee.clone();
+        match self.rt.spawn(async move { hub.set(&target, key, value).await }).await {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(e)) => {
+                warn!("Matter → {ieee} {key}: {e:#}");
+                Err(ErrorCode::ConstraintError.into())
             }
             Err(_) => Err(ErrorCode::Failure.into()),
         }
@@ -378,6 +491,10 @@ impl AsyncHandler for BridgedHandler<'_> {
             LEVEL_ID => level_control::HandlerAsyncAdaptor(&c).read(ctx, reply).await,
             COLOR_ID => color_control::HandlerAsyncAdaptor(&c).read(ctx, reply).await,
             BRIDGED_ID => bridged::HandlerAsyncAdaptor(&c).read(ctx, reply).await,
+            TEMPERATURE_ID => temperature::HandlerAsyncAdaptor(&c).read(ctx, reply).await,
+            HUMIDITY_ID => humidity::HandlerAsyncAdaptor(&c).read(ctx, reply).await,
+            POWER_ID => power_source::HandlerAsyncAdaptor(&c).read(ctx, reply).await,
+            THERMOSTAT_ID => thermostat::HandlerAsyncAdaptor(&c).read(ctx, reply).await,
             _ => Err(ErrorCode::ClusterNotFound.into()),
         }
     }
@@ -390,6 +507,10 @@ impl AsyncHandler for BridgedHandler<'_> {
             LEVEL_ID => level_control::HandlerAsyncAdaptor(&c).write(ctx).await,
             COLOR_ID => color_control::HandlerAsyncAdaptor(&c).write(ctx).await,
             BRIDGED_ID => bridged::HandlerAsyncAdaptor(&c).write(ctx).await,
+            TEMPERATURE_ID => temperature::HandlerAsyncAdaptor(&c).write(ctx).await,
+            HUMIDITY_ID => humidity::HandlerAsyncAdaptor(&c).write(ctx).await,
+            POWER_ID => power_source::HandlerAsyncAdaptor(&c).write(ctx).await,
+            THERMOSTAT_ID => thermostat::HandlerAsyncAdaptor(&c).write(ctx).await,
             _ => Err(ErrorCode::ClusterNotFound.into()),
         }
     }
@@ -403,6 +524,10 @@ impl AsyncHandler for BridgedHandler<'_> {
             LEVEL_ID => level_control::HandlerAsyncAdaptor(&c).invoke(ctx, reply).await,
             COLOR_ID => color_control::HandlerAsyncAdaptor(&c).invoke(ctx, reply).await,
             BRIDGED_ID => bridged::HandlerAsyncAdaptor(&c).invoke(ctx, reply).await,
+            TEMPERATURE_ID => temperature::HandlerAsyncAdaptor(&c).invoke(ctx, reply).await,
+            HUMIDITY_ID => humidity::HandlerAsyncAdaptor(&c).invoke(ctx, reply).await,
+            POWER_ID => power_source::HandlerAsyncAdaptor(&c).invoke(ctx, reply).await,
+            THERMOSTAT_ID => thermostat::HandlerAsyncAdaptor(&c).invoke(ctx, reply).await,
             _ => Err(ErrorCode::ClusterNotFound.into()),
         }
     }
@@ -890,4 +1015,293 @@ fn truncate(text: &str, max: usize) -> String {
         end -= 1;
     }
     text[..end].to_owned()
+}
+
+// ---- Temperature and humidity ----
+
+impl temperature::ClusterAsyncHandler for &Cl<'_> {
+    const CLUSTER: Cluster<'static> = TEMPERATURE_CLUSTER;
+
+    fn dataver(&self) -> u32 {
+        self.bridge.dataver(self.endpoint, TEMPERATURE_ID)
+    }
+
+    fn dataver_changed(&self) {
+        self.bridge.dataver_changed(self.endpoint, TEMPERATURE_ID);
+    }
+
+    async fn measured_value(&self, _ctx: impl ReadContext) -> Result<Nullable<i16>, Error> {
+        Ok(match self.number("temperature")? {
+            Some(celsius) => Nullable::some((celsius * 100.0).round() as i16),
+            None => Nullable::none(),
+        })
+    }
+
+    async fn min_measured_value(&self, _ctx: impl ReadContext) -> Result<Nullable<i16>, Error> {
+        Ok(Nullable::none())
+    }
+
+    async fn max_measured_value(&self, _ctx: impl ReadContext) -> Result<Nullable<i16>, Error> {
+        Ok(Nullable::none())
+    }
+}
+
+impl humidity::ClusterAsyncHandler for &Cl<'_> {
+    const CLUSTER: Cluster<'static> = HUMIDITY_CLUSTER;
+
+    fn dataver(&self) -> u32 {
+        self.bridge.dataver(self.endpoint, HUMIDITY_ID)
+    }
+
+    fn dataver_changed(&self) {
+        self.bridge.dataver_changed(self.endpoint, HUMIDITY_ID);
+    }
+
+    async fn measured_value(&self, _ctx: impl ReadContext) -> Result<Nullable<u16>, Error> {
+        Ok(match self.number("humidity")? {
+            Some(percent) => Nullable::some((percent.clamp(0.0, 100.0) * 100.0).round() as u16),
+            None => Nullable::none(),
+        })
+    }
+
+    async fn min_measured_value(&self, _ctx: impl ReadContext) -> Result<Nullable<u16>, Error> {
+        Ok(Nullable::none())
+    }
+
+    async fn max_measured_value(&self, _ctx: impl ReadContext) -> Result<Nullable<u16>, Error> {
+        Ok(Nullable::none())
+    }
+}
+
+// ---- Battery ----
+
+impl Cl<'_> {
+    fn battery(&self) -> Result<Option<f64>, Error> {
+        self.number("battery")
+    }
+}
+
+impl power_source::ClusterAsyncHandler for &Cl<'_> {
+    const CLUSTER: Cluster<'static> = POWER_CLUSTER;
+
+    fn dataver(&self) -> u32 {
+        self.bridge.dataver(self.endpoint, POWER_ID)
+    }
+
+    fn dataver_changed(&self) {
+        self.bridge.dataver_changed(self.endpoint, POWER_ID);
+    }
+
+    async fn status(&self, _ctx: impl ReadContext) -> Result<power_source::PowerSourceStatusEnum, Error> {
+        Ok(power_source::PowerSourceStatusEnum::Active)
+    }
+
+    async fn order(&self, _ctx: impl ReadContext) -> Result<u8, Error> {
+        Ok(0)
+    }
+
+    async fn description<P: TLVBuilderParent>(&self, _ctx: impl ReadContext, builder: Utf8StrBuilder<P>) -> Result<P, Error> {
+        builder.set("Battery")
+    }
+
+    async fn endpoint_list<P: TLVBuilderParent>(
+        &self,
+        _ctx: impl ReadContext,
+        builder: ArrayAttributeRead<ToTLVArrayBuilder<P, EndptId>, ToTLVBuilder<P, EndptId>>,
+    ) -> Result<P, Error> {
+        match builder {
+            ArrayAttributeRead::ReadAll(builder) => builder.push(&self.endpoint)?.end(),
+            ArrayAttributeRead::ReadOne(0, builder) => builder.set(&self.endpoint),
+            ArrayAttributeRead::ReadOne(_, _) => Err(ErrorCode::ConstraintError.into()),
+            ArrayAttributeRead::ReadNone(builder) => builder.end(),
+        }
+    }
+
+    async fn bat_percent_remaining(&self, _ctx: impl ReadContext) -> Result<Nullable<u8>, Error> {
+        // Half percent units
+        Ok(match self.battery()? {
+            Some(percent) => Nullable::some((percent.clamp(0.0, 100.0) * 2.0).round() as u8),
+            None => Nullable::none(),
+        })
+    }
+
+    async fn bat_charge_level(&self, _ctx: impl ReadContext) -> Result<power_source::BatChargeLevelEnum, Error> {
+        Ok(match self.battery()? {
+            Some(p) if p < 10.0 => power_source::BatChargeLevelEnum::Critical,
+            Some(p) if p < 20.0 => power_source::BatChargeLevelEnum::Warning,
+            _ => power_source::BatChargeLevelEnum::OK,
+        })
+    }
+
+    async fn bat_replacement_needed(&self, _ctx: impl ReadContext) -> Result<bool, Error> {
+        Ok(self.battery()?.is_some_and(|p| p < 10.0))
+    }
+
+    async fn bat_replaceability(&self, _ctx: impl ReadContext) -> Result<power_source::BatReplaceabilityEnum, Error> {
+        Ok(power_source::BatReplaceabilityEnum::UserReplaceable)
+    }
+}
+
+// ---- Thermostat (heating only) ----
+
+impl Cl<'_> {
+    /// The setpoint's range in hundredths of a degree
+    fn setpoint_range(&self) -> Result<(i16, i16), Error> {
+        let view = self.bridge.view(self.endpoint)?;
+        let (min, max) = view
+            .features
+            .iter()
+            .find(|f| f.key == "setpoint")
+            .map(|f| f.range(&view.device))
+            .unwrap_or((None, None));
+        Ok(((min.unwrap_or(5.0) * 100.0) as i16, (max.unwrap_or(35.0) * 100.0) as i16))
+    }
+
+    fn setpoint(&self) -> Result<i16, Error> {
+        let (min, max) = self.setpoint_range()?;
+        Ok(self.number("setpoint")?.map_or(min, |c| (c * 100.0).round() as i16).clamp(min, max))
+    }
+}
+
+impl thermostat::ClusterAsyncHandler for &Cl<'_> {
+    const CLUSTER: Cluster<'static> = THERMOSTAT_CLUSTER;
+
+    fn dataver(&self) -> u32 {
+        self.bridge.dataver(self.endpoint, THERMOSTAT_ID)
+    }
+
+    fn dataver_changed(&self) {
+        self.bridge.dataver_changed(self.endpoint, THERMOSTAT_ID);
+    }
+
+    async fn local_temperature(&self, _ctx: impl ReadContext) -> Result<Nullable<i16>, Error> {
+        Ok(match self.number("temperature")? {
+            Some(celsius) => Nullable::some((celsius * 100.0).round() as i16),
+            None => Nullable::none(),
+        })
+    }
+
+    async fn abs_min_heat_setpoint_limit(&self, _ctx: impl ReadContext) -> Result<i16, Error> {
+        Ok(self.setpoint_range()?.0)
+    }
+
+    async fn abs_max_heat_setpoint_limit(&self, _ctx: impl ReadContext) -> Result<i16, Error> {
+        Ok(self.setpoint_range()?.1)
+    }
+
+    async fn occupied_heating_setpoint(&self, _ctx: impl ReadContext) -> Result<i16, Error> {
+        self.setpoint()
+    }
+
+    async fn set_occupied_heating_setpoint(&self, _ctx: impl WriteContext, value: i16) -> Result<(), Error> {
+        let (min, max) = self.setpoint_range()?;
+        if !(min..=max).contains(&value) {
+            return Err(ErrorCode::ConstraintError.into());
+        }
+        self.bridge.set(self.endpoint, "setpoint", json!(f64::from(value) / 100.0)).await
+    }
+
+    async fn control_sequence_of_operation(&self, _ctx: impl ReadContext) -> Result<thermostat::ControlSequenceOfOperationEnum, Error> {
+        Ok(thermostat::ControlSequenceOfOperationEnum::HeatingOnly)
+    }
+
+    async fn set_control_sequence_of_operation(
+        &self,
+        _ctx: impl WriteContext,
+        value: thermostat::ControlSequenceOfOperationEnum,
+    ) -> Result<(), Error> {
+        match value {
+            thermostat::ControlSequenceOfOperationEnum::HeatingOnly => Ok(()),
+            _ => Err(ErrorCode::ConstraintError.into()),
+        }
+    }
+
+    /// The device's own "auto" (its schedule) still heats: Matter's Auto means heat and
+    /// cool, which these devices cannot
+    async fn system_mode(&self, _ctx: impl ReadContext) -> Result<thermostat::SystemModeEnum, Error> {
+        Ok(match self.bridge.state(self.endpoint, "system_mode")?.as_ref().and_then(Json::as_str) {
+            Some("off") => thermostat::SystemModeEnum::Off,
+            _ => thermostat::SystemModeEnum::Heat,
+        })
+    }
+
+    async fn set_system_mode(&self, _ctx: impl WriteContext, value: thermostat::SystemModeEnum) -> Result<(), Error> {
+        let mode = match value {
+            thermostat::SystemModeEnum::Off => "off",
+            thermostat::SystemModeEnum::Heat => "heat",
+            _ => return Err(ErrorCode::ConstraintError.into()),
+        };
+        self.bridge.set(self.endpoint, "system_mode", json!(mode)).await
+    }
+
+    async fn thermostat_running_state(&self, _ctx: impl ReadContext) -> Result<thermostat::RelayStateBitmap, Error> {
+        let heating = self.bridge.state(self.endpoint, "heating")?.and_then(|v| v.as_bool()).unwrap_or(false);
+        Ok(if heating { thermostat::RelayStateBitmap::HEAT } else { thermostat::RelayStateBitmap::empty() })
+    }
+
+    async fn handle_setpoint_raise_lower(&self, _ctx: impl InvokeContext, request: thermostat::SetpointRaiseLowerRequest<'_>) -> Result<(), Error> {
+        // Amount in tenths of a degree
+        let (min, max) = self.setpoint_range()?;
+        let target = (self.setpoint()? + i16::from(request.amount()?) * 10).clamp(min, max);
+        self.bridge.set(self.endpoint, "setpoint", json!(f64::from(target) / 100.0)).await
+    }
+
+    async fn handle_set_weekly_schedule(&self, _ctx: impl InvokeContext, _r: thermostat::SetWeeklyScheduleRequest<'_>) -> Result<(), Error> {
+        unsupported()
+    }
+
+    async fn handle_get_weekly_schedule<P: TLVBuilderParent>(
+        &self,
+        _ctx: impl InvokeContext,
+        _r: thermostat::GetWeeklyScheduleRequest<'_>,
+        _response: thermostat::GetWeeklyScheduleResponseBuilder<P>,
+    ) -> Result<P, Error> {
+        Err(ErrorCode::CommandNotFound.into())
+    }
+
+    async fn handle_clear_weekly_schedule(&self, _ctx: impl InvokeContext) -> Result<(), Error> {
+        unsupported()
+    }
+
+    async fn handle_set_active_schedule_request(
+        &self,
+        _ctx: impl InvokeContext,
+        _r: thermostat::SetActiveScheduleRequestRequest<'_>,
+    ) -> Result<(), Error> {
+        unsupported()
+    }
+
+    async fn handle_set_active_preset_request(
+        &self,
+        _ctx: impl InvokeContext,
+        _r: thermostat::SetActivePresetRequestRequest<'_>,
+    ) -> Result<(), Error> {
+        unsupported()
+    }
+
+    async fn handle_add_thermostat_suggestion<P: TLVBuilderParent>(
+        &self,
+        _ctx: impl InvokeContext,
+        _r: thermostat::AddThermostatSuggestionRequest<'_>,
+        _response: thermostat::AddThermostatSuggestionResponseBuilder<P>,
+    ) -> Result<P, Error> {
+        Err(ErrorCode::CommandNotFound.into())
+    }
+
+    async fn handle_remove_thermostat_suggestion(
+        &self,
+        _ctx: impl InvokeContext,
+        _r: thermostat::RemoveThermostatSuggestionRequest<'_>,
+    ) -> Result<(), Error> {
+        unsupported()
+    }
+
+    async fn handle_atomic_request<P: TLVBuilderParent>(
+        &self,
+        _ctx: impl InvokeContext,
+        _r: thermostat::AtomicRequestRequest<'_>,
+        _response: thermostat::AtomicResponseBuilder<P>,
+    ) -> Result<P, Error> {
+        Err(ErrorCode::CommandNotFound.into())
+    }
 }
