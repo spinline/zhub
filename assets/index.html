@@ -1444,10 +1444,12 @@ function mqttForm(m) {
   const base = el("input", { type: "text", value: m.base_topic });
   const discovery = el("input", { type: "checkbox", checked: m.discovery });
   const prefix = el("input", { type: "text", value: m.discovery_prefix });
+  const logCommands = el("input", { type: "checkbox", checked: !!m.log_commands });
   const save = el("button", { textContent: "Save", className: "primary" });
   save.onclick = () => run(saveSettings({ mqtt: {
     enabled: enabled.checked, host: host.value.trim(), port: Number(port.value), username: user.value.trim(),
     password: pass.value || null, base_topic: base.value.trim(), discovery: discovery.checked, discovery_prefix: prefix.value.trim(),
+    log_commands: logCommands.checked,
   } }).then(() => { pass.value = ""; setTimeout(() => run(loadSettings()), 2000); }));
   return [
     field("Enabled", el("label", { className: "switch" }, enabled, el("span"))),
@@ -1457,6 +1459,8 @@ function mqttForm(m) {
     field("Base topic", base, "Zigbee2MQTT's default is zigbee2mqtt."),
     field("Home Assistant discovery", el("label", { className: "switch" }, discovery, el("span"))),
     field("Discovery prefix", prefix),
+    field("Log incoming commands", el("label", { className: "switch" }, logCommands, el("span")),
+      "Writes every command the hub receives (set, get, bridge requests) to the log. For tracing a client; leave off otherwise."),
     el("div", { className: "actions" }, save),
   ];
 }

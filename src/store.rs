@@ -118,6 +118,8 @@ pub struct MqttSettings {
     pub base_topic: String,
     pub discovery: bool,
     pub discovery_prefix: String,
+    /// Log every incoming command (to trace what a client sends)
+    pub log_commands: bool,
 }
 
 impl Default for MqttSettings {
@@ -131,6 +133,7 @@ impl Default for MqttSettings {
             base_topic: "zigbee2mqtt".into(),
             discovery: true,
             discovery_prefix: "homeassistant".into(),
+            log_commands: false,
         }
     }
 }

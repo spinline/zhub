@@ -12,7 +12,7 @@
 //! The connection restarts when the settings change.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use rumqttc::{AsyncClient, Event as MqttEvent, Incoming, LastWill, MqttOptions, QoS};
@@ -24,6 +24,7 @@ use tracing::{debug, info, warn};
 use crate::devices::{Access, Card, Feature, Kind, Place, Source};
 use crate::hub::{DeviceView, Event, Hub};
 use crate::store::{Group, MqttSettings};
+use crate::z2m_light;
 
 /// Keys a light or climate entity already covers
 const LIGHT_KEYS: &[&str] = &["on", "level", "color_temp"];
@@ -161,6 +162,8 @@ impl Bridge {
         for topic in [
             format!("{base}/+/set"),
             format!("{base}/+/set/+"),
+            format!("{base}/+/get"),
+            format!("{base}/+/get/+"),
             format!("{base}/bridge/request/+"),
             format!("{}/status", self.cfg.discovery_prefix),
         ] {
@@ -406,14 +409,20 @@ impl Bridge {
             return;
         };
         if let Some(request) = rest.strip_prefix("bridge/request/") {
+            if self.cfg.log_commands {
+                info!("MQTT ← {topic} {}", String::from_utf8_lossy(payload));
+            }
             self.request(request, payload);
             return;
         }
         let mut parts = rest.splitn(3, '/');
-        let (Some(name), Some("set")) = (parts.next(), parts.next()) else {
+        let (Some(name), Some(verb @ ("set" | "get"))) = (parts.next(), parts.next()) else {
             return;
         };
         let text = String::from_utf8_lossy(payload);
+        if self.cfg.log_commands {
+            info!("MQTT ← {topic} {text}");
+        }
         // `<name>/set/<key>` carries a bare value; `<name>/set` a JSON object
         let command: Map<String, Json> = match parts.next() {
             Some(key) => {
@@ -430,10 +439,21 @@ impl Bridge {
         };
         let hub = self.hub.clone();
         let name = name.to_owned();
+        let log = self.cfg.log_commands;
+        let get_verb = verb == "get";
+        let verb = verb.to_owned();
         // Commands may wait for a sleepy device: never hold up the bridge
         tokio::spawn(async move {
-            if let Err(e) = apply(&hub, &name, command).await {
-                warn!("MQTT {name}/set: {e:#}");
+            let started = std::time::Instant::now();
+            let result = if get_verb {
+                get(&hub, &name, command.keys().cloned().collect()).await
+            } else {
+                apply(&hub, &name, command).await
+            };
+            match result {
+                Ok(()) if log => info!("MQTT {name}/{verb} done in {} ms", started.elapsed().as_millis()),
+                Ok(()) => {}
+                Err(e) => warn!("MQTT {name}/{verb}: {e:#}"),
             }
         });
     }
@@ -842,110 +862,186 @@ fn writable(f: &Feature) -> bool {
     f.access != Access::Read
 }
 
-/// A command from MQTT: the device or group by name (or IEEE address), Zigbee2MQTT's
-/// light keys translated
+/// Zigbee2MQTT's per-light memory between commands (the level before a fade to off)
+static LIGHT_MEMORY: LazyLock<Mutex<HashMap<String, z2m_light::Memory>>> = LazyLock::new(Default::default);
+
+/// What the light converters know of a device or group; `None` without on/off
+fn light_target(views: &[&DeviceView]) -> Option<z2m_light::Target> {
+    let with = |key: &str| views.iter().filter(|v| v.features.iter().any(|f| f.key == key)).copied().collect::<Vec<_>>();
+    let switches = with("on");
+    if switches.is_empty() {
+        return None;
+    }
+    let levels = with("level");
+    let temps = with("color_temp");
+    let range = |v: &DeviceView, key: &str| v.features.iter().find(|f| f.key == key).map(|f| f.range(&v.device)).unwrap_or((None, None));
+    // A group: on if any member is, the brightest level, the narrowest color range
+    let on = switches.iter().filter_map(|v| v.device.state.get("on").and_then(Json::as_bool)).reduce(|a, b| a || b);
+    let brightness = levels.iter().filter_map(|v| v.device.state.get("level").and_then(Json::as_f64)).reduce(f64::max);
+    let color_temp_min = temps.iter().filter_map(|v| range(v, "color_temp").0).reduce(f64::max);
+    let color_temp_max = temps.iter().filter_map(|v| range(v, "color_temp").1).reduce(f64::min);
+    Some(z2m_light::Target {
+        on,
+        brightness,
+        has_level: !levels.is_empty(),
+        has_color_temp: !temps.is_empty(),
+        color_temp_min,
+        color_temp_max,
+        // Zigbee2MQTT's "allEqual": every light starts at level 2 (Hue)
+        turns_off_at_brightness1: !levels.is_empty() && levels.iter().all(|v| range(v, "level").0 == Some(2.0)),
+    })
+}
+
+/// A command from MQTT: the device or group by name (or IEEE address). Light keys run as
+/// Zigbee2MQTT's light converters do, the other keys set the hub's features.
 async fn apply(hub: &Arc<Hub>, name: &str, command: Map<String, Json>) -> anyhow::Result<()> {
     let devices = hub.devices();
     let target = devices.iter().find(|d| topic_name(&d.device.name) == name || d.device.ieee == name);
     let group = hub.groups().into_iter().find(|g| topic_name(&g.name) == name);
-    let current_on = match (&target, &group) {
-        (Some(d), _) => d.device.state.get("on").and_then(Json::as_bool).unwrap_or(false),
-        (None, Some(g)) => g
-            .members
-            .iter()
-            .any(|m| devices.iter().any(|d| d.device.ieee == m.ieee && d.device.state.get("on").and_then(Json::as_bool) == Some(true))),
+    let (key, members): (String, Vec<&DeviceView>) = match (&target, &group) {
+        (Some(d), _) => (d.device.ieee.clone(), vec![*d]),
+        (None, Some(g)) => (
+            format!("group:{}", g.id),
+            g.members.iter().filter_map(|m| devices.iter().find(|d| d.device.ieee == m.ieee)).collect(),
+        ),
         (None, None) => anyhow::bail!("no device or group named {name}"),
     };
-    let (writes, transition) = translate(command, target, current_on)?;
-    let result = async {
-        for (key, value) in writes {
-            match (&target, &group) {
-                (Some(d), _) => {
-                    hub.set_with(&d.device.ieee, &key, value, transition).await?;
+    let light = light_target(&members).filter(|_| command.keys().any(|k| z2m_light::KEYS.contains(&k.as_str())));
+    let (parts, rest, rest_first) = match &light {
+        Some(t) => {
+            let memory = LIGHT_MEMORY.lock().unwrap().get(&key).cloned().unwrap_or_default();
+            let plan = z2m_light::plan(&command, t, &memory);
+            LIGHT_MEMORY.lock().unwrap().insert(key.clone(), plan.memory);
+            (plan.parts, plan.rest, plan.rest_first)
+        }
+        None => (Vec::new(), command, false),
+    };
+
+    let mut last_error = None;
+    let mut done_any = false;
+    let run_rest = async |done_any: &mut bool, last_error: &mut Option<anyhow::Error>| {
+        for (key, value) in translate_rest(rest.clone()) {
+            let result = match (&target, &group) {
+                (Some(d), _) => hub.set(&d.device.ieee, &key, value).await.map(drop),
+                (None, Some(g)) => hub.set_group(g.id, &key, &value),
+                (None, None) => Ok(()),
+            };
+            match result {
+                Ok(()) => *done_any = true,
+                Err(e) => {
+                    warn!("MQTT {name}/set {key}: {e:#}");
+                    *last_error = Some(e);
                 }
-                (None, Some(g)) => hub.set_group_with(g.id, &key, &value, transition)?,
-                (None, None) => {}
             }
         }
-        anyhow::Ok(())
+    };
+    if rest_first {
+        run_rest(&mut done_any, &mut last_error).await;
     }
-    .await;
-    // Zigbee2MQTT publishes the state after every command, changed or not: a client that
-    // lost track (it thought a light off that was on) is corrected by its next command
-    match (&target, &group) {
-        (Some(d), _) => hub.republish(&d.device.ieee),
-        (None, Some(g)) => g.members.iter().for_each(|m| hub.republish(&m.ieee)),
-        (None, None) => {}
+    // Zigbee2MQTT runs every converter, logging the ones that fail
+    for part in parts {
+        let result = match part {
+            Ok(part) => run_light(hub, &target, &group, &members, part).await,
+            Err(e) => Err(e),
+        };
+        match result {
+            Ok(()) => done_any = true,
+            Err(e) => {
+                warn!("MQTT {name}/set: {e:#}");
+                last_error = Some(e);
+            }
+        }
     }
-    result
+    if !rest_first {
+        run_rest(&mut done_any, &mut last_error).await;
+    }
+    // Zigbee2MQTT publishes the state after a command, changed or not: a client that lost
+    // track (it thought a light off that was on) is corrected by its next command
+    if done_any {
+        members.iter().for_each(|m| hub.republish(&m.device.ieee));
+    }
+    match last_error {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
-/// A Zigbee2MQTT command as the hub's writes, with the transition (tenths of a second)
-fn translate(command: Map<String, Json>, target: Option<&DeviceView>, current_on: bool) -> anyhow::Result<(Vec<(String, Json)>, Option<u16>)> {
-    let mut writes: Vec<(String, Json)> = Vec::new();
-    let state = command.get("state").and_then(Json::as_str).map(str::to_ascii_uppercase);
-    let brightness = match command.get("brightness") {
-        None => None,
-        Some(v) => Some(v.as_f64().filter(|b| b.is_finite()).context("brightness: expected a number")?),
-    };
-    // Seconds, as Zigbee2MQTT takes it; ZCL counts tenths
-    let transition = match command.get("transition") {
-        None => None,
-        Some(v) => {
-            let seconds = v.as_f64().filter(|t| t.is_finite() && *t >= 0.0).context("transition: expected seconds")?;
-            Some((seconds * 10.0).round().min(65_534.0) as u16)
+/// Sends one light converter's commands and takes its state
+async fn run_light(hub: &Arc<Hub>, target: &Option<&DeviceView>, group: &Option<Group>, members: &[&DeviceView], part: z2m_light::Part) -> anyhow::Result<()> {
+    for step in &part.steps {
+        match step {
+            z2m_light::Step::Command { cluster, command, payload } => match (target, group) {
+                (Some(d), _) => hub.send_zcl_command(&d.device.ieee, *cluster, *command, payload.clone()).await?,
+                (None, Some(g)) => hub.send_group_zcl(g.id, *cluster, *command, payload, Vec::new())?,
+                (None, None) => {}
+            },
+            z2m_light::Step::Read { cluster, attributes, after_ms } => {
+                tokio::time::sleep(Duration::from_millis(*after_ms)).await;
+                // A group is read through its first member that has the cluster
+                let reader = members.iter().find(|m| m.device.endpoint_with(*cluster).is_some());
+                if let Some(m) = reader {
+                    hub.read_attrs(&m.device.ieee, *cluster, attributes).await?;
+                }
+            }
         }
-    };
-    // As Zigbee2MQTT: brightness 0 alone turns the light off, a toggle with brightness
-    // turns it off when it is on
-    let off = match state.as_deref() {
-        Some("OFF") => true,
-        Some("TOGGLE") => current_on,
-        Some("ON") => false,
-        None => brightness.is_some_and(|b| b <= 0.0),
-        Some(other) => anyhow::bail!("unknown state {other}"),
-    };
-    if off {
-        writes.push(("on".into(), json!(false)));
-    } else if let Some(b) = brightness {
-        // Move to Level with On/Off turns the light on as well; 0 and 1 mean the lowest
-        // level the light takes (Hue lights turn off at 1)
-        let lowest = target
-            .and_then(|d| d.features.iter().find(|f| f.key == "level").map(|f| f.range(&d.device).0))
-            .flatten()
-            .unwrap_or(1.0);
-        writes.push(("level".into(), json!(b.round().clamp(lowest, 254.0))));
-    } else if state.is_some() {
-        writes.push(("on".into(), json!(true)));
     }
-    for (key, mut value) in command {
-        if key == "state" || key == "brightness" || key == "transition" || (off && key == "color_temp") {
-            continue;
+    for m in members {
+        let values: Vec<(&'static str, Json)> = part.state.iter().filter(|(k, _)| m.features.iter().any(|f| f.key == *k)).cloned().collect();
+        if !values.is_empty() {
+            hub.set_state_quiet(&m.device.ieee, values);
         }
-        let key = match key.as_str() {
-            "current_heating_setpoint" | "occupied_heating_setpoint" => "setpoint".to_owned(),
-            _ => key,
-        };
-        if let Some((on, off)) = binary_words(&key)
-            && let Some(word) = value.as_str()
-        {
-            value = match word {
-                w if w.eq_ignore_ascii_case(on) => json!(true),
-                w if w.eq_ignore_ascii_case(off) => json!(false),
-                _ => value,
+    }
+    Ok(())
+}
+
+/// Zigbee2MQTT's names and words for the hub's other features
+fn translate_rest(command: Map<String, Json>) -> Vec<(String, Json)> {
+    command
+        .into_iter()
+        .map(|(key, mut value)| {
+            let key = match key.as_str() {
+                "current_heating_setpoint" | "occupied_heating_setpoint" => "setpoint".to_owned(),
+                _ => key,
             };
+            if let Some((on, off)) = binary_words(&key)
+                && let Some(word) = value.as_str()
+            {
+                value = match word {
+                    w if w.eq_ignore_ascii_case(on) => json!(true),
+                    w if w.eq_ignore_ascii_case(off) => json!(false),
+                    _ => value,
+                };
+            }
+            (key, value)
+        })
+        .collect()
+}
+
+/// `<name>/get`: reads what the keys stand for, then publishes the state
+async fn get(hub: &Arc<Hub>, name: &str, keys: Vec<String>) -> anyhow::Result<()> {
+    let devices = hub.devices();
+    let target = devices.iter().find(|d| topic_name(&d.device.name) == name || d.device.ieee == name);
+    let group = hub.groups().into_iter().find(|g| topic_name(&g.name) == name);
+    let reader = match (&target, &group) {
+        (Some(d), _) => d.device.ieee.clone(),
+        (None, Some(g)) => g.members.first().context("the group has no members")?.ieee.clone(),
+        (None, None) => anyhow::bail!("no device or group named {name}"),
+    };
+    let mut last_error = None;
+    for key in keys {
+        let result = match z2m_light::get_reads(&key) {
+            Some((cluster, attrs)) => hub.read_attrs(&reader, cluster, attrs).await,
+            None => hub.read_feature(&reader, &translate_rest(Map::from_iter([(key, Json::Null)]))[0].0).await,
+        };
+        if let Err(e) = result {
+            last_error = Some(e);
         }
-        // Tools scale color temperature over 153-500 mireds; the light's range is narrower
-        if key == "color_temp"
-            && let (Some(d), Some(v)) = (&target, value.as_f64())
-            && let Some(f) = d.features.iter().find(|f| f.key == "color_temp")
-        {
-            let (min, max) = f.range(&d.device);
-            value = json!(v.clamp(min.unwrap_or(v), max.unwrap_or(v)).round());
-        }
-        writes.push((key, value));
     }
-    Ok((writes, transition))
+    hub.republish(&reader);
+    match last_error {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 #[cfg(test)]
@@ -1078,28 +1174,4 @@ mod tests {
         assert_eq!((lock["value_on"].clone(), lock["value_off"].clone()), (json!("LOCK"), json!("UNLOCK")));
     }
 
-    #[test]
-    fn commands_translate_as_zigbee2mqtt() {
-        let lamp = view("LTA009", json!({"on": true, "level": 204, "color_temp": 250}));
-        let t = |c: Json, on: bool| translate(c.as_object().unwrap().clone(), Some(&lamp), on).unwrap();
-        // The plain states
-        assert_eq!(t(json!({"state": "OFF"}), true).0, [("on".to_owned(), json!(false))]);
-        assert_eq!(t(json!({"state": "on"}), false).0, [("on".to_owned(), json!(true))]);
-        assert_eq!(t(json!({"state": "TOGGLE"}), true).0, [("on".to_owned(), json!(false))]);
-        // Brightness 0 alone turns off; with ON it is the lowest level (2 for Hue)
-        assert_eq!(t(json!({"brightness": 0}), true).0, [("on".to_owned(), json!(false))]);
-        assert_eq!(t(json!({"state": "ON", "brightness": 0}), false).0, [("level".to_owned(), json!(2.0))]);
-        assert_eq!(t(json!({"brightness": 1}), true).0, [("level".to_owned(), json!(2.0))]);
-        assert_eq!(t(json!({"brightness": 203.2}), true).0, [("level".to_owned(), json!(203.0))]);
-        // A toggle with brightness turns an on light off
-        assert_eq!(t(json!({"state": "TOGGLE", "brightness": 100}), true).0, [("on".to_owned(), json!(false))]);
-        // Transition in seconds becomes tenths and is no write of its own; off drops color_temp
-        let (writes, transition) = t(json!({"state": "OFF", "transition": 1.5, "color_temp": 300}), true);
-        assert_eq!(writes, [("on".to_owned(), json!(false))]);
-        assert_eq!(transition, Some(15));
-        let (writes, transition) = t(json!({"state": "ON", "brightness": 204, "color_temp": 250}), false);
-        assert_eq!(writes, [("level".to_owned(), json!(204.0)), ("color_temp".to_owned(), json!(250.0))]);
-        assert_eq!(transition, None);
-        assert!(translate(json!({"brightness": "x"}).as_object().unwrap().clone(), Some(&lamp), true).is_err());
-    }
 }

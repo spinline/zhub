@@ -720,6 +720,36 @@ impl Hub {
     }
 
     /// Sets state values ahead of the device's own report
+    /// Reads attributes of a device; the answers update its state as reports do
+    pub async fn read_attrs(&self, ieee: &str, cluster_id: u16, attrs: &[u16]) -> Result<()> {
+        let device = self.device(ieee).context("device not found")?;
+        let ep = device.endpoint_with(cluster_id).context("the device does not have this cluster")?;
+        self.read_attributes(device.nwk, ep, cluster_id, None, attrs).await.map(drop)
+    }
+
+    /// Reads the attribute behind a feature (Zigbee2MQTT's `/get`)
+    pub async fn read_feature(&self, ieee: &str, key: &str) -> Result<()> {
+        let device = self.device(ieee).context("device not found")?;
+        let feature = devices::features(&device).into_iter().find(|f| f.key == key).with_context(|| format!("unknown feature: {key}"))?;
+        let Source::Attr { cluster, attr, manufacturer, .. } = feature.source else {
+            bail!("{} cannot be read", feature.label);
+        };
+        let ep = device.endpoint_with(cluster).context("the device does not have this cluster")?;
+        self.read_attributes(device.nwk, ep, cluster, manufacturer, &[attr]).await.map(drop)
+    }
+
+    /// Sets state values without telling anyone yet (a `republish` follows)
+    pub fn set_state_quiet(&self, ieee: &str, values: Vec<(&'static str, Json)>) {
+        let mut data = self.data.lock().unwrap();
+        if let Some(device) = data.devices.get_mut(ieee) {
+            for (key, value) in values {
+                device.state.insert(key.to_owned(), value);
+            }
+            drop(data);
+            self.dirty.notify_one();
+        }
+    }
+
     pub fn set_state_values(&self, ieee: &str, values: Vec<(&'static str, Json)>) {
         self.update_device(ieee, |d| {
             for (key, value) in values {
@@ -1831,12 +1861,6 @@ impl Hub {
     /// depending on its source. Attribute writes to sleepy devices are queued; returns
     /// `true` when the write waits for the device to wake up.
     pub async fn set(self: &Arc<Self>, ieee: &str, key: &str, value: Json) -> Result<bool> {
-        self.set_with(ieee, key, value, None).await
-    }
-
-    /// `set` with a transition time for light commands (tenths of a second; the hub's
-    /// half second when `None`)
-    pub async fn set_with(self: &Arc<Self>, ieee: &str, key: &str, value: Json, transition: Option<u16>) -> Result<bool> {
         let device = self.device(ieee).context("device not found")?;
         let feature = devices::features(&device)
             .into_iter()
@@ -1890,7 +1914,7 @@ impl Hub {
                 Ok(true)
             }
             Source::Attr { cluster, write, .. } => {
-                self.light_command(&device, feature, cluster, write, &value, transition).await?;
+                self.light_command(&device, feature, cluster, write, &value).await?;
                 Ok(false)
             }
             // Validation already refuses these
@@ -1986,17 +2010,9 @@ impl Hub {
     }
 
     /// Light cluster commands: On/Off, Move to Level (with On/Off), Move to Color Temperature
-    async fn light_command(
-        &self,
-        device: &Device,
-        feature: &Feature,
-        cluster_id: u16,
-        write: Write,
-        value: &Json,
-        transition: Option<u16>,
-    ) -> Result<()> {
-        // Half-second transition unless asked otherwise
-        let transition = transition.unwrap_or(5);
+    async fn light_command(&self, device: &Device, feature: &Feature, cluster_id: u16, write: Write, value: &Json) -> Result<()> {
+        // Half-second transition
+        let transition: u16 = 5;
         let number = || value.as_f64().unwrap_or_default().round();
         let (command, payload): (u8, Vec<u8>) = match write {
             Write::OnOff => (u8::from(value.as_bool() == Some(true)), vec![]),
@@ -2495,12 +2511,7 @@ impl Hub {
     /// One multicast frame for the whole group: on/off, brightness or color temperature.
     /// The members' states are updated at once; their reports confirm shortly.
     pub fn set_group(&self, id: u16, key: &str, value: &Json) -> Result<()> {
-        self.set_group_with(id, key, value, None)
-    }
-
-    /// `set_group` with a transition time (tenths of a second; half a second when `None`)
-    pub fn set_group_with(&self, id: u16, key: &str, value: &Json, transition: Option<u16>) -> Result<()> {
-        let transition = transition.unwrap_or(5);
+        let transition: u16 = 5;
         let members = {
             let data = self.data.lock().unwrap();
             data.groups.iter().find(|g| g.id == id).context("group not found")?.members.clone()

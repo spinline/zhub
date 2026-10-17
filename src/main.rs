@@ -11,6 +11,7 @@ mod thermostat;
 mod store;
 mod tuya;
 mod web;
+mod z2m_light;
 mod zcl;
 mod zdo;
 
