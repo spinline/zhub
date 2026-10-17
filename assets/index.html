@@ -1524,7 +1524,12 @@ function connect() {
   source.onmessage = (msg) => {
     const event = JSON.parse(msg.data);
     if (event.type === "device") {
-      devices.set(event.device.ieee, event.device);
+      const d = event.device, before = devices.get(d.ieee);
+      if (!before) toast(`New device joined: ${d.name}`);
+      else if (!before.interviewed && d.interviewed) {
+        toast(d.definition ? `${d.name} is ready: ${d.definition.vendor} ${d.model || ""} (${d.definition.description})` : `${d.name} joined, but ${d.model || "its model"} is not supported`);
+      }
+      devices.set(d.ieee, d);
       render();
     } else if (event.type === "removed") {
       devices.delete(event.ieee);
