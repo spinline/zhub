@@ -3162,7 +3162,6 @@ dependencies = [
 [[package]]
 name = "ziggurat-spinel"
 version = "0.1.0"
-source = "git+https://github.com/zigpy/ziggurat?rev=913a5c247b611ac1ffa0bb7f9feaa9e59d656336#913a5c247b611ac1ffa0bb7f9feaa9e59d656336"
 dependencies = [
  "crc_all",
  "num_enum",

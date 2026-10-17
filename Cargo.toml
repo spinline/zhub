@@ -43,3 +43,7 @@ codegen-units = 1
 opt-level = "s"
 panic = "abort"
 strip = true
+
+# zhub's copy of ziggurat-spinel with a shorter transmit timeout (vendor/ziggurat-spinel/ZHUB-CHANGES.md)
+[patch."https://github.com/zigpy/ziggurat"]
+ziggurat-spinel = { path = "vendor/ziggurat-spinel" }

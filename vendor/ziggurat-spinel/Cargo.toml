@@ -1,0 +1,19 @@
+[package]
+name = "ziggurat-spinel"
+version = "0.1.0"
+description = "OpenThread Spinel protocol codec and RCP client for the Ziggurat Zigbee stack"
+rust-version = "1.98"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/zigpy/ziggurat"
+
+[dependencies]
+ziggurat-ieee-802154 = { git = "https://github.com/zigpy/ziggurat", rev = "913a5c247b611ac1ffa0bb7f9feaa9e59d656336" }
+
+crc_all = "0.2.2"
+tracing = "0.1"
+num_enum = "0.7.6"
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["rt", "time", "sync", "io-util"] }
+tokio-serial = "5.5"
+

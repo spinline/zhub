@@ -1394,7 +1394,7 @@ async function loadSettings() {
   infoRows($("#setAdapter"), [
     ["Serial port", info.serial_port],
     ["Baud rate", String(info.baudrate)],
-    ["Flow control", "None"],
+    ["Flow control", info.flow_control ?? "None"],
   ]);
   $("#setGeneral").replaceChildren(
     numberSetting("Mains-powered devices offline after", "min", hubSettings.availability_mains_minutes, { min: 1, max: 1440 },
