@@ -19,7 +19,7 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 getrandom = "0.3"
 rumqttc = { version = "0.24", default-features = false }
 # Matter bridge (feature "matter"); a pinned commit, the crate is not released often
-rs-matter = { git = "https://github.com/project-chip/rs-matter", rev = "c69916a5a78957d46500145486df375acf4ab490", optional = true }
+rs-matter = { git = "https://github.com/project-chip/rs-matter", rev = "c69916a5a78957d46500145486df375acf4ab490", features = ["groups"], optional = true }
 embassy-futures = { version = "0.1", optional = true }
 embassy-time = { version = "0.5", features = ["std"], optional = true }
 embassy-time-queue-utils = { version = "0.3", features = ["generic-queue-64"], optional = true }

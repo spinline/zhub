@@ -338,6 +338,10 @@ pub struct Persisted {
     pub devices: BTreeMap<String, Device>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub groups: Vec<Group>,
+    /// Matter endpoint per device: ieee → endpoint id. Kept for removed devices too, so an
+    /// id is never given to another device (controllers remember them)
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub matter_endpoints: BTreeMap<String, u16>,
     /// Values queued for sleepy devices: ieee → (feature → value)
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub pending_writes: BTreeMap<String, BTreeMap<String, Json>>,

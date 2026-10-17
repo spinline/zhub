@@ -9,6 +9,7 @@
 //! when adding it.
 
 mod avahi;
+mod bridge;
 
 use std::net::UdpSocket;
 use std::path::PathBuf;
@@ -16,16 +17,16 @@ use std::pin::pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use embassy_futures::select::{Either, select, select4};
+use embassy_futures::select::{Either, Either3, select, select3, select4};
 use rs_matter::crypto::{Crypto, default_crypto};
 use rs_matter::dm::clusters::basic_info::BasicInfoConfig;
 use rs_matter::dm::clusters::desc::{self, ClusterHandler as _};
-use rs_matter::dm::devices::DEV_TYPE_AGGREGATOR;
 use rs_matter::dm::devices::test::{DAC_PRIVKEY, TEST_DEV_ATT, TEST_PID, TEST_VID};
 use rs_matter::dm::endpoints;
 use rs_matter::dm::networks::SysNetifs;
 use rs_matter::dm::networks::eth::EthNetwork;
-use rs_matter::dm::{Async, DataModel, Dataver, Endpoint, Node};
+use rs_matter::dm::clusters::groups::{self, ClusterHandler as _};
+use rs_matter::dm::{AttrChangeNotifier, Async, DataModel, Dataver};
 use rs_matter::error::Error;
 use rs_matter::im::{EthInteractionModelState, InteractionModel};
 use rs_matter::pairing::DiscoveryCapabilities;
@@ -36,12 +37,12 @@ use rs_matter::sc::pase::{CommWindowState, Spake2pVerifierPassword, Spake2pVerif
 use rs_matter::transport::MATTER_SOCKET_BIND_ADDR;
 use rs_matter::transport::exchange::MatterBuffers;
 use rs_matter::utils::select::Coalesce;
-use rs_matter::{BasicCommData, MATTER_PORT, Matter, clusters, devices, root_endpoint};
+use rs_matter::{BasicCommData, MATTER_PORT, Matter};
 use serde::Serialize;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{info, warn};
 
-use crate::hub::{Hub, MatterCommand};
+use crate::hub::{Event, Hub, MatterCommand};
 use crate::store::MatterSettings;
 
 /// How long a commissioning window opened from the UI stays open (seconds)
@@ -71,11 +72,13 @@ pub struct MatterStatus {
 /// it when the settings change
 pub fn start(hub: Arc<Hub>, data_dir: PathBuf, commands: mpsc::UnboundedReceiver<MatterCommand>) {
     let settings = hub.matter_settings();
+    // Zigbee commands are run on the hub's runtime
+    let rt = tokio::runtime::Handle::current();
     let spawned = std::thread::Builder::new()
         .name("matter".into())
         // rs-matter keeps its buffers and state on the stack of the running future
         .stack_size(8 * 1024 * 1024)
-        .spawn(move || supervise(hub, data_dir, settings, commands));
+        .spawn(move || supervise(hub, rt, data_dir, settings, commands));
     if let Err(e) = spawned {
         warn!("Matter not started: {e}");
     }
@@ -83,6 +86,7 @@ pub fn start(hub: Arc<Hub>, data_dir: PathBuf, commands: mpsc::UnboundedReceiver
 
 fn supervise(
     hub: Arc<Hub>,
+    rt: tokio::runtime::Handle,
     data_dir: PathBuf,
     mut settings: watch::Receiver<MatterSettings>,
     mut commands: mpsc::UnboundedReceiver<MatterCommand>,
@@ -102,7 +106,7 @@ fn supervise(
             }
             continue;
         }
-        let outcome = futures_lite::future::block_on(run(&hub, &data_dir, &current, &mut settings, &mut commands));
+        let outcome = futures_lite::future::block_on(run(&hub, &rt, &data_dir, &current, &mut settings, &mut commands));
         avahi::clear(dir);
         match outcome {
             Ok(Stop::SettingsChanged) => info!("Matter settings changed, restarting the Matter stack"),
@@ -169,26 +173,53 @@ fn qr_svg(text: &str) -> Result<String, Error> {
     ))
 }
 
-/// The node: root endpoint and the aggregator the bridged devices hang off
-const NODE: Node<'static> = Node {
-    endpoints: &[
-        root_endpoint!(eth),
-        Endpoint::new(1, devices!(DEV_TYPE_AGGREGATOR), clusters!(desc::DescHandler::CLUSTER)),
-    ],
-};
-
-fn data_model(mut rand: impl rand::Rng + Copy) -> impl DataModel {
+/// The data model: root endpoint, the aggregator and the bridged devices (see `bridge`)
+fn data_model<'a>(bridge: &'a bridge::Bridge, mut rand: impl rand::Rng + Copy) -> impl DataModel + 'a {
     (
-        NODE,
-        endpoints::EthSysHandlerBuilder::new().netif_diag(&SysNetifs).build(rand).chain(
-            |e, c| e == 1 && c == desc::DescHandler::CLUSTER.id,
-            Async(desc::DescHandler::new_aggregator(Dataver::new_rand(&mut rand)).adapt()),
-        ),
+        bridge::BridgeNode(bridge),
+        endpoints::EthSysHandlerBuilder::new()
+            .netif_diag(&SysNetifs)
+            .build(rand)
+            .chain(
+                |e, c| e == bridge::AGGREGATOR_ENDPOINT && c == desc::DescHandler::CLUSTER.id,
+                Async(desc::DescHandler::new_aggregator(Dataver::new_rand(&mut rand)).adapt()),
+            )
+            .chain(
+                |e, c| e > bridge::AGGREGATOR_ENDPOINT && c == desc::DescHandler::CLUSTER.id,
+                Async(desc::DescHandler::new(Dataver::new_rand(&mut rand)).adapt()),
+            )
+            .chain(
+                |e, c| e > bridge::AGGREGATOR_ENDPOINT && c == groups::GroupsHandler::CLUSTER.id,
+                Async(groups::GroupsHandler::new(Dataver::new_rand(&mut rand)).adapt()),
+            )
+            .chain(bridge::BridgedHandler::handles, bridge::BridgedHandler(bridge)),
     )
+}
+
+/// Attribute change notifications into the interaction model
+struct ImNotify<'a, T: AttrChangeNotifier>(&'a T);
+
+impl<T: AttrChangeNotifier> bridge::Notify for ImNotify<'_, T> {
+    fn cluster_changed(&self, endpoint: u16, cluster: u32) {
+        self.0.notify_cluster_changed(endpoint, cluster);
+    }
+
+    fn endpoint_changed(&self, endpoint: u16) {
+        self.0.notify_endpoint_changed(endpoint);
+    }
+}
+
+/// Before the interaction model exists there is nobody to tell
+struct NoNotify;
+
+impl bridge::Notify for NoNotify {
+    fn cluster_changed(&self, _endpoint: u16, _cluster: u32) {}
+    fn endpoint_changed(&self, _endpoint: u16) {}
 }
 
 async fn run(
     hub: &Arc<Hub>,
+    rt: &tokio::runtime::Handle,
     data_dir: &std::path::Path,
     cfg: &MatterSettings,
     settings: &mut watch::Receiver<MatterSettings>,
@@ -228,7 +259,9 @@ async fn run(
     let state: EthInteractionModelState = EthInteractionModelState::new(EthNetwork::new_default());
     let crypto = default_crypto(rand::rng(), DAC_PRIVKEY);
     let rand = crypto.rand()?;
-    let im = InteractionModel::new(&matter, &crypto, &buffers, data_model(rand), &kv, &state);
+    let bridge = bridge::Bridge::new(hub.clone(), rt.clone());
+    bridge.sync(&NoNotify);
+    let im = InteractionModel::new(&matter, &crypto, &buffers, data_model(&bridge, rand), &kv, &state);
     im.startup().await?;
 
     let responder = DefaultResponder::new(&im);
@@ -284,10 +317,37 @@ async fn run(
         }
     };
 
+    // Devices joining, leaving or changing state
+    let follow = async {
+        let notify = ImNotify(&im);
+        let mut events = hub.subscribe();
+        bridge.sync(&notify);
+        loop {
+            match events.recv().await {
+                Ok(Event::Device { device }) => {
+                    bridge.sync(&notify);
+                    bridge.device_changed(&device.device.ieee, &notify);
+                }
+                Ok(Event::Removed { .. }) => bridge.sync(&notify),
+                Ok(_) => {}
+                // Missed changes: everything may have changed
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    bridge.sync(&notify);
+                    for view in hub.devices() {
+                        bridge.device_changed(&view.device.ieee, &notify);
+                    }
+                }
+                Err(broadcast::error::RecvError::Closed) => core::future::pending::<()>().await,
+            }
+        }
+    };
+
     let stack = select4(&mut transport, &mut mdns, &mut respond, &mut im_job).coalesce();
-    match select(pin!(stack), select(pin!(control), pin!(status))).await {
+    let (control, status, follow) = (pin!(control), pin!(status), pin!(follow));
+    let side = select3(control, status, follow);
+    match select(pin!(stack), side).await {
         Either::First(result) => result.map(|()| Stop::Closed),
-        Either::Second(Either::First(stop)) => Ok(stop),
-        Either::Second(Either::Second(())) => Ok(Stop::Closed),
+        Either::Second(Either3::First(stop)) => Ok(stop),
+        Either::Second(Either3::Second(()) | Either3::Third(())) => Ok(Stop::Closed),
     }
 }

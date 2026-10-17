@@ -640,6 +640,64 @@ impl Hub {
         self.matter_commands.send(command).map_err(|_| anyhow!("the Matter bridge is not running"))
     }
 
+    // ---- For the Matter bridge ----
+
+    /// Sends a cluster-specific ZCL command to the device. Matter's On/Off, Level Control,
+    /// Color Control and Identify commands are the ZCL ones, ids included.
+    pub async fn send_zcl_command(&self, ieee: &str, cluster_id: u16, command: u8, payload: Vec<u8>) -> Result<()> {
+        let device = self.device(ieee).context("device not found")?;
+        self.cluster_command(
+            &device,
+            CommandFrame {
+                cluster: cluster_id,
+                manufacturer: None,
+                command,
+                payload,
+            },
+        )
+        .await
+    }
+
+    /// Sets state values ahead of the device's own report
+    pub fn set_state_values(&self, ieee: &str, values: Vec<(&'static str, Json)>) {
+        self.update_device(ieee, |d| {
+            for (key, value) in values {
+                d.state.insert(key.to_owned(), value);
+            }
+        });
+    }
+
+    pub fn device_view(&self, ieee: &str) -> Option<DeviceView> {
+        self.device(ieee).map(|d| self.view(&d))
+    }
+
+    /// The device's Matter endpoint: allocated once, from 2 up, never reused
+    pub fn matter_endpoint(&self, ieee: &str) -> u16 {
+        let mut data = self.data.lock().unwrap();
+        if let Some(&id) = data.matter_endpoints.get(ieee) {
+            return id;
+        }
+        let id = data.matter_endpoints.values().max().map_or(2, |max| max + 1);
+        data.matter_endpoints.insert(ieee.to_owned(), id);
+        drop(data);
+        self.dirty.notify_one();
+        id
+    }
+
+    /// Zigbee2MQTT's availability: no message for longer than the device type's limit
+    pub fn is_offline(&self, device: &Device) -> bool {
+        let Some(seen) = device.last_seen else {
+            return false;
+        };
+        let settings = &self.data.lock().unwrap().settings;
+        let minutes = if device.rx_on_when_idle {
+            settings.availability_mains_minutes
+        } else {
+            settings.availability_battery_minutes
+        };
+        now_unix().saturating_sub(seen) > u64::from(minutes) * 60
+    }
+
     /// Where the hub keeps its files (the state file's directory)
     pub fn data_dir(&self) -> PathBuf {
         self.state_path.parent().map(PathBuf::from).unwrap_or_default()
