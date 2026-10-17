@@ -167,13 +167,11 @@
   details.members .member span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   details.members .member button { padding: 2px 8px; font-size: 12px; }
   details.members select { flex: 1; min-width: 0; }
-  .week { display: flex; flex-direction: column; gap: 2px; margin: 6px 0 10px; }
-  .week button { display: grid; grid-template-columns: 42px 1fr; gap: 8px; text-align: left; border: 0; background: none; padding: 6px 8px; border-radius: 8px; font-size: 13px; }
-  .week button span { color: var(--muted); }
-  .week button.active { background: var(--accent-soft); }
-  .tslot { display: grid; grid-template-columns: 1fr 1fr auto; gap: 8px; align-items: center; margin: 4px 0; }
-  .tslot input { width: 100%; }
-  .tslot button { padding: 4px 10px; }
+  .days { display: flex; flex-direction: column; gap: 6px; margin-top: 6px; }
+  .dayrow { display: grid; grid-template-columns: 92px 1fr auto; gap: 8px; align-items: center; font-size: 14px; }
+  .dayrow b { font-weight: 500; }
+  .dayrow input { width: 100%; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; }
+  @media (max-width: 520px) { .dayrow { grid-template-columns: 1fr auto; } .dayrow b { grid-column: 1 / -1; } }
   .log-tools { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; font-size: 13px; color: var(--muted); }
   pre.log {
     margin: 0; background: var(--bg); border: 1px solid var(--line); border-radius: 10px; padding: 10px;
@@ -524,76 +522,50 @@ function control(ieee, f) {
   return { node: row(out), update(d) { setTitle(d); out.textContent = formatValue(f, d.state[f.key], d); } };
 }
 
-// ZCL thermostat schedule (TRVZB): a week overview, and the chosen day's transitions
+// ZCL thermostat schedule (TRVZB), as in Zigbee2MQTT: one text per day in the format
+// "HH:mm/temperature HH:mm/temperature", e.g. "00:00/17 06:30/21 22:30/17"
 const WEEK = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"];
-const WEEKDAYS = WEEK.slice(0, 5);
+
+const scheduleText = (slots) => (slots ?? []).map(s => `${s.time}/${s.temperature}`).join(" ");
+
+function parseScheduleText(text, day) {
+  const slots = text.trim().split(/\s+/).filter(Boolean).map(token => {
+    const m = token.match(/^(\d{1,2}):(\d{2})\/(\d+(?:[.,]\d+)?)$/);
+    if (!m) throw new Error(`${label(day)}: "${token}" is not HH:mm/temperature (e.g. 06:30/21)`);
+    return { time: `${m[1].padStart(2, "0")}:${m[2]}`, temperature: Number(m[3].replace(",", ".")) };
+  });
+  if (!slots.length) throw new Error(`${label(day)}: enter at least 00:00/temperature`);
+  return slots;
+}
 
 function weekScheduleEditor(ieee, f) {
-  const { min, max, step, max_transitions: maxSlots } = f.kind;
-  let selected = "monday", draft = null, week = null, last;
-  const overview = el("div", { className: "week" });
-  const editor = el("div");
-  // The valve cannot report its schedule: days never saved here are unknown
-  const summary = (slots) => slots?.length ? slots.map(s => `${s.time} ${s.temperature}°`).join(" · ") : "unknown (not saved here yet)";
-
-  const send = (days) => {
-    const value = Object.fromEntries(days.map(day => [day, draft]));
-    return run(setValue(ieee, f.key, value).then(() => { toast("Schedule saved"); draft = null; }));
-  };
-
-  function renderEditor() {
-    if (!draft) draft = structuredClone(week?.[selected] ?? [{ time: "00:00", temperature: 20 }]);
-    const rows = draft.map((slot, i) => {
-      const time = el("input", { type: "time", value: slot.time, disabled: i === 0 });
-      const temp = el("input", { type: "number", min, max, step, value: slot.temperature });
-      time.onchange = () => { slot.time = time.value; };
-      temp.onchange = () => { slot.temperature = Number(temp.value); };
-      const drop = el("button", { textContent: "✕", title: "Remove", disabled: i === 0 });
-      drop.onclick = () => { draft.splice(i, 1); renderEditor(); };
-      return el("div", { className: "tslot" }, time, temp, drop);
-    });
-    const add = el("button", { textContent: "Add transition", disabled: draft.length >= maxSlots });
-    add.onclick = () => {
-      const lastSlot = draft[draft.length - 1];
-      const [h, m] = lastSlot.time.split(":").map(Number);
-      const next = Math.min(23, h + 1);
-      draft.push({ time: `${String(next).padStart(2, "0")}:${String(m).padStart(2, "0")}`, temperature: lastSlot.temperature });
-      renderEditor();
+  let last;
+  const inputs = {};
+  const rows = WEEK.map(day => {
+    const input = el("input", { type: "text", placeholder: "unknown (not saved here yet)", autocomplete: "off", spellcheck: false });
+    const save = el("button", { textContent: "Save" });
+    const send = () => {
+      let slots;
+      try { slots = parseScheduleText(input.value, day); } catch (e) { toast(e.message); return; }
+      save.disabled = true;
+      save.textContent = "Saving…";
+      run(setValue(ieee, f.key, { [day]: slots }).then(() => toast(`${label(day)} saved`))
+        .finally(() => { save.disabled = false; save.textContent = "Save"; }));
     };
-    const name = label(selected);
-    const saveDay = el("button", { textContent: `Save ${name}`, className: "primary" });
-    const saveWeekdays = el("button", { textContent: "Save to Mon–Fri" });
-    const saveAll = el("button", { textContent: "Save to every day" });
-    saveDay.onclick = () => send([selected]);
-    saveWeekdays.onclick = () => send(WEEKDAYS);
-    saveAll.onclick = () => send(WEEK);
-    editor.replaceChildren(
-      el("div", { className: "label", textContent: `${name}: time and temperature (°C)` }),
-      ...rows,
-      el("div", { className: "actions" }, add),
-      el("div", { className: "actions" }, saveDay, saveWeekdays, saveAll),
-    );
-  }
-
-  function renderOverview() {
-    overview.replaceChildren(...WEEK.map(day => {
-      const row = el("button", { className: day === selected ? "active" : "" },
-        el("b", { textContent: label(day).slice(0, 3) }), el("span", { textContent: summary(week?.[day]) }));
-      row.onclick = () => { selected = day; draft = null; renderOverview(); renderEditor(); };
-      return row;
-    }));
-  }
-
+    save.onclick = send;
+    input.onkeydown = (e) => { if (e.key === "Enter") send(); };
+    inputs[day] = input;
+    return el("div", { className: "dayrow" }, el("b", { textContent: label(day) }), input, save);
+  });
   return {
-    node: el("div", {}, overview, editor),
+    node: el("div", { className: "days" }, ...rows),
     update(d) {
-      const json = JSON.stringify(d.state[f.key] ?? null);
+      const week = d.state[f.key] ?? {};
+      const json = JSON.stringify(week);
       if (json === last) return;
       last = json;
-      week = d.state[f.key] ?? null;
-      renderOverview();
-      // Unsaved edits stay
-      if (!draft || !editor.contains(document.activeElement)) { draft = null; renderEditor(); }
+      // Unsaved typing stays
+      for (const day of WEEK) if (!focused(inputs[day])) inputs[day].value = scheduleText(week[day]);
     },
   };
 }
