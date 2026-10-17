@@ -71,5 +71,21 @@ cat deploy/S99zhub | ssh -p 222 root@192.168.1.1 'cat > /opt/etc/init.d/S99zhub 
 ssh -p 222 root@192.168.1.1 /opt/etc/init.d/S99zhub restart
 ```
 
+MQTT broker on the router (optional; Home Assistant or another automation platform connects
+to it): Entware's `mosquitto-nossl` (no TLS, ~110 KB) with `deploy/mosquitto.conf`, which
+listens on the home network and localhost only and requires a password. This build stores
+passwords in plain text, so the file is readable by the broker user only:
+
+```sh
+opkg install mosquitto-nossl
+cat deploy/mosquitto.conf | ssh -p 222 root@192.168.1.1 'cat > /opt/etc/mosquitto/mosquitto.conf'
+# on the router: one line per user, "name:password"
+mkdir -p /opt/var/lib/mosquitto && chown nobody:nobody /opt/var/lib/mosquitto
+umask 077; echo "zhub:<password>" > /opt/etc/mosquitto/passwd; chown nobody:nobody /opt/etc/mosquitto/passwd
+/opt/etc/init.d/S80mosquitto restart
+```
+
+Then Settings → MQTT in zhub: broker 127.0.0.1, user zhub.
+
 Log: `/opt/var/log/zhub.log`. `--sniff` logs MAC command frames for diagnostics (the
 radio does not acknowledge frames while sniffing; use it only briefly).
