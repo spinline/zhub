@@ -658,6 +658,35 @@ impl Hub {
         .await
     }
 
+    /// Sends a cluster-specific ZCL command to a group (one multicast frame); the members
+    /// that have the given features get `state` at once
+    pub fn send_group_zcl(&self, id: u16, cluster_id: u16, command: u8, payload: &[u8], state: Vec<(&'static str, Json)>) -> Result<()> {
+        let members = {
+            let data = self.data.lock().unwrap();
+            data.groups.iter().find(|g| g.id == id).context("group not found")?.members.clone()
+        };
+        let frame = zcl::frame(
+            zcl::FC_CLUSTER_SPECIFIC | zcl::FC_DISABLE_DEFAULT_RESPONSE,
+            self.next_seq(),
+            command,
+            payload,
+        );
+        self.stack
+            .send_aps_groupcast(id, HA_PROFILE, cluster_id, HUB_ENDPOINT, RADIUS, frame, TxPriority::UserNormal)
+            .map_err(|e| anyhow!("cannot send to the group: {e:?}"))?;
+        for member in members {
+            let Some(device) = self.device(&member.ieee) else {
+                continue;
+            };
+            let features = devices::features(&device);
+            let values: Vec<_> = state.iter().filter(|(k, _)| features.iter().any(|f| f.key == *k)).cloned().collect();
+            if !values.is_empty() {
+                self.set_state_values(&member.ieee, values);
+            }
+        }
+        Ok(())
+    }
+
     /// Sets state values ahead of the device's own report
     pub fn set_state_values(&self, ieee: &str, values: Vec<(&'static str, Json)>) {
         self.update_device(ieee, |d| {
