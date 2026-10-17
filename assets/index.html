@@ -542,7 +542,7 @@ function weekScheduleEditor(ieee, f) {
   let last;
   const inputs = {};
   const rows = WEEK.map(day => {
-    const input = el("input", { type: "text", placeholder: "unknown (not saved here yet)", autocomplete: "off", spellcheck: false });
+    const input = el("input", { type: "text", autocomplete: "off", spellcheck: false });
     const save = el("button", { textContent: "Save" });
     const send = () => {
       let slots;
