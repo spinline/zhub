@@ -69,6 +69,8 @@ struct Bridge {
     /// Retained topics published per device or group ("group:<id>"), to clear them later
     state_topics: HashMap<String, String>,
     discovery: HashMap<String, BTreeMap<String, String>>,
+    /// A device or group got a new topic: bridge/info lists the names too
+    renamed: bool,
 }
 
 async fn session(hub: Arc<Hub>, cfg: MqttSettings) {
@@ -112,6 +114,7 @@ async fn session(hub: Arc<Hub>, cfg: MqttSettings) {
         cfg,
         state_topics: HashMap::new(),
         discovery: HashMap::new(),
+        renamed: false,
     };
     let mut events = hub.subscribe();
     loop {
@@ -128,7 +131,12 @@ async fn session(hub: Arc<Hub>, cfg: MqttSettings) {
                 None => break,
             },
             event = events.recv() => match event {
-                Ok(event) => bridge.hub_event(event).await,
+                Ok(event) => {
+                    bridge.hub_event(event).await;
+                    if std::mem::take(&mut bridge.renamed) {
+                        bridge.publish_info().await;
+                    }
+                }
                 // Missed events: publish the whole picture again
                 Err(broadcast::error::RecvError::Lagged(_)) => bridge.publish_all().await,
                 Err(broadcast::error::RecvError::Closed) => break,
@@ -338,8 +346,10 @@ impl Bridge {
         if let Some(old) = self.state_topics.insert(key.to_owned(), topic.clone())
             && old != topic
         {
+            // As Zigbee2MQTT's rename: the old retained state and availability go
             self.publish(&old, String::new(), true).await;
             self.publish(&format!("{old}/availability"), String::new(), true).await;
+            self.renamed = true;
         }
         topic
     }
