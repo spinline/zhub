@@ -30,6 +30,8 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .route("/api/hub/settings", post(settings))
         .route("/api/hub/tx_power", post(tx_power))
         .route("/api/hub/restart", post(restart))
+        .route("/api/matter/open", post(matter_open))
+        .route("/api/matter/reset", post(matter_reset))
         .route("/api/logs", get(logs))
         .route("/api/devices/{ieee}", axum::routing::delete(remove))
         .route("/api/devices/{ieee}/set", post(set))
@@ -144,6 +146,16 @@ struct TxPower {
 async fn tx_power(State(hub): State<Arc<Hub>>, Json(body): Json<TxPower>) -> ApiResult {
     let actual = hub.set_tx_power(body.dbm).await?;
     Ok(Json(json!({ "ok": true, "tx_power": actual })))
+}
+
+async fn matter_open(State(hub): State<Arc<Hub>>) -> ApiResult {
+    hub.matter_command(crate::hub::MatterCommand::OpenCommissioning)?;
+    ok()
+}
+
+async fn matter_reset(State(hub): State<Arc<Hub>>) -> ApiResult {
+    hub.matter_command(crate::hub::MatterCommand::Reset)?;
+    ok()
 }
 
 async fn restart(State(hub): State<Arc<Hub>>) -> ApiResult {

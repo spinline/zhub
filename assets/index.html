@@ -172,6 +172,10 @@
   .dayrow b { font-weight: 500; }
   .dayrow input { width: 100%; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; }
   @media (max-width: 520px) { .dayrow { grid-template-columns: 1fr auto; } .dayrow b { grid-column: 1 / -1; } }
+  .pairing { display: flex; gap: 16px; align-items: center; flex-wrap: wrap; margin: 8px 0; }
+  .pairing .qr { width: 168px; height: 168px; border-radius: 8px; overflow: hidden; flex: none; }
+  .pairing .qr svg { width: 100%; height: 100%; display: block; }
+  .pairing .code { font: 600 22px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .04em; }
   .log-tools { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; font-size: 13px; color: var(--muted); }
   pre.log {
     margin: 0; background: var(--bg); border: 1px solid var(--line); border-radius: 10px; padding: 10px;
@@ -234,6 +238,12 @@
     <div class="card"><h3>Network</h3><dl class="info" id="setNetwork"></dl><div id="setTxPower"></div></div>
     <div class="card"><h3>Adapter</h3><dl class="info" id="setAdapter"></dl></div>
     <div class="card"><h3>Availability and joining</h3><div id="setGeneral"></div></div>
+    <div class="card" id="matterCard" hidden>
+      <h3>Matter</h3>
+      <div class="desc" style="color:var(--muted);font-size:12px">Shows the Zigbee devices to Matter controllers: Apple Home, Google Home, Alexa, SmartThings, Home Assistant. The bridge is not certified, so the controller warns when adding it ("uncertified accessory"); confirm to continue.</div>
+      <dl class="info"><dt>Status</dt><dd id="matterStatus"></dd></dl>
+      <div id="setMatter"></div>
+    </div>
     <div class="card">
       <h3>MQTT</h3>
       <div class="desc" style="color:var(--muted);font-size:12px">Publishes devices like Zigbee2MQTT (<code>zigbee2mqtt/&lt;name&gt;</code>, <code>…/set</code>, <code>…/action</code>), so Home Assistant, Node-RED or Homey can use them. Home Assistant finds them through MQTT discovery.</div>
@@ -1356,6 +1366,7 @@ async function loadSettings() {
       "How long the Permit join button keeps joining open.",
       (v) => saveSettings({ permit_join_seconds: v })),
   );
+  renderMatter(info.matter || {});
   $("#mqttStatus").textContent = info.mqtt_status;
   $("#mqttStatus").style.color = info.mqtt_status.startsWith("error") ? "var(--warn)" : "";
   // Do not wipe what is being typed
@@ -1365,6 +1376,52 @@ async function loadSettings() {
   select.replaceChildren(...options.map(([v, t]) => el("option", { value: v, textContent: t })));
   select.value = info.log_level;
   render();
+}
+
+// Matter: on/off, pairing code and QR while running, commissioning tools
+function matterForm(status, settings) {
+  const enabled = el("input", { type: "checkbox", checked: settings.enabled });
+  enabled.onchange = () => run(saveSettings({ matter: { enabled: enabled.checked } }).then(() => setTimeout(() => run(loadSettings()), 3000)));
+  const nodes = [el("div", { className: "ctl" }, el("div", { className: "label", textContent: "Enabled" }), el("label", { className: "switch" }, enabled, el("span")))];
+  if (status.state === "running" && status.manual_code) {
+    const qr = el("div", { className: "qr" });
+    qr.innerHTML = status.qr_svg || "";
+    nodes.push(el("div", { className: "pairing" }, qr, el("div", {},
+      el("div", { className: "desc", textContent: "Pairing code" }),
+      el("div", { className: "code", textContent: status.manual_code }),
+      el("div", { className: "desc", style: "margin-top:8px", textContent: status.commissioning_open
+        ? "Pairing is open: in the controller's app choose Add device → Matter and scan the code, or type the number."
+        : "Pairing is closed. Open it to add the bridge to a controller." }))));
+    const open = el("button", { textContent: "Open pairing (15 min)", className: "primary" });
+    open.disabled = status.commissioning_open;
+    open.onclick = () => run(api("/api/matter/open").then(() => { toast("Pairing open for 15 minutes"); setTimeout(() => run(loadSettings()), 1500); }));
+    const reset = el("button", { textContent: "Forget all controllers", className: "danger" });
+    reset.onclick = () => {
+      if (confirm("Remove the bridge from every Matter controller it was added to? They will have to add it again.")) {
+        run(api("/api/matter/reset").then(() => { toast("Matter reset"); setTimeout(() => run(loadSettings()), 4000); }));
+      }
+    };
+    nodes.push(el("div", { className: "actions" }, open, reset));
+  }
+  return nodes;
+}
+
+function renderMatter(matter) {
+  $("#matterCard").hidden = !matter.supported;
+  if (!matter.supported) return;
+  $("#matterStatus").textContent = matterStatusText(matter);
+  $("#matterStatus").style.color = (matter.state || "").startsWith("error") ? "var(--warn)" : "";
+  const sig = JSON.stringify([matter.state, matter.manual_code, matter.commissioning_open, hubSettings.matter?.enabled]);
+  if ($("#setMatter").dataset.sig !== sig) {
+    $("#setMatter").dataset.sig = sig;
+    $("#setMatter").replaceChildren(...matterForm(matter, hubSettings.matter || {}));
+  }
+}
+
+function matterStatusText(status) {
+  if (status.state !== "running") return status.state;
+  const c = status.controllers;
+  return `running · ${c} controller${c === 1 ? "" : "s"}${status.commissioning_open ? " · pairing open" : ""}`;
 }
 
 function mqttForm(m) {
@@ -1418,6 +1475,11 @@ async function fetchLogs() {
   while (box.childElementCount > LOG_KEEP) box.firstChild.remove();
   if (atBottom) box.scrollTop = box.scrollHeight;
 }
+
+// The Matter status (controllers, pairing window) changes on its own: refresh it
+setInterval(() => {
+  if (page === "settings" && !document.hidden) run(api("/api/hub", null, "GET").then(info => renderMatter(info.matter || {})));
+}, 5000);
 
 function pollLogs() {
   clearTimeout(logTimer);

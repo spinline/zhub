@@ -2,6 +2,8 @@ mod hub;
 mod hue_reset;
 mod devices;
 mod logging;
+#[cfg(feature = "matter")]
+mod matter;
 mod mqtt;
 mod radio;
 mod sniff;
@@ -84,6 +86,10 @@ async fn run(args: Args, logging: std::sync::Arc<logging::Logging>) -> Result<()
     .await?;
 
     tokio::spawn(mqtt::run(hub.clone()));
+    #[cfg(feature = "matter")]
+    if let Some(commands) = hub.take_matter_commands() {
+        matter::start(hub.clone(), hub.data_dir().join("matter"), commands);
+    }
 
     let listener = tokio::net::TcpListener::bind(&args.listen)
         .await

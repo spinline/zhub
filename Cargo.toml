@@ -18,6 +18,14 @@ clap = { version = "4.6", features = ["derive"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 getrandom = "0.3"
 rumqttc = { version = "0.24", default-features = false }
+# Matter bridge (feature "matter"); a pinned commit, the crate is not released often
+rs-matter = { git = "https://github.com/project-chip/rs-matter", rev = "c69916a5a78957d46500145486df375acf4ab490", optional = true }
+embassy-futures = { version = "0.1", optional = true }
+embassy-time = { version = "0.5", features = ["std"], optional = true }
+embassy-time-queue-utils = { version = "0.3", features = ["generic-queue-64"], optional = true }
+futures-lite = { version = "2", optional = true }
+async-io = { version = "2", optional = true }
+rand = { version = "0.10", features = ["std", "std_rng", "thread_rng"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time", "sync", "net", "io-util", "signal", "fs"] }
@@ -25,6 +33,9 @@ tokio-serial = "5.5"
 tokio-stream = { version = "0.1", features = ["sync"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[features]
+matter = ["dep:rs-matter", "dep:embassy-futures", "dep:embassy-time", "dep:embassy-time-queue-utils", "dep:futures-lite", "dep:async-io", "dep:rand"]
 
 [profile.release]
 lto = true

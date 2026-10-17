@@ -60,6 +60,45 @@ pub struct Settings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub log_level: Option<String>,
     pub mqtt: MqttSettings,
+    pub matter: MatterSettings,
+}
+
+/// Matter bridge. The setup code (passcode, discriminator) is drawn once and kept, so the
+/// printed QR code stays valid.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MatterSettings {
+    pub enabled: bool,
+    /// 0: not drawn yet
+    pub passcode: u32,
+    pub discriminator: u16,
+}
+
+impl Default for MatterSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            passcode: 0,
+            discriminator: 0,
+        }
+    }
+}
+
+/// Matter forbids trivial passcodes (Core spec 5.1.7.1)
+const INVALID_PASSCODES: [u32; 12] = [
+    0, 11111111, 22222222, 33333333, 44444444, 55555555, 66666666, 77777777, 88888888, 99999999, 12345678,
+    87654321,
+];
+
+impl MatterSettings {
+    /// Draws the setup code if there is none yet
+    pub fn ensure_setup_code(&mut self) {
+        while self.passcode == 0 || INVALID_PASSCODES.contains(&self.passcode) || self.passcode > 99999998 {
+            let bytes = random_bytes::<6>();
+            self.passcode = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) % 99999998 + 1;
+            self.discriminator = u16::from_le_bytes([bytes[4], bytes[5]]) & 0x0FFF;
+        }
+    }
 }
 
 /// MQTT bridge, laid out like Zigbee2MQTT's (base topic, Home Assistant discovery)
@@ -115,6 +154,7 @@ impl Default for Settings {
             permit_join_seconds: 180,
             log_level: None,
             mqtt: MqttSettings::default(),
+            matter: MatterSettings::default(),
         }
     }
 }
@@ -123,6 +163,11 @@ impl Settings {
     /// For the API: the MQTT password replaced by whether one is set
     pub fn public(&self) -> Json {
         let mut value = serde_json::to_value(self).unwrap_or_default();
+        if let Some(matter) = value.get_mut("matter").and_then(Json::as_object_mut) {
+            // Shown as the pairing code by the Matter status instead
+            matter.remove("passcode");
+            matter.remove("discriminator");
+        }
         if let Some(mqtt) = value.get_mut("mqtt").and_then(Json::as_object_mut) {
             mqtt.remove("password");
             mqtt.insert("has_password".into(), Json::Bool(self.mqtt.password.is_some()));

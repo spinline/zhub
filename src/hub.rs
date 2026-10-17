@@ -11,7 +11,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
 use serde_json::{Value as Json, json};
-use tokio::sync::{Notify, broadcast, oneshot, watch};
+use tokio::sync::{Notify, broadcast, mpsc, oneshot, watch};
 use tracing::{debug, info, warn};
 
 use ziggurat_driver::runtime::TokioSpawner;
@@ -154,7 +154,22 @@ pub struct Hub {
     restart: Notify,
     /// The MQTT bridge restarts when these change
     mqtt_settings: watch::Sender<store::MqttSettings>,
+    /// The Matter bridge, likewise
+    matter_settings: watch::Sender<store::MatterSettings>,
+    matter_status: Mutex<Json>,
+    matter_commands: mpsc::UnboundedSender<MatterCommand>,
+    /// Taken by the Matter bridge when it starts
+    matter_command_rx: Mutex<Option<mpsc::UnboundedReceiver<MatterCommand>>>,
     mqtt_status: Mutex<String>,
+}
+
+/// Requests from the UI to the Matter bridge
+#[derive(Debug, Clone, Copy)]
+pub enum MatterCommand {
+    /// Lets a controller add the bridge (another controller, or after losing the pairing)
+    OpenCommissioning,
+    /// Forgets every controller: removes the fabrics and opens commissioning
+    Reset,
 }
 
 /// What the settings page shows about the hub
@@ -174,6 +189,7 @@ pub struct HubInfo {
     pub log_level: String,
     pub settings: Json,
     pub mqtt_status: String,
+    pub matter: Json,
 }
 
 /// Transmit power the MG24 RCP accepts (dBm)
@@ -509,6 +525,8 @@ impl Hub {
 
         apply_default_names(&mut data);
         let mqtt_settings = data.settings.mqtt.clone();
+        let matter_settings = data.settings.matter.clone();
+        let (matter_commands, matter_command_rx) = mpsc::unbounded_channel();
         // Writes the previous run could not deliver yet
         let pending_writes: HashMap<_, _> = std::mem::take(&mut data.pending_writes).into_iter().collect();
         if !pending_writes.is_empty() {
@@ -541,6 +559,10 @@ impl Hub {
             logging: opts.logging,
             restart: Notify::new(),
             mqtt_settings: watch::Sender::new(mqtt_settings),
+            matter_settings: watch::Sender::new(matter_settings),
+            matter_status: Mutex::new(json!({"supported": cfg!(feature = "matter"), "state": "disabled"})),
+            matter_commands,
+            matter_command_rx: Mutex::new(Some(matter_command_rx)),
             mqtt_status: Mutex::new("disabled".into()),
         });
 
@@ -585,12 +607,42 @@ impl Hub {
             log_level: self.logging.level(),
             settings: data.settings.public(),
             mqtt_status: self.mqtt_status.lock().unwrap().clone(),
+            matter: self.matter_status.lock().unwrap().clone(),
         }
     }
 
     /// For the API (no MQTT password)
     pub fn public_settings(&self) -> Json {
         self.data.lock().unwrap().settings.public()
+    }
+
+    pub fn matter_settings(&self) -> watch::Receiver<store::MatterSettings> {
+        self.matter_settings.subscribe()
+    }
+
+    pub fn set_matter_status(&self, status: impl Serialize) {
+        if let Ok(value) = serde_json::to_value(status) {
+            *self.matter_status.lock().unwrap() = value;
+        }
+    }
+
+    pub fn take_matter_commands(&self) -> Option<mpsc::UnboundedReceiver<MatterCommand>> {
+        self.matter_command_rx.lock().unwrap().take()
+    }
+
+    pub fn matter_command(&self, command: MatterCommand) -> Result<()> {
+        if !cfg!(feature = "matter") {
+            bail!("this build has no Matter support");
+        }
+        if !self.data.lock().unwrap().settings.matter.enabled {
+            bail!("Matter is disabled");
+        }
+        self.matter_commands.send(command).map_err(|_| anyhow!("the Matter bridge is not running"))
+    }
+
+    /// Where the hub keeps its files (the state file's directory)
+    pub fn data_dir(&self) -> PathBuf {
+        self.state_path.parent().map(PathBuf::from).unwrap_or_default()
     }
 
     pub fn mqtt_settings(&self) -> watch::Receiver<store::MqttSettings> {
@@ -607,6 +659,15 @@ impl Hub {
 
     pub fn update_settings(&self, mut settings: store::Settings) -> Result<()> {
         settings.validate()?;
+        // The setup code never comes from the page; it is drawn once
+        {
+            let current = &self.data.lock().unwrap().settings.matter;
+            settings.matter.passcode = current.passcode;
+            settings.matter.discriminator = current.discriminator;
+        }
+        if settings.matter.enabled {
+            settings.matter.ensure_setup_code();
+        }
         // The page never sees the password: an empty one keeps the saved one
         if settings.mqtt.password.as_deref().is_none_or(str::is_empty) {
             settings.mqtt.password = self.data.lock().unwrap().settings.mqtt.password.clone();
@@ -624,6 +685,11 @@ impl Hub {
             settings.mqtt.host,
             settings.mqtt.port
         );
+        self.matter_settings.send_if_modified(|current| {
+            let changed = *current != settings.matter;
+            *current = settings.matter.clone();
+            changed
+        });
         self.mqtt_settings.send_if_modified(|current| {
             let changed = *current != settings.mqtt;
             *current = settings.mqtt.clone();
