@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rumqttc::{AsyncClient, Event as MqttEvent, Incoming, LastWill, MqttOptions, QoS};
+use anyhow::Context as _;
 use serde_json::{Map, Value as Json, json};
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, info, warn};
@@ -855,24 +856,70 @@ async fn apply(hub: &Arc<Hub>, name: &str, command: Map<String, Json>) -> anyhow
             .any(|m| devices.iter().any(|d| d.device.ieee == m.ieee && d.device.state.get("on").and_then(Json::as_bool) == Some(true))),
         (None, None) => anyhow::bail!("no device or group named {name}"),
     };
-    let mut writes: Vec<(String, Json)> = Vec::new();
-    let state = command.get("state").and_then(Json::as_str).map(str::to_ascii_uppercase);
-    let brightness = command.get("brightness").cloned();
-    match state.as_deref() {
-        Some("OFF") => writes.push(("on".into(), json!(false))),
-        Some("TOGGLE") if brightness.is_none() => writes.push(("on".into(), json!(!current_on))),
-        Some("ON" | "TOGGLE") | None => {
-            if let Some(level) = brightness {
-                // Move to Level with On/Off turns the light on as well
-                writes.push(("level".into(), level));
-            } else if state.is_some() {
-                writes.push(("on".into(), json!(true)));
+    let (writes, transition) = translate(command, target, current_on)?;
+    let result = async {
+        for (key, value) in writes {
+            match (&target, &group) {
+                (Some(d), _) => {
+                    hub.set_with(&d.device.ieee, &key, value, transition).await?;
+                }
+                (None, Some(g)) => hub.set_group_with(g.id, &key, &value, transition)?,
+                (None, None) => {}
             }
         }
+        anyhow::Ok(())
+    }
+    .await;
+    // Zigbee2MQTT publishes the state after every command, changed or not: a client that
+    // lost track (it thought a light off that was on) is corrected by its next command
+    match (&target, &group) {
+        (Some(d), _) => hub.republish(&d.device.ieee),
+        (None, Some(g)) => g.members.iter().for_each(|m| hub.republish(&m.ieee)),
+        (None, None) => {}
+    }
+    result
+}
+
+/// A Zigbee2MQTT command as the hub's writes, with the transition (tenths of a second)
+fn translate(command: Map<String, Json>, target: Option<&DeviceView>, current_on: bool) -> anyhow::Result<(Vec<(String, Json)>, Option<u16>)> {
+    let mut writes: Vec<(String, Json)> = Vec::new();
+    let state = command.get("state").and_then(Json::as_str).map(str::to_ascii_uppercase);
+    let brightness = match command.get("brightness") {
+        None => None,
+        Some(v) => Some(v.as_f64().filter(|b| b.is_finite()).context("brightness: expected a number")?),
+    };
+    // Seconds, as Zigbee2MQTT takes it; ZCL counts tenths
+    let transition = match command.get("transition") {
+        None => None,
+        Some(v) => {
+            let seconds = v.as_f64().filter(|t| t.is_finite() && *t >= 0.0).context("transition: expected seconds")?;
+            Some((seconds * 10.0).round().min(65_534.0) as u16)
+        }
+    };
+    // As Zigbee2MQTT: brightness 0 alone turns the light off, a toggle with brightness
+    // turns it off when it is on
+    let off = match state.as_deref() {
+        Some("OFF") => true,
+        Some("TOGGLE") => current_on,
+        Some("ON") => false,
+        None => brightness.is_some_and(|b| b <= 0.0),
         Some(other) => anyhow::bail!("unknown state {other}"),
+    };
+    if off {
+        writes.push(("on".into(), json!(false)));
+    } else if let Some(b) = brightness {
+        // Move to Level with On/Off turns the light on as well; 0 and 1 mean the lowest
+        // level the light takes (Hue lights turn off at 1)
+        let lowest = target
+            .and_then(|d| d.features.iter().find(|f| f.key == "level").map(|f| f.range(&d.device).0))
+            .flatten()
+            .unwrap_or(1.0);
+        writes.push(("level".into(), json!(b.round().clamp(lowest, 254.0))));
+    } else if state.is_some() {
+        writes.push(("on".into(), json!(true)));
     }
     for (key, mut value) in command {
-        if key == "state" || key == "brightness" || (state.as_deref() == Some("OFF") && key == "color_temp") {
+        if key == "state" || key == "brightness" || key == "transition" || (off && key == "color_temp") {
             continue;
         }
         let key = match key.as_str() {
@@ -898,16 +945,7 @@ async fn apply(hub: &Arc<Hub>, name: &str, command: Map<String, Json>) -> anyhow
         }
         writes.push((key, value));
     }
-    for (key, value) in writes {
-        match (&target, &group) {
-            (Some(d), _) => {
-                hub.set(&d.device.ieee, &key, value).await?;
-            }
-            (None, Some(g)) => hub.set_group(g.id, &key, &value)?,
-            (None, None) => {}
-        }
-    }
-    Ok(())
+    Ok((writes, transition))
 }
 
 #[cfg(test)]
@@ -1038,5 +1076,30 @@ mod tests {
         let e = exposes(&trv);
         let lock = e.iter().find(|x| x["property"] == "child_lock").unwrap();
         assert_eq!((lock["value_on"].clone(), lock["value_off"].clone()), (json!("LOCK"), json!("UNLOCK")));
+    }
+
+    #[test]
+    fn commands_translate_as_zigbee2mqtt() {
+        let lamp = view("LTA009", json!({"on": true, "level": 204, "color_temp": 250}));
+        let t = |c: Json, on: bool| translate(c.as_object().unwrap().clone(), Some(&lamp), on).unwrap();
+        // The plain states
+        assert_eq!(t(json!({"state": "OFF"}), true).0, [("on".to_owned(), json!(false))]);
+        assert_eq!(t(json!({"state": "on"}), false).0, [("on".to_owned(), json!(true))]);
+        assert_eq!(t(json!({"state": "TOGGLE"}), true).0, [("on".to_owned(), json!(false))]);
+        // Brightness 0 alone turns off; with ON it is the lowest level (2 for Hue)
+        assert_eq!(t(json!({"brightness": 0}), true).0, [("on".to_owned(), json!(false))]);
+        assert_eq!(t(json!({"state": "ON", "brightness": 0}), false).0, [("level".to_owned(), json!(2.0))]);
+        assert_eq!(t(json!({"brightness": 1}), true).0, [("level".to_owned(), json!(2.0))]);
+        assert_eq!(t(json!({"brightness": 203.2}), true).0, [("level".to_owned(), json!(203.0))]);
+        // A toggle with brightness turns an on light off
+        assert_eq!(t(json!({"state": "TOGGLE", "brightness": 100}), true).0, [("on".to_owned(), json!(false))]);
+        // Transition in seconds becomes tenths and is no write of its own; off drops color_temp
+        let (writes, transition) = t(json!({"state": "OFF", "transition": 1.5, "color_temp": 300}), true);
+        assert_eq!(writes, [("on".to_owned(), json!(false))]);
+        assert_eq!(transition, Some(15));
+        let (writes, transition) = t(json!({"state": "ON", "brightness": 204, "color_temp": 250}), false);
+        assert_eq!(writes, [("level".to_owned(), json!(204.0)), ("color_temp".to_owned(), json!(250.0))]);
+        assert_eq!(transition, None);
+        assert!(translate(json!({"brightness": "x"}).as_object().unwrap().clone(), Some(&lamp), true).is_err());
     }
 }

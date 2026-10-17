@@ -942,6 +942,12 @@ impl Hub {
         self.dirty.notify_one();
     }
 
+    /// Publishes a device's state again although it did not change: Zigbee2MQTT answers
+    /// every command this way, which corrects a client that lost track
+    pub fn republish(&self, ieee: &str) {
+        self.emit_device(ieee);
+    }
+
     fn emit_device(&self, ieee: &str) {
         if let Some(device) = self.device_view(ieee) {
             let _ = self.events.send(Event::Device { device });
@@ -1825,6 +1831,12 @@ impl Hub {
     /// depending on its source. Attribute writes to sleepy devices are queued; returns
     /// `true` when the write waits for the device to wake up.
     pub async fn set(self: &Arc<Self>, ieee: &str, key: &str, value: Json) -> Result<bool> {
+        self.set_with(ieee, key, value, None).await
+    }
+
+    /// `set` with a transition time for light commands (tenths of a second; the hub's
+    /// half second when `None`)
+    pub async fn set_with(self: &Arc<Self>, ieee: &str, key: &str, value: Json, transition: Option<u16>) -> Result<bool> {
         let device = self.device(ieee).context("device not found")?;
         let feature = devices::features(&device)
             .into_iter()
@@ -1878,7 +1890,7 @@ impl Hub {
                 Ok(true)
             }
             Source::Attr { cluster, write, .. } => {
-                self.light_command(&device, feature, cluster, write, &value).await?;
+                self.light_command(&device, feature, cluster, write, &value, transition).await?;
                 Ok(false)
             }
             // Validation already refuses these
@@ -1974,21 +1986,29 @@ impl Hub {
     }
 
     /// Light cluster commands: On/Off, Move to Level (with On/Off), Move to Color Temperature
-    async fn light_command(&self, device: &Device, feature: &Feature, cluster_id: u16, write: Write, value: &Json) -> Result<()> {
-        // Half-second transition
-        const TRANSITION: u16 = 5;
+    async fn light_command(
+        &self,
+        device: &Device,
+        feature: &Feature,
+        cluster_id: u16,
+        write: Write,
+        value: &Json,
+        transition: Option<u16>,
+    ) -> Result<()> {
+        // Half-second transition unless asked otherwise
+        let transition = transition.unwrap_or(5);
         let number = || value.as_f64().unwrap_or_default().round();
         let (command, payload): (u8, Vec<u8>) = match write {
             Write::OnOff => (u8::from(value.as_bool() == Some(true)), vec![]),
             Write::Level => {
                 let level = number().clamp(0.0, 254.0) as u8;
                 let mut payload = vec![level];
-                payload.extend_from_slice(&TRANSITION.to_le_bytes());
+                payload.extend_from_slice(&transition.to_le_bytes());
                 (0x04, payload)
             }
             Write::ColorTemp => {
                 let mut payload = (number().clamp(0.0, 65_279.0) as u16).to_le_bytes().to_vec();
-                payload.extend_from_slice(&TRANSITION.to_le_bytes());
+                payload.extend_from_slice(&transition.to_le_bytes());
                 (0x0A, payload)
             }
             Write::No | Write::Attribute => bail!("{} is not written with a command", feature.label),
@@ -2475,7 +2495,12 @@ impl Hub {
     /// One multicast frame for the whole group: on/off, brightness or color temperature.
     /// The members' states are updated at once; their reports confirm shortly.
     pub fn set_group(&self, id: u16, key: &str, value: &Json) -> Result<()> {
-        const TRANSITION: u16 = 5;
+        self.set_group_with(id, key, value, None)
+    }
+
+    /// `set_group` with a transition time (tenths of a second; half a second when `None`)
+    pub fn set_group_with(&self, id: u16, key: &str, value: &Json, transition: Option<u16>) -> Result<()> {
+        let transition = transition.unwrap_or(5);
         let members = {
             let data = self.data.lock().unwrap();
             data.groups.iter().find(|g| g.id == id).context("group not found")?.members.clone()
@@ -2504,14 +2529,14 @@ impl Hub {
                 let (low, high) = limits("level");
                 let level = number()?.round().clamp(low.max(1.0), high.min(254.0));
                 let mut payload = vec![level as u8];
-                payload.extend_from_slice(&TRANSITION.to_le_bytes());
+                payload.extend_from_slice(&transition.to_le_bytes());
                 (cluster::LEVEL, 0x04, payload, vec![("level", json!(level)), ("on", json!(true))])
             }
             "color_temp" => {
                 let (low, high) = limits("color_temp");
                 let mired = number()?.round().clamp(low.max(0.0), high.min(65_279.0));
                 let mut payload = (mired as u16).to_le_bytes().to_vec();
-                payload.extend_from_slice(&TRANSITION.to_le_bytes());
+                payload.extend_from_slice(&transition.to_le_bytes());
                 (cluster::COLOR, 0x0A, payload, vec![("color_temp", json!(mired))])
             }
             _ => bail!("unknown group control: {key}"),
