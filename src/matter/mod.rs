@@ -329,7 +329,6 @@ async fn run(
                     bridge.device_changed(&device.device.ieee, &notify);
                 }
                 Ok(Event::Removed { .. } | Event::Groups { .. }) => bridge.sync(&notify),
-                Ok(Event::Action { ieee, action, .. }) => bridge.action(&ieee, &action, &im),
                 Ok(_) => {}
                 // Missed changes: everything may have changed
                 Err(broadcast::error::RecvError::Lagged(_)) => {

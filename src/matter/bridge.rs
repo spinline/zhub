@@ -7,7 +7,6 @@
 //! Changes reported over Zigbee are pushed to subscribers.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rs_matter::dm::clusters::decl::bridged_device_basic_information as bridged;
@@ -16,28 +15,24 @@ use rs_matter::dm::clusters::decl::level_control;
 use rs_matter::dm::clusters::decl::on_off;
 use rs_matter::dm::clusters::decl::power_source;
 use rs_matter::dm::clusters::decl::relative_humidity_measurement as humidity;
-use rs_matter::dm::clusters::decl::switch;
 use rs_matter::dm::clusters::decl::temperature_measurement as temperature;
 use rs_matter::dm::clusters::decl::thermostat;
 use rs_matter::dm::clusters::desc::{self, ClusterHandler as _};
 use rs_matter::dm::clusters::groups::{self, ClusterHandler as _};
 use rs_matter::dm::devices::{
-    DEV_TYPE_AGGREGATOR, DEV_TYPE_BRIDGED_NODE, DEV_TYPE_DIMMABLE_LIGHT, DEV_TYPE_GENERIC_SWITCH, DEV_TYPE_ON_OFF_LIGHT,
-    DEV_TYPE_THERMOSTAT,
+    DEV_TYPE_AGGREGATOR, DEV_TYPE_BRIDGED_NODE, DEV_TYPE_DIMMABLE_LIGHT, DEV_TYPE_ON_OFF_LIGHT, DEV_TYPE_THERMOSTAT,
 };
 use rs_matter::dm::{
-    ArrayAttributeRead, AsyncHandler, AttrChangeNotifier, Cluster, ClusterId, Dataver, DeviceType, EndptId, Endpoint,
-    EventEmitter, InvokeContext, InvokeReply, MatchContext, Metadata, Node, ReadContext, ReadReply, WriteContext,
+    ArrayAttributeRead, AsyncHandler, Cluster, ClusterId, Dataver, DeviceType, EndptId, Endpoint, InvokeContext, InvokeReply,
+    MatchContext, Metadata, Node, ReadContext, ReadReply, WriteContext,
 };
-use rs_matter::im::encoding::EventPriority;
-use rs_matter::im::events::EVENT_DATA_TAG;
 use rs_matter::error::{Error, ErrorCode};
 use rs_matter::tlv::{Nullable, TLVBuilderParent, ToTLVArrayBuilder, ToTLVBuilder, Utf8StrBuilder};
 use rs_matter::{clusters, devices, root_endpoint, with};
 use serde_json::{Value as Json, json};
 use tracing::{debug, info, warn};
 
-use crate::devices::{Access, Card, Kind as FeatureKind};
+use crate::devices::{Access, Card};
 use crate::hub::{DeviceView, Hub};
 
 pub const AGGREGATOR_ENDPOINT: EndptId = 1;
@@ -50,7 +45,6 @@ const TEMPERATURE_ID: ClusterId = temperature::FULL_CLUSTER.id;
 const HUMIDITY_ID: ClusterId = humidity::FULL_CLUSTER.id;
 const POWER_ID: ClusterId = power_source::FULL_CLUSTER.id;
 const THERMOSTAT_ID: ClusterId = thermostat::FULL_CLUSTER.id;
-const SWITCH_ID: ClusterId = switch::FULL_CLUSTER.id;
 
 const DEV_TYPE_COLOR_TEMPERATURE_LIGHT: DeviceType = DeviceType { dtype: 0x010C, drev: 4 };
 const DEV_TYPE_TEMPERATURE_SENSOR: DeviceType = DeviceType { dtype: 0x0302, drev: 2 };
@@ -179,19 +173,6 @@ const THERMOSTAT_CLUSTER: Cluster<'static> = thermostat::FULL_CLUSTER
     ))
     .with_cmds(with!(thermostat::CommandId::SetpointRaiseLower));
 
-const SWITCH_CLUSTER: Cluster<'static> = switch::FULL_CLUSTER
-    .with_revision(2)
-    .with_features(
-        switch::Feature::MOMENTARY_SWITCH.bits()
-            | switch::Feature::MOMENTARY_SWITCH_RELEASE.bits()
-            | switch::Feature::MOMENTARY_SWITCH_LONG_PRESS.bits(),
-    )
-    .with_attrs(with!(required; switch::AttributeId::NumberOfPositions | switch::AttributeId::CurrentPosition))
-    .with_cmds(with!())
-    .with_events(with!(
-        switch::EventId::InitialPress | switch::EventId::LongPress | switch::EventId::ShortRelease | switch::EventId::LongRelease
-    ));
-
 /// The kinds of bridged devices, by what the Matter side offers
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -200,8 +181,6 @@ pub enum Kind {
     ColorTemperatureLight,
     TemperatureSensor { humidity: bool, battery: bool },
     Thermostat { battery: bool },
-    /// One button of a remote or switch module
-    Switch { battery: bool },
 }
 
 impl Kind {
@@ -254,8 +233,6 @@ impl Kind {
             ),
             Self::Thermostat { battery: false } => devices!(DEV_TYPE_THERMOSTAT, DEV_TYPE_BRIDGED_NODE),
             Self::Thermostat { battery: true } => devices!(DEV_TYPE_THERMOSTAT, DEV_TYPE_POWER_SOURCE, DEV_TYPE_BRIDGED_NODE),
-            Self::Switch { battery: false } => devices!(DEV_TYPE_GENERIC_SWITCH, DEV_TYPE_BRIDGED_NODE),
-            Self::Switch { battery: true } => devices!(DEV_TYPE_GENERIC_SWITCH, DEV_TYPE_POWER_SOURCE, DEV_TYPE_BRIDGED_NODE),
         }
     }
 
@@ -297,10 +274,6 @@ impl Kind {
             Self::Thermostat { battery: true } => {
                 clusters!(desc::DescHandler::CLUSTER, BRIDGED_CLUSTER, THERMOSTAT_CLUSTER, POWER_CLUSTER)
             }
-            Self::Switch { battery: false } => clusters!(desc::DescHandler::CLUSTER, BRIDGED_CLUSTER, SWITCH_CLUSTER),
-            Self::Switch { battery: true } => {
-                clusters!(desc::DescHandler::CLUSTER, BRIDGED_CLUSTER, SWITCH_CLUSTER, POWER_CLUSTER)
-            }
         }
     }
 }
@@ -309,8 +282,6 @@ impl Kind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Target {
     Device(String),
-    /// One button of a remote or switch module, by its action prefix ("left", "right")
-    Button { ieee: String, button: String },
     /// A Zigbee group of lights, controlled as one light
     Group(u16),
 }
@@ -320,14 +291,13 @@ impl Target {
     fn key(&self) -> String {
         match self {
             Self::Device(ieee) => ieee.clone(),
-            Self::Button { ieee, button } => format!("{ieee}#{button}"),
             Self::Group(id) => format!("group:{id}"),
         }
     }
 
     fn ieee(&self) -> Option<&str> {
         match self {
-            Self::Device(ieee) | Self::Button { ieee, .. } => Some(ieee),
+            Self::Device(ieee) => Some(ieee),
             Self::Group(_) => None,
         }
     }
@@ -340,8 +310,6 @@ pub struct Bridged {
     pub kind: Kind,
     /// The name as last pushed (the node label)
     name: String,
-    /// Switch: 1 while the button is held
-    position: AtomicU8,
     datavers: HashMap<ClusterId, Dataver>,
 }
 
@@ -379,17 +347,6 @@ struct Info {
     reachable: bool,
 }
 
-/// The buttons a device's action feature names: "left_press" → "left"
-fn buttons(view: &DeviceView) -> Vec<String> {
-    let Some(feature) = view.features.iter().find(|f| f.key == "action") else {
-        return Vec::new();
-    };
-    let FeatureKind::Enum { values } = feature.kind else {
-        return Vec::new();
-    };
-    values.iter().filter_map(|v| v.strip_suffix("_press")).map(str::to_owned).collect()
-}
-
 impl Bridge {
     pub fn new(hub: Arc<Hub>, rt: tokio::runtime::Handle) -> Self {
         Self {
@@ -423,7 +380,7 @@ impl Bridge {
     /// The device behind the endpoint (a device or one of its buttons)
     fn view(&self, endpoint: EndptId) -> Result<DeviceView, Error> {
         match self.target(endpoint)? {
-            Target::Device(ieee) | Target::Button { ieee, .. } => self.device(&ieee),
+            Target::Device(ieee) => self.device(&ieee),
             Target::Group(_) => Err(ErrorCode::AttributeNotFound.into()),
         }
     }
@@ -431,7 +388,7 @@ impl Bridge {
     /// A state value; for a group the members' combined light state
     fn state(&self, endpoint: EndptId, key: &str) -> Result<Option<Json>, Error> {
         match self.target(endpoint)? {
-            Target::Device(ieee) | Target::Button { ieee, .. } => Ok(self.device(&ieee)?.device.state.get(key).cloned()),
+            Target::Device(ieee) => Ok(self.device(&ieee)?.device.state.get(key).cloned()),
             Target::Group(id) => {
                 let members = self.members(id);
                 let values = || members.iter().filter_map(|m| m.device.state.get(key));
@@ -447,7 +404,7 @@ impl Bridge {
     /// The valid range of a numeric feature; for a group the narrowest of its members
     fn range(&self, endpoint: EndptId, key: &str) -> Result<(Option<f64>, Option<f64>), Error> {
         let views = match self.target(endpoint)? {
-            Target::Device(ieee) | Target::Button { ieee, .. } => vec![self.device(&ieee)?],
+            Target::Device(ieee) => vec![self.device(&ieee)?],
             Target::Group(id) => self.members(id),
         };
         let mut range: (Option<f64>, Option<f64>) = (None, None);
@@ -481,12 +438,8 @@ impl Bridge {
             }
             target => {
                 let view = self.view(endpoint)?;
-                let mut name = view.device.name.clone();
-                if let Target::Button { button, .. } = &target {
-                    name = format!("{name} {button}");
-                }
                 Ok(Info {
-                    name,
+                    name: view.device.name.clone(),
                     vendor: view.definition.map(|d| d.vendor.to_owned()).or(view.device.manufacturer.clone()).unwrap_or_default(),
                     product: view.device.model.clone().unwrap_or_default(),
                     serial: target.key(),
@@ -521,7 +474,7 @@ impl Bridge {
                 warn!("Matter → group {id} cluster 0x{cluster:04x} command 0x{command:02x}: {e:#}");
                 ErrorCode::Failure.into()
             }),
-            Target::Device(ieee) | Target::Button { ieee, .. } => {
+            Target::Device(ieee) => {
                 let hub = self.hub.clone();
                 let target = ieee.clone();
                 let sent = self
@@ -570,16 +523,6 @@ impl Bridge {
             if let Some(kind) = Kind::of(view) {
                 wanted.push((Target::Device(view.device.ieee.clone()), kind, view.device.name.clone()));
             }
-            let has_battery = view.features.iter().any(|f| f.key == "battery");
-            for (i, button) in buttons(view).into_iter().enumerate() {
-                let name = format!("{} {button}", view.device.name);
-                let target = Target::Button {
-                    ieee: view.device.ieee.clone(),
-                    button,
-                };
-                // The battery once, on the first button
-                wanted.push((target, Kind::Switch { battery: i == 0 && has_battery }, name));
-            }
         }
         for group in self.hub.groups() {
             let members: Vec<&DeviceView> = group.members.iter().filter_map(|m| devices.iter().find(|d| d.device.ieee == m.ieee)).collect();
@@ -618,7 +561,6 @@ impl Bridge {
                     target,
                     kind,
                     name,
-                    position: AtomicU8::new(0),
                     datavers,
                 });
                 parts_changed = true;
@@ -651,50 +593,6 @@ impl Bridge {
         }
     }
 
-    /// A button press: the Switch cluster's position and events
-    pub fn action<E: EventEmitter + AttrChangeNotifier>(&self, ieee: &str, action: &str, im: &E) {
-        let found = {
-            let bridged = self.bridged.lock().unwrap();
-            bridged.iter().find_map(|b| match &b.target {
-                Target::Button { ieee: i, button } if i == ieee => action
-                    .strip_prefix(button.as_str())
-                    .and_then(|rest| rest.strip_prefix('_'))
-                    .map(|kind| (b.endpoint, kind.to_owned())),
-                _ => None,
-            })
-        };
-        let Some((endpoint, kind)) = found else {
-            return;
-        };
-        let (event, position) = match kind.as_str() {
-            "press" => (switch::EventId::InitialPress, 1),
-            "hold" => (switch::EventId::LongPress, 1),
-            "press_release" => (switch::EventId::ShortRelease, 0),
-            "hold_release" => (switch::EventId::LongRelease, 0),
-            _ => return,
-        };
-        if let Some(b) = self.bridged.lock().unwrap().iter().find(|b| b.endpoint == endpoint) {
-            b.position.store(position, Ordering::Relaxed);
-        }
-        im.notify_attr_changed(endpoint, SWITCH_ID, switch::AttributeId::CurrentPosition as _);
-        let emitted = im.emit_event(endpoint, SWITCH_ID, event as _, EventPriority::Info, |w| match event {
-            switch::EventId::InitialPress => switch::InitialPressBuilder::new(w, &EVENT_DATA_TAG)?.new_position(1)?.end().map(drop),
-            switch::EventId::LongPress => switch::LongPressBuilder::new(w, &EVENT_DATA_TAG)?.new_position(1)?.end().map(drop),
-            switch::EventId::ShortRelease => {
-                switch::ShortReleaseBuilder::new(w, &EVENT_DATA_TAG)?.previous_position(1)?.end().map(drop)
-            }
-            _ => switch::LongReleaseBuilder::new(w, &EVENT_DATA_TAG)?.previous_position(1)?.end().map(drop),
-        });
-        match emitted {
-            Ok(number) => debug!("Matter event {event:?} on endpoint {endpoint} (#{number})"),
-            Err(e) => warn!("Matter event {event:?} on endpoint {endpoint} not emitted: {e:?}"),
-        }
-    }
-
-    fn position(&self, endpoint: EndptId) -> u8 {
-        let bridged = self.bridged.lock().unwrap();
-        bridged.iter().find(|b| b.endpoint == endpoint).map_or(0, |b| b.position.load(Ordering::Relaxed))
-    }
 }
 
 // ---- Node metadata ----
@@ -740,7 +638,6 @@ impl AsyncHandler for BridgedHandler<'_> {
             HUMIDITY_ID => humidity::HandlerAsyncAdaptor(&c).read(ctx, reply).await,
             POWER_ID => power_source::HandlerAsyncAdaptor(&c).read(ctx, reply).await,
             THERMOSTAT_ID => thermostat::HandlerAsyncAdaptor(&c).read(ctx, reply).await,
-            SWITCH_ID => switch::HandlerAsyncAdaptor(&c).read(ctx, reply).await,
             _ => Err(ErrorCode::ClusterNotFound.into()),
         }
     }
@@ -757,7 +654,6 @@ impl AsyncHandler for BridgedHandler<'_> {
             HUMIDITY_ID => humidity::HandlerAsyncAdaptor(&c).write(ctx).await,
             POWER_ID => power_source::HandlerAsyncAdaptor(&c).write(ctx).await,
             THERMOSTAT_ID => thermostat::HandlerAsyncAdaptor(&c).write(ctx).await,
-            SWITCH_ID => switch::HandlerAsyncAdaptor(&c).write(ctx).await,
             _ => Err(ErrorCode::ClusterNotFound.into()),
         }
     }
@@ -775,7 +671,6 @@ impl AsyncHandler for BridgedHandler<'_> {
             HUMIDITY_ID => humidity::HandlerAsyncAdaptor(&c).invoke(ctx, reply).await,
             POWER_ID => power_source::HandlerAsyncAdaptor(&c).invoke(ctx, reply).await,
             THERMOSTAT_ID => thermostat::HandlerAsyncAdaptor(&c).invoke(ctx, reply).await,
-            SWITCH_ID => switch::HandlerAsyncAdaptor(&c).invoke(ctx, reply).await,
             _ => Err(ErrorCode::ClusterNotFound.into()),
         }
     }
@@ -1537,24 +1432,3 @@ impl thermostat::ClusterAsyncHandler for &Cl<'_> {
     }
 }
 
-// ---- Switch (one button) ----
-
-impl switch::ClusterAsyncHandler for &Cl<'_> {
-    const CLUSTER: Cluster<'static> = SWITCH_CLUSTER;
-
-    fn dataver(&self) -> u32 {
-        self.bridge.dataver(self.endpoint, SWITCH_ID)
-    }
-
-    fn dataver_changed(&self) {
-        self.bridge.dataver_changed(self.endpoint, SWITCH_ID);
-    }
-
-    async fn number_of_positions(&self, _ctx: impl ReadContext) -> Result<u8, Error> {
-        Ok(2)
-    }
-
-    async fn current_position(&self, _ctx: impl ReadContext) -> Result<u8, Error> {
-        Ok(self.bridge.position(self.endpoint))
-    }
-}
