@@ -30,6 +30,22 @@ pub struct NetworkData {
     pub tx_power: i8,
 }
 
+/// A Zigbee group: the members keep the membership themselves (Groups cluster); the hub
+/// keeps the name and the member list
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Group {
+    pub id: u16,
+    pub name: String,
+    #[serde(default)]
+    pub members: Vec<GroupMember>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupMember {
+    pub ieee: String,
+    pub ep: u8,
+}
+
 /// Hub settings edited in the UI
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -219,6 +235,8 @@ pub struct Persisted {
     pub children: Vec<Child>,
     #[serde(default)]
     pub devices: BTreeMap<String, Device>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<Group>,
     /// Values queued for sleepy devices: ieee → (feature → value)
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub pending_writes: BTreeMap<String, BTreeMap<String, Json>>,

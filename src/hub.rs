@@ -84,6 +84,8 @@ pub enum Event {
     PermitJoin { remaining: u64 },
     /// The hub settings changed (the UI reloads them)
     Settings,
+    /// Groups were created, renamed, deleted or changed members
+    Groups { groups: Vec<store::Group> },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -930,6 +932,18 @@ impl Hub {
                 data.to_vec(),
             );
             return;
+        }
+
+        // A cluster-specific response (e.g. Add Group Response) answers a request of ours;
+        // a frame nobody waits for passes through unchanged
+        if header.server_to_client() {
+            self.complete(
+                PendingKey::Zcl {
+                    nwk: source,
+                    seq: header.seq,
+                },
+                data.to_vec(),
+            );
         }
 
         if cluster_id == cluster::IAS_ZONE && header.server_to_client() {
@@ -2012,6 +2026,197 @@ impl Hub {
         Ok(())
     }
 
+    // ---- Groups ----
+
+    pub fn groups(&self) -> Vec<store::Group> {
+        self.data.lock().unwrap().groups.clone()
+    }
+
+    fn groups_changed(&self) {
+        self.dirty.notify_one();
+        let _ = self.events.send(Event::Groups { groups: self.groups() });
+    }
+
+    fn group_name_check(&self, name: &str, except: Option<u16>) -> Result<String> {
+        let name = name.trim();
+        if name.is_empty() || name.chars().count() > 64 {
+            bail!("the group name must be 1-64 characters");
+        }
+        let data = self.data.lock().unwrap();
+        if data.groups.iter().any(|g| g.name == name && Some(g.id) != except) {
+            bail!("a group named \"{name}\" already exists");
+        }
+        Ok(name.to_owned())
+    }
+
+    /// A new, empty group; ids count up from 1 as in Zigbee2MQTT
+    pub fn create_group(&self, name: &str) -> Result<u16> {
+        let name = self.group_name_check(name, None)?;
+        let id = {
+            let mut data = self.data.lock().unwrap();
+            let id = (1..=0xFFF7).find(|id| !data.groups.iter().any(|g| g.id == *id)).context("no free group id")?;
+            data.groups.push(store::Group {
+                id,
+                name: name.clone(),
+                members: Vec::new(),
+            });
+            id
+        };
+        info!("Group {id} \"{name}\" created");
+        self.groups_changed();
+        Ok(id)
+    }
+
+    pub fn rename_group(&self, id: u16, name: &str) -> Result<()> {
+        let name = self.group_name_check(name, Some(id))?;
+        {
+            let mut data = self.data.lock().unwrap();
+            let group = data.groups.iter_mut().find(|g| g.id == id).context("group not found")?;
+            group.name = name;
+        }
+        self.groups_changed();
+        Ok(())
+    }
+
+    /// Asks every member to leave the group, then forgets it (a member that does not
+    /// answer keeps the membership, which is harmless without the group)
+    pub async fn delete_group(&self, id: u16) -> Result<()> {
+        let members = {
+            let data = self.data.lock().unwrap();
+            data.groups.iter().find(|g| g.id == id).context("group not found")?.members.clone()
+        };
+        for member in members {
+            if let Err(e) = self.group_membership(id, &member, false).await {
+                warn!("{} did not leave group {id}: {e:#}", member.ieee);
+            }
+        }
+        self.data.lock().unwrap().groups.retain(|g| g.id != id);
+        info!("Group {id} deleted");
+        self.groups_changed();
+        Ok(())
+    }
+
+    /// ZCL Groups cluster: Add Group / Remove Group on the member's endpoint
+    async fn group_membership(&self, id: u16, member: &store::GroupMember, add: bool) -> Result<()> {
+        let device = self.device(&member.ieee).context("device not found")?;
+        let serves_groups = device
+            .endpoints
+            .iter()
+            .any(|ep| ep.id == member.ep && ep.in_clusters.contains(&cluster::GROUPS));
+        if !serves_groups {
+            bail!("{} endpoint {} has no Groups cluster", device.name, member.ep);
+        }
+        let mut payload = id.to_le_bytes().to_vec();
+        if add {
+            payload.push(0); // empty group name
+        }
+        let command = if add { 0x00 } else { 0x03 };
+        let (header, body) = self
+            .zcl_request(device.nwk, member.ep, cluster::GROUPS, zcl::FC_CLUSTER_SPECIFIC, command, &payload)
+            .await?;
+        // The response carries the status first; an existing membership on add and a
+        // missing one on remove are what was asked for
+        let status = if header.command == zcl::cmd::DEFAULT_RSP {
+            zcl::default_response_status(&body)
+        } else {
+            body.first().copied()
+        };
+        match status {
+            Some(zcl::STATUS_SUCCESS) => Ok(()),
+            Some(0x8A) if add => Ok(()),
+            Some(0x8B) if !add => Ok(()),
+            Some(status) => bail!("the device refused (status 0x{status:02x})"),
+            None => bail!("malformed response"),
+        }
+    }
+
+    pub async fn set_group_member(&self, id: u16, ieee: &str, ep: u8, add: bool) -> Result<()> {
+        if !self.data.lock().unwrap().groups.iter().any(|g| g.id == id) {
+            bail!("group not found");
+        }
+        let member = store::GroupMember { ieee: ieee.to_owned(), ep };
+        self.group_membership(id, &member, add).await?;
+        {
+            let mut data = self.data.lock().unwrap();
+            let group = data.groups.iter_mut().find(|g| g.id == id).context("group not found")?;
+            group.members.retain(|m| *m != member);
+            if add {
+                group.members.push(member);
+            }
+        }
+        info!("{ieee} ep {ep} {} group {id}", if add { "joined" } else { "left" });
+        self.groups_changed();
+        Ok(())
+    }
+
+    /// One multicast frame for the whole group: on/off, brightness or color temperature.
+    /// The members' states are updated at once; their reports confirm shortly.
+    pub fn set_group(&self, id: u16, key: &str, value: &Json) -> Result<()> {
+        const TRANSITION: u16 = 5;
+        let members = {
+            let data = self.data.lock().unwrap();
+            data.groups.iter().find(|g| g.id == id).context("group not found")?.members.clone()
+        };
+        let member_devices: Vec<Device> = members.iter().filter_map(|m| self.device(&m.ieee)).collect();
+        // The narrowest limits of the members (e.g. Hue lights start brightness at 2)
+        let limits = |feature_key: &str| {
+            let mut low = f64::MIN;
+            let mut high = f64::MAX;
+            for device in &member_devices {
+                if let Some(feature) = devices::features(device).into_iter().find(|f| f.key == feature_key) {
+                    let (min, max) = feature.range(device);
+                    low = low.max(min.unwrap_or(f64::MIN));
+                    high = high.min(max.unwrap_or(f64::MAX));
+                }
+            }
+            (low, high)
+        };
+        let number = || value.as_f64().filter(|v| v.is_finite()).context("expected a number");
+        let (cluster_id, command, payload, state): (u16, u8, Vec<u8>, Vec<(&str, Json)>) = match key {
+            "on" => {
+                let on = value.as_bool().context("expected true or false")?;
+                (cluster::ON_OFF, u8::from(on), vec![], vec![("on", json!(on))])
+            }
+            "level" => {
+                let (low, high) = limits("level");
+                let level = number()?.round().clamp(low.max(1.0), high.min(254.0));
+                let mut payload = vec![level as u8];
+                payload.extend_from_slice(&TRANSITION.to_le_bytes());
+                (cluster::LEVEL, 0x04, payload, vec![("level", json!(level)), ("on", json!(true))])
+            }
+            "color_temp" => {
+                let (low, high) = limits("color_temp");
+                let mired = number()?.round().clamp(low.max(0.0), high.min(65_279.0));
+                let mut payload = (mired as u16).to_le_bytes().to_vec();
+                payload.extend_from_slice(&TRANSITION.to_le_bytes());
+                (cluster::COLOR, 0x0A, payload, vec![("color_temp", json!(mired))])
+            }
+            _ => bail!("unknown group control: {key}"),
+        };
+        let frame = zcl::frame(
+            zcl::FC_CLUSTER_SPECIFIC | zcl::FC_DISABLE_DEFAULT_RESPONSE,
+            self.next_seq(),
+            command,
+            &payload,
+        );
+        self.stack
+            .send_aps_groupcast(id, HA_PROFILE, cluster_id, HUB_ENDPOINT, RADIUS, frame, TxPriority::UserNormal)
+            .map_err(|e| anyhow!("cannot send to the group: {e:?}"))?;
+        info!("Group {id} {key} = {value}");
+        for device in member_devices {
+            // Only members that have the feature
+            let features = devices::features(&device);
+            self.update_device(&device.ieee, |d| {
+                for (k, v) in &state {
+                    if features.iter().any(|f| f.key == *k) {
+                        d.state.insert((*k).to_owned(), v.clone());
+                    }
+                }
+            });
+        }
+        Ok(())
+    }
+
     /// A ZDO request that a sleepy device may answer only once a button press wakes it:
     /// repeated for a while, each attempt waiting as long as the parent keeps the frame
     async fn zdo_patient(&self, device: &Device, cluster_id: u16, payload: Vec<u8>) -> Result<Vec<u8>> {
@@ -2052,13 +2257,12 @@ impl Hub {
         Ok(all
             .into_iter()
             .map(|binding| {
-                let dst_name = binding.dst_ieee.as_deref().and_then(|dst| {
-                    if dst == hub {
-                        Some("Hub".to_owned())
-                    } else {
-                        data.devices.get(dst).map(|d| d.name.clone())
-                    }
-                });
+                let dst_name = match (binding.group, binding.dst_ieee.as_deref()) {
+                    (Some(group), _) => data.groups.iter().find(|g| g.id == group).map(|g| g.name.clone()),
+                    (None, Some(dst)) if dst == hub => Some("Hub".to_owned()),
+                    (None, Some(dst)) => data.devices.get(dst).map(|d| d.name.clone()),
+                    (None, None) => None,
+                };
                 BindingView { binding, dst_name }
             })
             .collect())
@@ -2069,15 +2273,18 @@ impl Hub {
     pub async fn set_binding(&self, ieee: &str, src_ep: u8, cluster_id: u16, dst: &str, dst_ep: u8, unbind: bool) -> Result<()> {
         let device = self.device(ieee).context("device not found")?;
         let src = parse_eui64(ieee)?;
-        let (dst_ieee, dst_ep) = if dst == "hub" {
-            (self.ieee, HUB_ENDPOINT)
+        let payload = if let Some(group) = dst.strip_prefix("group:") {
+            let group: u16 = group.parse().context("invalid group id")?;
+            zdo::bind_req_group(src.0, src_ep, cluster_id, group)
+        } else if dst == "hub" {
+            zdo::bind_req(src.0, src_ep, cluster_id, self.ieee.0, HUB_ENDPOINT)
         } else {
-            (parse_eui64(dst)?, dst_ep)
+            zdo::bind_req(src.0, src_ep, cluster_id, parse_eui64(dst)?.0, dst_ep)
         };
         let request = if unbind { zdo::cluster::UNBIND_REQ } else { zdo::cluster::BIND_REQ };
         let what = if unbind { "unbind" } else { "bind" };
         let rsp = self
-            .zdo_patient(&device, request, zdo::bind_req(src.0, src_ep, cluster_id, dst_ieee.0, dst_ep))
+            .zdo_patient(&device, request, payload)
             .await
             .map_err(|e| no_reply_hint(e, what))?;
         zdo::parse_status_rsp(&rsp).map_err(|e| anyhow!("the device refused to {what} cluster 0x{cluster_id:04x} ({e:#})"))?;
@@ -2091,6 +2298,9 @@ impl Hub {
             data.devices.remove(ieee);
             data.link_keys.retain(|k| k.ieee != ieee);
             data.children.retain(|c| c.ieee != ieee);
+            for group in &mut data.groups {
+                group.members.retain(|m| m.ieee != ieee);
+            }
         }
         self.pending_writes.lock().unwrap().remove(ieee);
         let _ = self.events.send(Event::Removed {

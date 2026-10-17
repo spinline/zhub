@@ -212,6 +212,16 @@ pub fn parse_mgmt_bind_rsp(payload: &[u8]) -> Result<(u8, Vec<Binding>)> {
     Ok((*total, bindings))
 }
 
+/// Bind_req to a group (address mode 0x01)
+pub fn bind_req_group(src_ieee: [u8; 8], src_ep: u8, cluster: u16, group: u16) -> Vec<u8> {
+    let mut out = src_ieee.to_vec();
+    out.push(src_ep);
+    out.extend_from_slice(&cluster.to_le_bytes());
+    out.push(0x01);
+    out.extend_from_slice(&group.to_le_bytes());
+    out
+}
+
 pub fn parse_status_rsp(payload: &[u8]) -> Result<()> {
     check_status(payload).map(|_| ())
 }
@@ -330,6 +340,12 @@ mod tests {
         assert_eq!(desc.logical_type, 2);
         assert!(!desc.rx_on_when_idle());
         assert_eq!(desc.manufacturer_code, 0x1002);
+    }
+
+    #[test]
+    fn group_bind_uses_address_mode_one() {
+        let req = bind_req_group([1, 2, 3, 4, 5, 6, 7, 8], 1, 0x0006, 0x0003);
+        assert_eq!(req, [1, 2, 3, 4, 5, 6, 7, 8, 0x01, 0x06, 0x00, 0x01, 0x03, 0x00]);
     }
 
     #[test]

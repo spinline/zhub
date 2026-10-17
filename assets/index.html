@@ -162,6 +162,11 @@
   .settings { display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); align-items: start; }
   .settings .card h3 { margin: 0; font-size: 15px; }
   .settings .wide { grid-column: 1 / -1; }
+  details.members summary { cursor: pointer; color: var(--muted); font-size: 13px; }
+  details.members .member { display: flex; align-items: center; gap: 8px; padding: 4px 0; font-size: 14px; }
+  details.members .member span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  details.members .member button { padding: 2px 8px; font-size: 12px; }
+  details.members select { flex: 1; min-width: 0; }
   .log-tools { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; font-size: 13px; color: var(--muted); }
   pre.log {
     margin: 0; background: var(--bg); border: 1px solid var(--line); border-radius: 10px; padding: 10px;
@@ -185,6 +190,7 @@
   <button id="permit" class="primary">Permit join</button>
   <nav id="menu">
     <a href="#devices" data-page="devices"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>Devices</a>
+    <a href="#groups" data-page="groups"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="9" cy="8" r="3"/><circle cx="17" cy="9" r="2.5"/><path d="M3 20c0-3.3 2.7-6 6-6s6 2.7 6 6"/><path d="M15 14.5c.6-.3 1.3-.5 2-.5 2.8 0 4 2 4 5"/></svg>Groups</a>
     <a href="#settings" data-page="settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>Settings</a>
     <a href="#logs" data-page="logs"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M14 3v6h6"/><path d="M8 13h8M8 17h6"/></svg>Logs</a>
   </nav>
@@ -206,6 +212,16 @@
   <div id="sensors" class="grid"></div>
   <h2 id="otherTitle" hidden>Other</h2>
   <div id="other" class="grid"></div>
+</main>
+<main id="pageGroups" hidden>
+  <div class="card" style="margin-bottom:12px">
+    <div class="ctl" style="border:0;padding:0">
+      <div class="label">New group</div>
+      <div class="row"><input id="groupName" type="text" placeholder="e.g. Living room" autocomplete="off"><button id="groupCreate" class="primary">Create</button></div>
+      <div class="desc">A group takes one command for all its lights at once, and a switch can be bound to it. Add members under each group.</div>
+    </div>
+  </div>
+  <div id="groups" class="grid"></div>
 </main>
 <main id="pageSettings" hidden>
   <div class="settings">
@@ -278,6 +294,8 @@
 const devices = new Map();
 const cards = new Map();
 let permitUntil = 0;
+let groups = [];
+const groupCards = new Map();
 let hubSettings = { availability_mains_minutes: 10, availability_battery_minutes: 1500, permit_join_seconds: 180 };
 
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -836,12 +854,11 @@ function bindTab(d) {
   const showBindings = (bindings) => {
     if (!bindings.length) { list.replaceChildren(el("p", { className: "desc", textContent: "No bindings." })); return; }
     list.replaceChildren(...bindings.map(b => {
-      const target = b.group != null ? `Group ${hex(b.group)}`
+      const target = b.group != null ? `Group: ${b.dst_name ?? hex(b.group)}`
         : `${b.dst_name ?? b.dst_ieee}${b.dst_ep != null ? ` · ep ${b.dst_ep}` : ""}`;
       const unbind = el("button", { textContent: "Unbind" });
-      unbind.disabled = b.group != null;
       unbind.onclick = () => {
-        const dst = b.dst_name === "Hub" ? "hub" : b.dst_ieee;
+        const dst = b.group != null ? `group:${b.group}` : b.dst_name === "Hub" ? "hub" : b.dst_ieee;
         unbind.disabled = true;
         unbind.textContent = "Unbinding…";
         run(api(`/api/devices/${ieee}/bind`, { src_ep: b.src_ep, clusters: [b.cluster], dst, dst_ep: b.dst_ep, unbind: true })
@@ -867,6 +884,7 @@ function bindTab(d) {
   const srcEp = el("select", {}, ...d.endpoints.map(ep => el("option", { value: ep.id, textContent: `ep ${ep.id}` })));
   const others = [...devices.values()].filter(o => o.ieee !== ieee && o.endpoints.length).sort((a, b) => a.name.localeCompare(b.name));
   const dst = el("select", {}, el("option", { value: "hub", textContent: "Hub" }),
+    ...groups.map(g => el("option", { value: `group:${g.id}`, textContent: `Group: ${g.name}` })),
     ...others.map(o => el("option", { value: o.ieee, textContent: o.name })));
   const dstEp = el("select");
   const clusterBox = el("div", { className: "presets" });
@@ -878,6 +896,11 @@ function bindTab(d) {
     let ids;
     if (dst.value === "hub") {
       ids = [...new Set([...src.in_clusters, ...src.out_clusters])].filter(id => id !== 0x0000);
+    } else if (dst.value.startsWith("group:")) {
+      // What the members serve; an empty group takes anything the source sends
+      const g = groups.find(g => `group:${g.id}` === dst.value);
+      const served = new Set(g.members.flatMap(m => endpoint(devices.get(m.ieee) ?? { endpoints: [] }, m.ep)?.in_clusters ?? []));
+      ids = src.out_clusters.filter(id => id !== 0x0000 && (!served.size || served.has(id)));
     } else {
       const target = endpoint(devices.get(dst.value), dstEp.value);
       ids = src.out_clusters.filter(id => id !== 0x0000 && target?.in_clusters.includes(id));
@@ -887,7 +910,7 @@ function bindTab(d) {
       : [el("span", { className: "desc", textContent: "No cluster the two have in common." })]));
   };
   const refreshDst = () => {
-    const isHub = dst.value === "hub";
+    const isHub = dst.value === "hub" || dst.value.startsWith("group:");
     dstEp.hidden = isHub;
     if (!isHub) {
       const eps = devices.get(dst.value).endpoints;
@@ -987,6 +1010,7 @@ function render() {
   }
   $("#otherTitle").hidden = groups.other.length === 0;
   $("#climateTitle").hidden = groups.climate.length === 0;
+  renderGroups();
   if (detail.ieee) renderDetail();
 }
 
@@ -1024,11 +1048,163 @@ $("#hueReset").onclick = () => {
     .finally(() => { button.disabled = false; button.textContent = "Reset"; }));
 };
 
+// ---- Groups ----
+
+// Group state follows the members: on if any is on, the brightest level, the first
+// member's color temperature; a control shows when a member has the feature
+function groupView(g) {
+  const members = g.members.map(m => devices.get(m.ieee)).filter(Boolean);
+  const having = (key) => members.filter(d => feature(d, key));
+  const view = { members };
+  if (having("on").length) view.on = having("on").some(d => d.state.on);
+  const lv = having("level");
+  if (lv.length) {
+    view.level = Math.max(0, ...lv.map(d => d.state.level ?? 0));
+    view.levelRange = lv.reduce(([lo, hi], d) => { const [a, b] = range(feature(d, "level"), d); return [Math.max(lo, a ?? 1), Math.min(hi, b ?? 254)]; }, [1, 254]);
+  }
+  const ct = having("color_temp");
+  if (ct.length) {
+    view.colorTemp = ct.find(d => d.state.color_temp != null)?.state.color_temp;
+    view.ctRange = ct.reduce(([lo, hi], d) => { const [a, b] = range(feature(d, "color_temp"), d); return [Math.max(lo, a ?? 153), Math.min(hi, b ?? 500)]; }, [0, 65279]);
+  }
+  return view;
+}
+
+const setGroup = (id, key, value) => api(`/api/groups/${id}/set`, { key, value });
+
+// Endpoints that can join a group: they serve the Groups cluster
+function groupCandidates(g) {
+  const list = [];
+  for (const d of [...devices.values()].sort((a, b) => a.name.localeCompare(b.name))) {
+    for (const ep of d.endpoints) {
+      if (ep.in_clusters.includes(0x0004) && !g.members.some(m => m.ieee === d.ieee && m.ep === ep.id)) {
+        list.push({ ieee: d.ieee, ep: ep.id, label: d.endpoints.length > 1 ? `${d.name} · ep ${ep.id}` : d.name });
+      }
+    }
+  }
+  return list;
+}
+
+function buildGroupCard(g) {
+  const id = g.id;
+  let current = g;
+  const card = el("div", { className: "card" });
+  const name = el("div", { className: "name" });
+  const sub = el("div", { className: "sub" });
+  const toggle = el("input", { type: "checkbox" });
+  const switchNode = el("label", { className: "switch" }, toggle, el("span"));
+  toggle.onchange = () => run(setGroup(id, "on", toggle.checked).catch(e => { toggle.checked = !toggle.checked; throw e; }));
+  card.append(el("div", { className: "top" }, el("div", { className: "names" }, name, sub), switchNode));
+
+  const level = el("input", { type: "range", min: 1, max: 254 });
+  const levelText = el("span");
+  level.oninput = () => levelText.textContent = `${Math.round(level.value / 2.54)}%`;
+  level.onchange = () => run(setGroup(id, "level", Number(level.value)));
+  const levelRow = el("label", { className: "slider" }, "Brightness", level, levelText);
+  const ct = el("input", { type: "range" });
+  const ctText = el("span");
+  ct.oninput = () => ctText.textContent = `${Math.round(1e6 / ct.value / 100) * 100}K`;
+  ct.onchange = () => run(setGroup(id, "color_temp", Number(ct.value)));
+  const ctRow = el("label", { className: "slider" }, "Color temp", ct, ctText);
+  card.append(levelRow, ctRow);
+
+  // Members and management
+  const memberList = el("div");
+  const add = el("select");
+  const addBtn = el("button", { textContent: "Add" });
+  addBtn.onclick = () => {
+    if (!add.value) return;
+    const [ieee, ep] = add.value.split("|");
+    addBtn.disabled = true;
+    addBtn.textContent = "Adding…";
+    run(api(`/api/groups/${id}/members`, { ieee, ep: Number(ep) }).then(() => toast("Added to the group"))
+      .finally(() => { addBtn.disabled = false; addBtn.textContent = "Add"; }));
+  };
+  const rename = el("button", { textContent: "Rename" });
+  rename.onclick = () => {
+    const next = prompt("Group name", current.name);
+    if (next && next.trim() && next !== current.name) run(api(`/api/groups/${id}/rename`, { name: next }));
+  };
+  const remove = el("button", { textContent: "Delete", className: "danger" });
+  remove.onclick = () => {
+    if (confirm(`Delete the group "${current.name}"? Its members are asked to leave it.`)) {
+      remove.disabled = true;
+      run(api(`/api/groups/${id}`, null, "DELETE").then(() => toast("Group deleted")).finally(() => { remove.disabled = false; }));
+    }
+  };
+  const summary = el("summary");
+  card.append(el("details", { className: "members" }, summary, memberList,
+    el("div", { className: "member" }, add, addBtn),
+    el("div", { className: "actions", style: "margin-top:8px" }, rename, remove),
+    el("div", { className: "desc", style: "font-size:12px;color:var(--muted)", textContent: `Group id ${id} (${hex(id)})` })));
+
+  return {
+    card,
+    update(g) {
+      current = g;
+      const v = groupView(g);
+      name.textContent = g.name;
+      sub.textContent = `${g.members.length} member${g.members.length === 1 ? "" : "s"}`;
+      summary.textContent = `Members (${g.members.length})`;
+      switchNode.hidden = v.on == null;
+      if (v.on != null && !focused(toggle)) toggle.checked = v.on;
+      levelRow.hidden = v.level == null;
+      if (v.level != null) {
+        Object.assign(level, { min: v.levelRange[0], max: v.levelRange[1] });
+        if (!focused(level)) { level.value = v.level; level.oninput(); }
+      }
+      ctRow.hidden = v.ctRange == null;
+      if (v.ctRange) {
+        Object.assign(ct, { min: v.ctRange[0], max: v.ctRange[1] });
+        if (!focused(ct) && v.colorTemp != null) { ct.value = v.colorTemp; ct.oninput(); }
+      }
+      memberList.replaceChildren(...g.members.map(m => {
+        const d = devices.get(m.ieee);
+        const leave = el("button", { textContent: "Remove" });
+        leave.onclick = () => {
+          leave.disabled = true;
+          run(api(`/api/groups/${id}/members`, { ieee: m.ieee, ep: m.ep, remove: true }).then(() => toast("Removed from the group"))
+            .finally(() => { leave.disabled = false; }));
+        };
+        return el("div", { className: "member" }, el("span", { textContent: d ? `${d.name}${d.endpoints.length > 1 ? ` · ep ${m.ep}` : ""}` : m.ieee }), leave);
+      }));
+      if (!focused(add)) {
+        const options = groupCandidates(g);
+        add.replaceChildren(el("option", { value: "", textContent: options.length ? "Add a device…" : "No device to add" }),
+          ...options.map(o => el("option", { value: `${o.ieee}|${o.ep}`, textContent: o.label })));
+      }
+    },
+  };
+}
+
+function renderGroups() {
+  const container = $("#groups");
+  if (!groups.length) {
+    container.replaceChildren(el("div", { className: "empty", textContent: "No groups yet." }));
+    groupCards.clear();
+    return;
+  }
+  const list = [];
+  for (const g of [...groups].sort((a, b) => a.name.localeCompare(b.name))) {
+    let entry = groupCards.get(g.id);
+    if (!entry) { entry = buildGroupCard(g); groupCards.set(g.id, entry); }
+    entry.update(g);
+    list.push(entry.card);
+  }
+  for (const id of [...groupCards.keys()]) if (!groups.some(g => g.id === id)) groupCards.delete(id);
+  container.replaceChildren(...list);
+}
+
+$("#groupCreate").onclick = () => {
+  const name = $("#groupName").value;
+  run(api("/api/groups", { name }).then(() => { $("#groupName").value = ""; toast("Group created"); }));
+};
+
 // ---- Settings page ----
 
 let page = "devices";
 
-const PAGES = { devices: "Devices", settings: "Settings", logs: "Logs" };
+const PAGES = { devices: "Devices", groups: "Groups", settings: "Settings", logs: "Logs" };
 
 function showPage() {
   const wanted = location.hash.slice(1);
@@ -1036,10 +1212,11 @@ function showPage() {
   $("#pageDevices").hidden = page !== "devices";
   $("#pageSettings").hidden = page !== "settings";
   $("#pageLogs").hidden = page !== "logs";
+  $("#pageGroups").hidden = page !== "groups";
   $("#pageTitle").textContent = PAGES[page];
   for (const a of document.querySelectorAll("#menu a")) a.classList.toggle("active", a.dataset.page === page);
   document.body.classList.remove("menu-open");
-  if (page !== "devices") run(loadSettings());
+  if (page === "settings" || page === "logs") run(loadSettings());
   pollLogs();
 }
 
@@ -1160,8 +1337,9 @@ async function load() {
   for (const ieee of [...cards.keys()]) if (!devices.has(ieee)) cards.delete(ieee);
   permitUntil = Date.now() + state.permit_join * 1000;
   if (state.settings) hubSettings = state.settings;
+  groups = state.groups || [];
   render();
-  if (page !== "devices") run(loadSettings());
+  if (page === "settings" || page === "logs") run(loadSettings());
   renderPermit();
 }
 
@@ -1188,6 +1366,9 @@ function connect() {
     } else if (event.type === "permit_join") {
       permitUntil = Date.now() + event.remaining * 1000;
       renderPermit();
+    } else if (event.type === "groups") {
+      groups = event.groups;
+      render();
     } else if (event.type === "settings") {
       run(load());
     }

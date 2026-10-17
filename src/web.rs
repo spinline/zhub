@@ -36,6 +36,11 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .route("/api/devices/{ieee}/rename", post(rename))
         .route("/api/devices/{ieee}/interview", post(interview))
         .route("/api/devices/{ieee}/bindings", get(bindings))
+        .route("/api/groups", post(create_group))
+        .route("/api/groups/{id}", axum::routing::delete(delete_group))
+        .route("/api/groups/{id}/rename", post(rename_group))
+        .route("/api/groups/{id}/members", post(group_member))
+        .route("/api/groups/{id}/set", post(set_group))
         .route("/api/devices/{ieee}/bind", post(bind))
         .with_state(hub)
 }
@@ -80,7 +85,46 @@ async fn state(State(hub): State<Arc<Hub>>) -> ApiResult {
         "devices": hub.devices(),
         "permit_join": hub.permit_remaining(),
         "settings": hub.settings(),
+        "groups": hub.groups(),
     })))
+}
+
+#[derive(Deserialize)]
+struct GroupName {
+    name: String,
+}
+
+async fn create_group(State(hub): State<Arc<Hub>>, Json(body): Json<GroupName>) -> ApiResult {
+    let id = hub.create_group(&body.name)?;
+    Ok(Json(json!({ "ok": true, "id": id })))
+}
+
+async fn rename_group(State(hub): State<Arc<Hub>>, Path(id): Path<u16>, Json(body): Json<GroupName>) -> ApiResult {
+    hub.rename_group(id, &body.name)?;
+    ok()
+}
+
+async fn delete_group(State(hub): State<Arc<Hub>>, Path(id): Path<u16>) -> ApiResult {
+    hub.delete_group(id).await?;
+    ok()
+}
+
+#[derive(Deserialize)]
+struct GroupMemberBody {
+    ieee: String,
+    ep: u8,
+    #[serde(default)]
+    remove: bool,
+}
+
+async fn group_member(State(hub): State<Arc<Hub>>, Path(id): Path<u16>, Json(body): Json<GroupMemberBody>) -> ApiResult {
+    hub.set_group_member(id, &body.ieee, body.ep, !body.remove).await?;
+    ok()
+}
+
+async fn set_group(State(hub): State<Arc<Hub>>, Path(id): Path<u16>, Json(body): Json<SetBody>) -> ApiResult {
+    hub.set_group(id, &body.key, &body.value)?;
+    ok()
 }
 
 async fn hub_info(State(hub): State<Arc<Hub>>) -> ApiResult {

@@ -11,6 +11,10 @@ Zigbee2MQTT needed: a single static binary with an embedded web UI.
 - Lights: on/off, brightness, color temperature, startup and transition settings, effects.
 - Sensors: temperature, humidity, occupancy, IAS zones (contact, motion, water), battery.
 - Remotes and switch modules: button presses become the `action` value.
+- Groups: lights in a Zigbee group take one multicast command (on/off, brightness,
+  color temperature); membership lives on the devices (Groups cluster).
+- Bindings: a device's binding table can be read and edited (to the hub, a device or a
+  group), so e.g. a switch controls lights directly.
 - Thermostats: SONOFF TRVZB (ZCL thermostat cluster) and Tuya thermostats (datapoints),
   including weekly schedules where supported.
 - Hue lights can be factory reset by serial number (like the Hue Bridge).
