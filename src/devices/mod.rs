@@ -523,6 +523,7 @@ pub struct DefinitionInfo {
 
 const DEFINITIONS: &[&Definition] = &[
     &philips::LTA005,
+    &philips::LWA017,
     &philips::LTA009,
     &philips::RDM001,
     &sonoff::SNZB_02D,

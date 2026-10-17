@@ -211,6 +211,30 @@ pub static LTA005: Definition = Definition {
     tuya_time_since_2000: false,
 };
 
+/// `philips.m.light()` + `m.identify()`: dimmable white, no color temperature
+static WHITE_FEATURES: [Feature; 7] = [
+    common::ON_OFF,
+    common::brightness(2.0),
+    common::POWER_ON_BEHAVIOR,
+    // As for the white ambiance lights: reported though Zigbee2MQTT does not expose them
+    level_config::CURRENT_LEVEL_STARTUP,
+    level_config::EXECUTE_IF_OFF,
+    EFFECT,
+    common::IDENTIFY,
+];
+
+pub static LWA017: Definition = Definition {
+    fingerprint: &[Fingerprint::Model("LWA017")],
+    vendor: "Philips",
+    description: "Hue white A60 bulb E27 1050lm with Bluetooth",
+    name: None,
+    card: Card::Light,
+    features: &WHITE_FEATURES,
+    binds: &[],
+    time_base: TimeBase::Zigbee2000,
+    tuya_time_since_2000: false,
+};
+
 // ---- RDM001: Hue wall switch module ----
 
 /// Signify's basic cluster attribute: how the connected switches are wired
@@ -385,5 +409,14 @@ mod tests {
     fn brightness_starts_at_two() {
         assert!(feature("level").validate(&lamp(), json!(1)).is_err());
         assert!(feature("level").validate(&lamp(), json!(2)).is_ok());
+    }
+
+    #[test]
+    fn white_bulb_has_no_color_temperature() {
+        let mut device = lamp();
+        device.model = Some("LWA017".into());
+        assert!(std::ptr::eq(definition(&device).unwrap(), &LWA017));
+        let keys: Vec<_> = features(&device).into_iter().map(|f| f.key).collect();
+        assert_eq!(keys, ["on", "level", "power_on_behavior", "current_level_startup", "execute_if_off", "effect", "identify"]);
     }
 }
