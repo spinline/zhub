@@ -30,6 +30,7 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .route("/api/hub/settings", post(settings))
         .route("/api/hub/tx_power", post(tx_power))
         .route("/api/hub/restart", post(restart))
+        .route("/api/mqtt/cleanup", post(mqtt_cleanup))
         .route("/api/matter/open", post(matter_open))
         .route("/api/matter/reset", post(matter_reset))
         .route("/api/logs", get(logs))
@@ -168,6 +169,11 @@ async fn matter_open(State(hub): State<Arc<Hub>>) -> ApiResult {
 async fn matter_reset(State(hub): State<Arc<Hub>>) -> ApiResult {
     hub.matter_command(crate::hub::MatterCommand::Reset)?;
     ok()
+}
+
+async fn mqtt_cleanup(State(hub): State<Arc<Hub>>) -> ApiResult {
+    let removed = crate::mqtt::clean_stale(&hub).await?;
+    Ok(Json(json!({ "ok": true, "removed": removed })))
 }
 
 async fn restart(State(hub): State<Arc<Hub>>) -> ApiResult {

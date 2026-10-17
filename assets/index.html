@@ -258,6 +258,11 @@
         <div class="desc">Saves the state and starts zhub again; the network stays up for the devices and the page reconnects in about 10 s.</div>
       </div>
       <div class="ctl">
+        <div class="label">Clean up stale MQTT topics</div>
+        <button id="mqttCleanup">Clean up</button>
+        <div class="desc">Removes retained messages of names no device or group has any more (left by a rename or removal while the broker was unreachable), and discovery entries of devices that are gone.</div>
+      </div>
+      <div class="ctl">
         <div class="label">Factory reset a Hue light by serial number</div>
         <span></span>
         <div class="desc">The 6-character code printed on the light (0-9, A-F). Separate several with commas. The light must be powered; after the reset it joins on its own. Takes about 20 s.</div>
@@ -1466,6 +1471,14 @@ function mqttForm(m) {
 }
 
 $("#logLevel").onchange = () => run(saveSettings({ log_level: $("#logLevel").value }));
+
+$("#mqttCleanup").onclick = () => {
+  const button = $("#mqttCleanup");
+  button.disabled = true;
+  run(api("/api/mqtt/cleanup").then(({ removed }) => toast(removed.length
+    ? `Removed ${removed.length} stale topic${removed.length === 1 ? "" : "s"}: ${removed.join(", ")}`
+    : "Nothing to clean up")).finally(() => { button.disabled = false; }));
+};
 
 $("#restart").onclick = () => {
   if (confirm("Restart the hub?")) run(api("/api/hub/restart").then(() => toast("Restarting; the page reconnects in about 10 s.")));

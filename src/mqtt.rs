@@ -11,7 +11,7 @@
 //!
 //! The connection restarts when the settings change.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
@@ -872,6 +872,91 @@ fn writable(f: &Feature) -> bool {
     f.access != Access::Read
 }
 
+/// Which retained topics nobody owns any more: the state and availability of names no
+/// device or group has, and discovery configs of devices and groups that are gone (all of
+/// them when discovery is off). Only zhub's own topic shapes count.
+fn stale_topics(retained: &[String], cfg: &MqttSettings, names: &HashSet<String>, nodes: &HashSet<String>) -> Vec<String> {
+    let base = format!("{}/", cfg.base_topic);
+    let prefix = format!("{}/", cfg.discovery_prefix);
+    let mut stale: Vec<String> = retained
+        .iter()
+        .filter(|topic| {
+            if let Some(rest) = topic.strip_prefix(&base) {
+                let name = rest.strip_suffix("/availability").unwrap_or(rest);
+                return !name.is_empty() && !name.contains('/') && name != "bridge" && !names.contains(name);
+            }
+            if let Some(rest) = topic.strip_prefix(&prefix) {
+                // <component>/<node>/<object>/config
+                let parts: Vec<&str> = rest.split('/').collect();
+                return parts.len() == 4
+                    && parts[3] == "config"
+                    && parts[1].starts_with("zhub_")
+                    && (!cfg.discovery || !nodes.contains(parts[1]));
+            }
+            false
+        })
+        .cloned()
+        .collect();
+    stale.sort();
+    stale
+}
+
+/// Removes the retained messages nobody owns (renames while the broker was unreachable,
+/// devices removed meanwhile); returns the topics removed. Zigbee2MQTT has no such tool.
+pub async fn clean_stale(hub: &Arc<Hub>) -> anyhow::Result<Vec<String>> {
+    let cfg = hub.mqtt_settings().borrow().clone();
+    anyhow::ensure!(cfg.enabled, "MQTT is off");
+    let id = hub.hub_ieee().replace(':', "");
+    let mut options = MqttOptions::new(format!("zhub-{id}-cleanup"), cfg.host.trim(), cfg.port);
+    options.set_keep_alive(Duration::from_secs(30));
+    options.set_max_packet_size(256 * 1024, 256 * 1024);
+    if !cfg.username.is_empty() {
+        options.set_credentials(cfg.username.clone(), cfg.password.clone().unwrap_or_default());
+    }
+    let (client, mut eventloop) = AsyncClient::new(options, 64);
+    client.subscribe(format!("{}/#", cfg.base_topic), QoS::AtLeastOnce).await?;
+    client.subscribe(format!("{}/+/+/+/config", cfg.discovery_prefix), QoS::AtLeastOnce).await?;
+    // Retained messages arrive right after the subscription; a quiet second ends them
+    let mut retained = Vec::new();
+    let mut subscribed = 0;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let wait = if subscribed < 2 { deadline } else { tokio::time::Instant::now() + Duration::from_secs(1) };
+        match tokio::time::timeout_at(wait.min(deadline), eventloop.poll()).await {
+            Ok(Ok(MqttEvent::Incoming(Incoming::SubAck(_)))) => subscribed += 1,
+            Ok(Ok(MqttEvent::Incoming(Incoming::Publish(p)))) if p.retain && !p.payload.is_empty() => retained.push(p.topic),
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => anyhow::bail!("cannot reach the broker: {e}"),
+            Err(_) if subscribed < 2 => anyhow::bail!("the broker did not answer"),
+            Err(_) => break,
+        }
+    }
+    let devices = hub.devices();
+    let groups = hub.groups();
+    let names: HashSet<String> = devices.iter().map(|d| topic_name(&d.device.name)).chain(groups.iter().map(|g| topic_name(&g.name))).collect();
+    let nodes: HashSet<String> = devices
+        .iter()
+        .map(|d| format!("zhub_{}", d.device.ieee.replace(':', "")))
+        .chain(groups.iter().map(|g| format!("zhub_group_{}", g.id)))
+        .collect();
+    let stale = stale_topics(&retained, &cfg, &names, &nodes);
+    for topic in &stale {
+        client.publish(topic.clone(), QoS::AtLeastOnce, true, Vec::new()).await?;
+        info!("MQTT: removed the stale retained topic {topic}");
+    }
+    // Let the removals go out before the connection closes
+    let _ = client.disconnect().await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Ok(event) = eventloop.poll().await {
+            if matches!(event, MqttEvent::Outgoing(rumqttc::Outgoing::Disconnect)) {
+                break;
+            }
+        }
+    })
+    .await;
+    Ok(stale)
+}
+
 /// Zigbee2MQTT's per-light memory between commands (the level before a fade to off)
 static LIGHT_MEMORY: LazyLock<Mutex<HashMap<String, z2m_light::Memory>>> = LazyLock::new(Default::default);
 
@@ -1184,4 +1269,28 @@ mod tests {
         assert_eq!((lock["value_on"].clone(), lock["value_off"].clone()), (json!("LOCK"), json!("UNLOCK")));
     }
 
+
+    #[test]
+    fn stale_topics_are_only_zhubs_shapes_without_an_owner() {
+        let cfg = cfg();
+        let names: HashSet<String> = ["Living room".to_owned()].into();
+        let nodes: HashSet<String> = ["zhub_00178801".to_owned()].into();
+        let retained: Vec<String> = [
+            "zigbee2mqtt/Living room",
+            "zigbee2mqtt/Living room/availability",
+            "zigbee2mqtt/LTA009 80a6",
+            "zigbee2mqtt/LTA009 80a6/availability",
+            "zigbee2mqtt/bridge/info",
+            "zigbee2mqtt/Old/deeper/topic",
+            "homeassistant/light/zhub_00178801/light/config",
+            "homeassistant/light/zhub_gone/light/config",
+            "homeassistant/light/other_tool/light/config",
+        ]
+        .map(str::to_owned)
+        .into();
+        assert_eq!(
+            stale_topics(&retained, &cfg, &names, &nodes),
+            ["homeassistant/light/zhub_gone/light/config", "zigbee2mqtt/LTA009 80a6", "zigbee2mqtt/LTA009 80a6/availability"]
+        );
+    }
 }
