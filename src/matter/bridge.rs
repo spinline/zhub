@@ -443,7 +443,7 @@ impl Bridge {
                     vendor: view.definition.map(|d| d.vendor.to_owned()).or(view.device.manufacturer.clone()).unwrap_or_default(),
                     product: view.device.model.clone().unwrap_or_default(),
                     serial: target.key(),
-                    reachable: !self.hub.is_offline(&view.device),
+                    reachable: !view.offline,
                 })
             }
         }

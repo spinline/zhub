@@ -3,6 +3,7 @@
 //! - `<base>/<name>/set`: commands, with Zigbee2MQTT's `state: ON/OFF/TOGGLE` and
 //!   `brightness` besides the feature keys
 //! - `<base>/<name>/action`: button presses (not retained)
+//! - `<base>/<name>/availability`: `{"state":"online"}` or `offline` (retained)
 //! - `<base>/bridge/state`, `<base>/bridge/devices`, `<base>/bridge/groups`
 //! - Home Assistant discovery under `<prefix>/…/config`
 //!
@@ -242,6 +243,7 @@ impl Bridge {
     async fn clear(&mut self, key: &str) {
         if let Some(topic) = self.state_topics.remove(key) {
             self.publish(&topic, String::new(), true).await;
+            self.publish(&format!("{topic}/availability"), String::new(), true).await;
         }
         for topic in self.discovery.remove(key).unwrap_or_default().into_keys() {
             self.publish(&topic, String::new(), true).await;
@@ -255,6 +257,7 @@ impl Bridge {
             && old != topic
         {
             self.publish(&old, String::new(), true).await;
+            self.publish(&format!("{old}/availability"), String::new(), true).await;
         }
         topic
     }
@@ -262,6 +265,8 @@ impl Bridge {
     async fn device_state(&mut self, view: &DeviceView) {
         let topic = self.state_topic(&view.device.ieee, &view.device.name).await;
         self.publish(&topic, device_payload(view).to_string(), true).await;
+        let availability = json!({"state": if view.offline { "offline" } else { "online" }});
+        self.publish(&format!("{topic}/availability"), availability.to_string(), true).await;
         if self.cfg.discovery {
             let configs = device_discovery(view, &self.cfg, &topic);
             self.update_discovery(view.device.ieee.clone(), configs).await;
@@ -445,6 +450,17 @@ fn device_discovery(view: &DeviceView, cfg: &MqttSettings, state_topic: &str) ->
         config.insert("unique_id".into(), json!(format!("zhub_{ieee}_{object}")));
         config.insert("device".into(), device.clone());
         common_fields(&mut config, cfg, state_topic);
+        // Available while both the bridge and the device are
+        config.remove("availability_topic");
+        config.remove("availability_template");
+        config.insert("availability_mode".into(), json!("all"));
+        config.insert(
+            "availability".into(),
+            json!([
+                {"topic": format!("{}/bridge/state", cfg.base_topic), "value_template": "{{ value_json.state }}"},
+                {"topic": format!("{state_topic}/availability"), "value_template": "{{ value_json.state }}"},
+            ]),
+        );
         configs.insert(format!("{}/{component}/zhub_{ieee}/{object}/config", cfg.discovery_prefix), Json::Object(config));
     };
 
@@ -702,6 +718,7 @@ mod tests {
             interviewing: false,
             waiting_for_wake: false,
             pending: Vec::new(),
+            offline: false,
             device,
         }
     }

@@ -47,6 +47,20 @@ const RADIUS: u8 = 30;
 const FRAME_COUNTER_MARGIN: u32 = 1000;
 const SAVE_DELAY: Duration = Duration::from_secs(5);
 const TABLE_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(300);
+const AVAILABILITY_CHECK: Duration = Duration::from_secs(30);
+
+/// Zigbee2MQTT's availability: no message for longer than the device type's limit
+fn offline(settings: &store::Settings, device: &Device) -> bool {
+    let Some(seen) = device.last_seen else {
+        return false;
+    };
+    let minutes = if device.rx_on_when_idle {
+        settings.availability_mains_minutes
+    } else {
+        settings.availability_battery_minutes
+    };
+    now_unix().saturating_sub(seen) > u64::from(minutes) * 60
+}
 const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 /// A sleepy device only receives a request at its next poll
 const SLEEPY_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -111,6 +125,8 @@ pub struct DeviceView {
     /// Features to write when the device wakes up
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub pending: Vec<String>,
+    /// No message for longer than the availability limit
+    pub offline: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -160,6 +176,8 @@ pub struct Hub {
     matter_commands: mpsc::UnboundedSender<MatterCommand>,
     /// Taken by the Matter bridge when it starts
     matter_command_rx: Mutex<Option<mpsc::UnboundedReceiver<MatterCommand>>>,
+    /// Devices last seen offline by the availability check
+    offline: Mutex<HashSet<String>>,
     mqtt_status: Mutex<String>,
 }
 
@@ -564,11 +582,13 @@ impl Hub {
             matter_commands,
             matter_command_rx: Mutex::new(Some(matter_command_rx)),
             mqtt_status: Mutex::new("disabled".into()),
+            offline: Mutex::new(HashSet::new()),
         });
 
         tokio::spawn(hub.clone().notification_loop());
         tokio::spawn(hub.clone().saver());
         tokio::spawn(hub.clone().table_snapshots());
+        tokio::spawn(hub.clone().availability());
 
         // Resume interviews the previous run left unfinished
         let unfinished: Vec<String> = hub
@@ -697,7 +717,8 @@ impl Hub {
     }
 
     pub fn device_view(&self, ieee: &str) -> Option<DeviceView> {
-        self.device(ieee).map(|d| self.view(&d))
+        let data = self.data.lock().unwrap();
+        data.devices.get(ieee).map(|d| self.view(d, &data.settings))
     }
 
     /// The device's Matter endpoint: allocated once, from 2 up, never reused
@@ -713,18 +734,29 @@ impl Hub {
         id
     }
 
-    /// Zigbee2MQTT's availability: no message for longer than the device type's limit
-    pub fn is_offline(&self, device: &Device) -> bool {
-        let Some(seen) = device.last_seen else {
-            return false;
-        };
-        let settings = &self.data.lock().unwrap().settings;
-        let minutes = if device.rx_on_when_idle {
-            settings.availability_mains_minutes
-        } else {
-            settings.availability_battery_minutes
-        };
-        now_unix().saturating_sub(seen) > u64::from(minutes) * 60
+    /// Tells everyone when a device goes offline or comes back: being offline is no
+    /// message for a while, which no message announces
+    async fn availability(self: Arc<Self>) {
+        loop {
+            tokio::time::sleep(AVAILABILITY_CHECK).await;
+            let now_offline: HashSet<String> = {
+                let data = self.data.lock().unwrap();
+                data.devices.values().filter(|d| offline(&data.settings, d)).map(|d| d.ieee.clone()).collect()
+            };
+            let changed: Vec<String> = {
+                let mut offline = self.offline.lock().unwrap();
+                let changed = offline.symmetric_difference(&now_offline).cloned().collect();
+                *offline = now_offline;
+                changed
+            };
+            for ieee in changed {
+                let Some(view) = self.device_view(&ieee) else {
+                    continue;
+                };
+                info!("{} is {}", view.device.name, if view.offline { "offline" } else { "online again" });
+                let _ = self.events.send(Event::Device { device: view });
+            }
+        }
     }
 
     /// Where the hub keeps its files (the state file's directory)
@@ -830,11 +862,12 @@ impl Hub {
 
     pub fn devices(&self) -> Vec<DeviceView> {
         let data = self.data.lock().unwrap();
-        data.devices.values().map(|d| self.view(d)).collect()
+        data.devices.values().map(|d| self.view(d, &data.settings)).collect()
     }
 
-    fn view(&self, device: &Device) -> DeviceView {
+    fn view(&self, device: &Device, settings: &store::Settings) -> DeviceView {
         DeviceView {
+            offline: offline(settings, device),
             card: devices::card(device),
             definition: devices::definition_info(device),
             features: devices::features(device).into_iter().copied().collect(),
@@ -874,7 +907,8 @@ impl Hub {
     /// Changes a device; if anything changed, publishes it and schedules a save
     fn update_device(&self, ieee: &str, change: impl FnOnce(&mut Device)) {
         let view = {
-            let mut data = self.data.lock().unwrap();
+            let mut guard = self.data.lock().unwrap();
+            let data = &mut *guard;
             let Some(device) = data.devices.get_mut(ieee) else {
                 return;
             };
@@ -883,17 +917,15 @@ impl Hub {
             if serde_json::to_value(&*device).ok() == before {
                 return;
             }
-            self.view(device)
+            self.view(device, &data.settings)
         };
         let _ = self.events.send(Event::Device { device: view });
         self.dirty.notify_one();
     }
 
     fn emit_device(&self, ieee: &str) {
-        if let Some(device) = self.device(ieee) {
-            let _ = self.events.send(Event::Device {
-                device: self.view(&device),
-            });
+        if let Some(device) = self.device_view(ieee) {
+            let _ = self.events.send(Event::Device { device });
         }
     }
 
