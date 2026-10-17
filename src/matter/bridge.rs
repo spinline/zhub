@@ -377,7 +377,7 @@ impl Bridge {
         group.members.iter().filter_map(|m| self.hub.device_view(&m.ieee)).collect()
     }
 
-    /// The device behind the endpoint (a device or one of its buttons)
+    /// The device behind the endpoint
     fn view(&self, endpoint: EndptId) -> Result<DeviceView, Error> {
         match self.target(endpoint)? {
             Target::Device(ieee) => self.device(&ieee),
