@@ -64,6 +64,10 @@ rejoin the dongle directly.
 
 ## Build and install
 
+`./build.sh` builds in Docker. `./build-native.sh` builds on the host instead (Rust nightly
+via rustup, zig 0.15.2 in `.tools/`); it is faster and is the one that fits the Matter build
+(rs-matter needs more memory than Docker Desktop's default VM gives).
+
 ```sh
 ./build.sh
 cat target/mips-unknown-linux-musl/release/zhub | ssh -p 222 root@192.168.1.1 'cat > /opt/bin/zhub && chmod +x /opt/bin/zhub'
