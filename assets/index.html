@@ -1206,9 +1206,15 @@ function buildGroupCard(g) {
       run(api(`/api/groups/${id}`, null, "DELETE").then(() => toast("Group deleted")).finally(() => { remove.disabled = false; }));
     }
   };
+  const matter = el("input", { type: "checkbox" });
+  matter.onchange = () => run(api(`/api/groups/${id}/matter`, { enabled: matter.checked }).catch(e => { matter.checked = !matter.checked; throw e; }));
+  const matterRow = el("div", { className: "ctl", style: "margin-top:8px" },
+    el("div", {}, el("div", { className: "label", textContent: "Show in Matter" }),
+      el("div", { className: "desc", style: "font-size:12px;color:var(--muted)", textContent: "As one light; its lights switch together in one command" })),
+    el("label", { className: "switch" }, matter, el("span")));
   const summary = el("summary");
   card.append(el("details", { className: "members" }, summary, memberList,
-    el("div", { className: "member" }, add, addBtn),
+    el("div", { className: "member" }, add, addBtn), matterRow,
     el("div", { className: "actions", style: "margin-top:8px" }, rename, remove),
     el("div", { className: "desc", style: "font-size:12px;color:var(--muted)", textContent: `Group id ${id} (${hex(id)})` })));
 
@@ -1221,6 +1227,8 @@ function buildGroupCard(g) {
       sub.textContent = `${g.members.length} member${g.members.length === 1 ? "" : "s"}`;
       summary.textContent = `Members (${g.members.length})`;
       switchNode.hidden = v.on == null;
+      matterRow.hidden = !hubSettings.matter?.enabled;
+      matter.checked = !!g.matter;
       if (v.on != null && !focused(toggle)) toggle.checked = v.on;
       levelRow.hidden = v.level == null;
       if (v.level != null) {

@@ -2320,6 +2320,7 @@ impl Hub {
                 id,
                 name: name.clone(),
                 members: Vec::new(),
+                matter: false,
             });
             id
         };
@@ -2334,6 +2335,16 @@ impl Hub {
             let mut data = self.data.lock().unwrap();
             let group = data.groups.iter_mut().find(|g| g.id == id).context("group not found")?;
             group.name = name;
+        }
+        self.groups_changed();
+        Ok(())
+    }
+
+    pub fn set_group_matter(&self, id: u16, enabled: bool) -> Result<()> {
+        {
+            let mut data = self.data.lock().unwrap();
+            let group = data.groups.iter_mut().find(|g| g.id == id).context("group not found")?;
+            group.matter = enabled;
         }
         self.groups_changed();
         Ok(())

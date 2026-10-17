@@ -38,6 +38,9 @@ pub struct Group {
     pub name: String,
     #[serde(default)]
     pub members: Vec<GroupMember>,
+    /// Bridged to Matter as one light (off by default: its lights are there one by one)
+    #[serde(default)]
+    pub matter: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

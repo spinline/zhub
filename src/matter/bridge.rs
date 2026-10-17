@@ -524,7 +524,7 @@ impl Bridge {
                 wanted.push((Target::Device(view.device.ieee.clone()), kind, view.device.name.clone()));
             }
         }
-        for group in self.hub.groups() {
+        for group in self.hub.groups().into_iter().filter(|g| g.matter) {
             let members: Vec<&DeviceView> = group.members.iter().filter_map(|m| devices.iter().find(|d| d.device.ieee == m.ieee)).collect();
             let writable = |key: &str| members.iter().any(|m| m.features.iter().any(|f| f.key == key && f.access != Access::Read));
             if writable("on") {

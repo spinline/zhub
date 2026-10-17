@@ -41,6 +41,7 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .route("/api/groups", post(create_group))
         .route("/api/groups/{id}", axum::routing::delete(delete_group))
         .route("/api/groups/{id}/rename", post(rename_group))
+        .route("/api/groups/{id}/matter", post(group_matter))
         .route("/api/groups/{id}/members", post(group_member))
         .route("/api/groups/{id}/set", post(set_group))
         .route("/api/devices/{ieee}/bind", post(bind))
@@ -103,6 +104,16 @@ async fn create_group(State(hub): State<Arc<Hub>>, Json(body): Json<GroupName>) 
 
 async fn rename_group(State(hub): State<Arc<Hub>>, Path(id): Path<u16>, Json(body): Json<GroupName>) -> ApiResult {
     hub.rename_group(id, &body.name)?;
+    ok()
+}
+
+#[derive(Deserialize)]
+struct GroupMatter {
+    enabled: bool,
+}
+
+async fn group_matter(State(hub): State<Arc<Hub>>, Path(id): Path<u16>, Json(body): Json<GroupMatter>) -> ApiResult {
+    hub.set_group_matter(id, body.enabled)?;
     ok()
 }
 
