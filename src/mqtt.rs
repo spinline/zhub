@@ -58,7 +58,7 @@ pub async fn run(hub: Arc<Hub>) {
 }
 
 /// MQTT topic levels cannot hold wildcards
-fn topic_name(name: &str) -> String {
+pub fn topic_name(name: &str) -> String {
     name.replace(['+', '#'], "_")
 }
 
@@ -217,7 +217,7 @@ impl Bridge {
                         "vendor": d.vendor,
                         "description": d.description,
                         "exposes": exposes(v),
-                        "options": [],
+                        "options": options(v),
                         "supports_ota": false,
                         "source": "native",
                     })),
@@ -778,6 +778,25 @@ fn device_discovery(view: &DeviceView, cfg: &MqttSettings, state_topic: &str) ->
     configs
 }
 
+/// Zigbee2MQTT's device options a device takes (`definition.options`): the transition for
+/// lights; tools offer a duration when it is there
+pub fn options(view: &DeviceView) -> Vec<Json> {
+    let light = view.features.iter().any(|f| f.key == "level" || f.key == "color_temp");
+    if !light {
+        return Vec::new();
+    }
+    vec![json!({
+        "type": "numeric",
+        "name": "transition",
+        "property": "transition",
+        "label": "Transition",
+        "access": 2,
+        "value_min": 0,
+        "unit": "s",
+        "description": "Controls the transition time (in seconds) of on/off, brightness, color temperature (if applicable) and color (if applicable) changes. Defaults to `0` (no transition).",
+    })]
+}
+
 /// Zigbee2MQTT's `exposes` for a device: lights and thermostats as composites with
 /// Zigbee2MQTT's property names, the other features under their own names
 pub fn exposes(view: &DeviceView) -> Vec<Json> {
@@ -984,12 +1003,17 @@ fn light_target(views: &[&DeviceView]) -> Option<z2m_light::Target> {
         color_temp_max,
         // Zigbee2MQTT's "allEqual": every light starts at level 2 (Hue)
         turns_off_at_brightness1: !levels.is_empty() && levels.iter().all(|v| range(v, "level").0 == Some(2.0)),
+        // A device's own option; groups have none
+        transition: match views {
+            [v] => v.device.options.get("transition").and_then(Json::as_f64),
+            _ => None,
+        },
     })
 }
 
 /// A command from MQTT: the device or group by name (or IEEE address). Light keys run as
 /// Zigbee2MQTT's light converters do, the other keys set the hub's features.
-async fn apply(hub: &Arc<Hub>, name: &str, command: Map<String, Json>) -> anyhow::Result<()> {
+pub async fn apply(hub: &Arc<Hub>, name: &str, command: Map<String, Json>) -> anyhow::Result<()> {
     let devices = hub.devices();
     let target = devices.iter().find(|d| topic_name(&d.device.name) == name || d.device.ieee == name);
     let group = hub.groups().into_iter().find(|g| topic_name(&g.name) == name);

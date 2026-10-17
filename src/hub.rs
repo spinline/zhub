@@ -738,6 +738,33 @@ impl Hub {
         self.read_attributes(device.nwk, ep, cluster, manufacturer, &[attr]).await.map(drop)
     }
 
+    /// Zigbee2MQTT's device options the hub takes; null removes one
+    pub fn set_device_options(&self, ieee: &str, options: serde_json::Map<String, Json>) -> Result<()> {
+        self.device(ieee).context("device not found")?;
+        for (key, value) in &options {
+            match key.as_str() {
+                "transition" if value.is_null() => {}
+                "transition" => {
+                    value
+                        .as_f64()
+                        .filter(|t| t.is_finite() && (0.0..=6553.4).contains(t))
+                        .context("transition: seconds, 0 to 6553.4")?;
+                }
+                _ => bail!("unknown option: {key}"),
+            }
+        }
+        self.update_device(ieee, |d| {
+            for (key, value) in options {
+                if value.is_null() {
+                    d.options.remove(&key);
+                } else {
+                    d.options.insert(key, value);
+                }
+            }
+        });
+        Ok(())
+    }
+
     /// Sets state values without telling anyone yet (a `republish` follows)
     pub fn set_state_quiet(&self, ieee: &str, values: Vec<(&'static str, Json)>) {
         let mut data = self.data.lock().unwrap();

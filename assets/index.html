@@ -809,7 +809,7 @@ $("#dlgClose").onclick = () => $("#detail").close();
 $("#detail").addEventListener("close", () => { detail.ieee = null; });
 $("#detail").addEventListener("click", (e) => { if (e.target === $("#detail")) $("#detail").close(); });
 
-const TABS = [["about", "About"], ["exposes", "Exposes"], ["bind", "Bind"], ["state", "State"], ["clusters", "Clusters"]];
+const TABS = [["about", "About"], ["exposes", "Exposes"], ["bind", "Bind"], ["settings", "Settings"], ["state", "State"], ["clusters", "Clusters"]];
 
 function renderDetail() {
   const d = devices.get(detail.ieee);
@@ -830,7 +830,7 @@ function renderDetail() {
   // Rebuild a tab only when its structure changes; otherwise just update its values
   const sig = detail.tab + "|" + signature(d);
   if (detail.signature !== sig) {
-    detail.view = { about: aboutTab, exposes: exposesTab, bind: bindTab, state: stateTab, clusters: clustersTab }[detail.tab](d);
+    detail.view = { about: aboutTab, exposes: exposesTab, bind: bindTab, settings: settingsTab, state: stateTab, clusters: clustersTab }[detail.tab](d);
     detail.signature = sig;
     $("#dlgPanel").replaceChildren(detail.view.node);
   }
@@ -1037,6 +1037,34 @@ function bindTab(d) {
   if (sleepy) list.replaceChildren(el("p", { className: "desc", textContent: "Press Read bindings, then the device's button." }));
   else if (d.endpoints.length) load();
   return { node, update() {} };
+}
+
+// Zigbee2MQTT's device-specific settings: how the hub drives the device
+function settingsTab(d) {
+  const node = el("div");
+  const light = d.features.some(f => f.key === "level" || f.key === "color_temp");
+  if (!light) {
+    node.append(el("p", { className: "desc", textContent: "This device has no hub settings." }));
+    return { node, update() {} };
+  }
+  const transition = el("input", { type: "number", min: 0, max: 6553.4, step: 0.1, placeholder: "0" });
+  const save = el("button", { textContent: "Save", className: "primary" });
+  save.onclick = () => {
+    const text = transition.value.trim();
+    const value = text === "" ? null : Number(text);
+    run(api(`/api/devices/${d.ieee}/options`, { transition: value }).then(() => toast("Settings saved")));
+  };
+  node.append(
+    el("div", { className: "ctl" },
+      el("div", { className: "label", textContent: "Transition (s)" }), transition,
+      el("div", { className: "desc", textContent: "Controls the transition time (in seconds) of on/off, brightness and color temperature changes. Defaults to 0 (no transition); with a transition, off fades out and the next on restores the brightness. A command's own transition wins." })),
+    el("div", { className: "actions" }, save));
+  return {
+    node,
+    update(d) {
+      if (!focused(transition)) transition.value = d.options?.transition ?? "";
+    },
+  };
 }
 
 function stateTab() {

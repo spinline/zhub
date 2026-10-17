@@ -48,6 +48,8 @@ pub struct Target {
     pub color_temp_max: Option<f64>,
     /// Hue lights: level 1 is off, so 1 becomes 2
     pub turns_off_at_brightness1: bool,
+    /// The device's transition option (seconds), used when a message has none
+    pub transition: Option<f64>,
 }
 
 /// Kept per light or group between commands (Zigbee2MQTT's `globalStore`)
@@ -124,10 +126,12 @@ fn u16_le(v: f64) -> [u8; 2] {
     (v.round().clamp(0.0, 65_535.0) as u16).to_le_bytes()
 }
 
-/// `utils.getTransition`: tenths of a second, and whether the message set it
-fn transition(message: &Map<String, Json>) -> Result<(f64, bool)> {
-    match message.get("transition") {
-        Some(v) if !v.is_null() => Ok((number(v, "transition")? * 10.0, true)),
+/// `utils.getTransition`: tenths of a second, and whether it was given (by the message,
+/// else the device option)
+fn transition(message: &Map<String, Json>, target: &Target) -> Result<(f64, bool)> {
+    match (message.get("transition"), target.transition) {
+        (Some(v), _) if !v.is_null() => Ok((number(v, "transition")? * 10.0, true)),
+        (_, Some(option)) => Ok((option * 10.0, true)),
         _ => Ok((0.0, false)),
     }
 }
@@ -232,7 +236,7 @@ fn on_off(message: &Map<String, Json>, target: &Target) -> Result<Part> {
 
 /// `light_onoff_brightness`
 fn onoff_brightness(message: &Map<String, Json>, target: &Target, memory: &mut Memory) -> Result<Part> {
-    let (transition_time, transition_specified) = transition(message)?;
+    let (transition_time, transition_specified) = transition(message, target)?;
     // JSON null asks to keep the state: Move to Level without On/Off
     let state_null = message.get("state").is_some_and(Json::is_null);
     let mut state: Option<String> = match message.get("state") {
@@ -361,7 +365,7 @@ fn color_temp(message: &Map<String, Json>, target: &Target) -> Result<Part> {
     {
         mired = m;
     }
-    let (transition_time, _) = transition(message)?;
+    let (transition_time, _) = transition(message, target)?;
     let mut payload = u16_le(mired).to_vec();
     payload.extend(u16_le(transition_time));
     payload.extend(OPTIONS);
@@ -380,7 +384,7 @@ fn brightness_step(message: &Map<String, Json>, target: &Target) -> Result<Part>
     if size > 255.0 {
         bail!("{key}: the step must be within -255 to 255");
     }
-    let (transition_time, _) = transition(message)?;
+    let (transition_time, _) = transition(message, target)?;
     let mut payload = vec![u8::from(value <= 0.0), size as u8];
     payload.extend(u16_le(transition_time));
     payload.extend(OPTIONS);
@@ -445,9 +449,9 @@ fn brightness_move(message: &Map<String, Json>, _target: &Target) -> Result<Part
 }
 
 /// `light_colortemp_step`: then reads the color temperature
-fn color_temp_step(message: &Map<String, Json>, _target: &Target) -> Result<Part> {
+fn color_temp_step(message: &Map<String, Json>, target: &Target) -> Result<Part> {
     let value = number(&message["color_temp_step"], "color_temp_step")?;
-    let (transition_time, _) = transition(message)?;
+    let (transition_time, _) = transition(message, target)?;
     let mut payload = vec![if value > 0.0 { 1 } else { 3 }];
     payload.extend(u16_le(value.abs()));
     payload.extend(u16_le(transition_time));
@@ -538,6 +542,7 @@ mod tests {
             color_temp_min: Some(153.0),
             color_temp_max: Some(454.0),
             turns_off_at_brightness1: true,
+            transition: None,
         }
     }
 
@@ -670,5 +675,17 @@ mod tests {
         let t = Target { has_level: false, has_color_temp: false, ..hue(true, 0.0) };
         let p = plan(&msg(json!({"brightness_step": 10, "color_temp": 300})), &t, &Memory::default());
         assert!(p.parts.iter().all(Result::is_err));
+    }
+
+    #[test]
+    fn the_device_transition_option_counts_as_given() {
+        let t = Target { transition: Some(1.0), ..hue(true, 150.0) };
+        // OFF fades like an OFF with a transition in the message
+        let (p, memory) = parts(json!({"state": "OFF"}), &t, &Memory::default());
+        assert_eq!(cmd(&p[0]), (cluster::LEVEL, LEVEL_MOVE_TO_LEVEL_WITH_ON_OFF, vec![0, 10, 0, 0, 0]));
+        assert!(memory.turned_off_with_transition);
+        // The message's own transition wins
+        let (p, _) = parts(json!({"brightness": 100, "transition": 3}), &t, &Memory::default());
+        assert_eq!(cmd(&p[0]).2, vec![100, 30, 0, 0, 0]);
     }
 }

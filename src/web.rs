@@ -37,6 +37,7 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .route("/api/devices/{ieee}", axum::routing::delete(remove))
         .route("/api/devices/{ieee}/set", post(set))
         .route("/api/devices/{ieee}/rename", post(rename))
+        .route("/api/devices/{ieee}/options", post(device_options))
         .route("/api/devices/{ieee}/interview", post(interview))
         .route("/api/devices/{ieee}/bindings", get(bindings))
         .route("/api/groups", post(create_group))
@@ -137,6 +138,11 @@ async fn group_member(State(hub): State<Arc<Hub>>, Path(id): Path<u16>, Json(bod
 }
 
 async fn set_group(State(hub): State<Arc<Hub>>, Path(id): Path<u16>, Json(body): Json<SetBody>) -> ApiResult {
+    let name = hub.groups().into_iter().find(|g| g.id == id).map(|g| crate::mqtt::topic_name(&g.name));
+    if let (Some(name), Some(command)) = (name, as_light_command(&body.key, &body.value)) {
+        crate::mqtt::apply(&hub, &name, command).await?;
+        return ok();
+    }
     hub.set_group(id, &body.key, &body.value)?;
     ok()
 }
@@ -228,7 +234,24 @@ struct SetBody {
     value: serde_json::Value,
 }
 
+/// The UI's light controls as Zigbee2MQTT's commands, so they follow the same rules
+/// (transition option, brightness 0 turns off) as MQTT tools
+fn as_light_command(key: &str, value: &serde_json::Value) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let (k, v) = match key {
+        "on" => ("state", json!(if value.as_bool()? { "ON" } else { "OFF" })),
+        "level" => ("brightness", value.clone()),
+        "color_temp" => ("color_temp", value.clone()),
+        _ => return None,
+    };
+    Some(serde_json::Map::from_iter([(k.to_owned(), v)]))
+}
+
 async fn set(State(hub): State<Arc<Hub>>, Path(ieee): Path<String>, Json(body): Json<SetBody>) -> ApiResult {
+    let light = hub.device_view(&ieee).is_some_and(|d| d.features.iter().any(|f| f.key == "on"));
+    if light && let Some(command) = as_light_command(&body.key, &body.value) {
+        crate::mqtt::apply(&hub, &ieee, command).await?;
+        return Ok(Json(json!({ "ok": true, "pending": false })));
+    }
     let pending = hub.set(&ieee, &body.key, body.value).await?;
     Ok(Json(json!({ "ok": true, "pending": pending })))
 }
@@ -236,6 +259,11 @@ async fn set(State(hub): State<Arc<Hub>>, Path(ieee): Path<String>, Json(body): 
 #[derive(Deserialize)]
 struct Rename {
     name: String,
+}
+
+async fn device_options(State(hub): State<Arc<Hub>>, Path(ieee): Path<String>, Json(body): Json<serde_json::Map<String, serde_json::Value>>) -> ApiResult {
+    hub.set_device_options(&ieee, body)?;
+    ok()
 }
 
 async fn rename(

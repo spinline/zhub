@@ -258,6 +258,9 @@ pub struct Device {
     /// Received signal strength of the last packet (dBm)
     #[serde(default)]
     pub rssi: Option<i8>,
+    /// How the hub drives the device, as Zigbee2MQTT's device options (transition)
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub options: BTreeMap<String, Json>,
 }
 
 fn default_true() -> bool {
@@ -287,6 +290,7 @@ impl Device {
             last_seen: None,
             lqi: None,
             rssi: None,
+            options: BTreeMap::new(),
         }
     }
 
