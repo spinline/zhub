@@ -11,7 +11,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
 use serde_json::{Value as Json, json};
-use tokio::sync::{Notify, broadcast, oneshot};
+use tokio::sync::{Notify, broadcast, oneshot, watch};
 use tracing::{debug, info, warn};
 
 use ziggurat_driver::runtime::TokioSpawner;
@@ -86,6 +86,13 @@ pub enum Event {
     Settings,
     /// Groups were created, renamed, deleted or changed members
     Groups { groups: Vec<store::Group> },
+    /// A button press or other command the device sent (Zigbee2MQTT's `action`)
+    Action {
+        ieee: String,
+        name: String,
+        key: String,
+        action: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -145,6 +152,9 @@ pub struct Hub {
     logging: Arc<crate::logging::Logging>,
     /// Asks main to shut down; the service script starts zhub again
     restart: Notify,
+    /// The MQTT bridge restarts when these change
+    mqtt_settings: watch::Sender<store::MqttSettings>,
+    mqtt_status: Mutex<String>,
 }
 
 /// What the settings page shows about the hub
@@ -162,7 +172,8 @@ pub struct HubInfo {
     pub serial_port: String,
     pub baudrate: u32,
     pub log_level: String,
-    pub settings: store::Settings,
+    pub settings: Json,
+    pub mqtt_status: String,
 }
 
 /// Transmit power the MG24 RCP accepts (dBm)
@@ -497,6 +508,7 @@ impl Hub {
         );
 
         apply_default_names(&mut data);
+        let mqtt_settings = data.settings.mqtt.clone();
         // Writes the previous run could not deliver yet
         let pending_writes: HashMap<_, _> = std::mem::take(&mut data.pending_writes).into_iter().collect();
         if !pending_writes.is_empty() {
@@ -528,6 +540,8 @@ impl Hub {
             baudrate: opts.baudrate,
             logging: opts.logging,
             restart: Notify::new(),
+            mqtt_settings: watch::Sender::new(mqtt_settings),
+            mqtt_status: Mutex::new("disabled".into()),
         });
 
         tokio::spawn(hub.clone().notification_loop());
@@ -569,20 +583,52 @@ impl Hub {
             serial_port: self.serial_port.clone(),
             baudrate: self.baudrate,
             log_level: self.logging.level(),
-            settings: data.settings.clone(),
+            settings: data.settings.public(),
+            mqtt_status: self.mqtt_status.lock().unwrap().clone(),
         }
     }
 
-    pub fn settings(&self) -> store::Settings {
-        self.data.lock().unwrap().settings.clone()
+    /// For the API (no MQTT password)
+    pub fn public_settings(&self) -> Json {
+        self.data.lock().unwrap().settings.public()
     }
 
-    pub fn update_settings(&self, settings: store::Settings) -> Result<()> {
+    pub fn mqtt_settings(&self) -> watch::Receiver<store::MqttSettings> {
+        self.mqtt_settings.subscribe()
+    }
+
+    pub fn set_mqtt_status(&self, status: impl Into<String>) {
+        *self.mqtt_status.lock().unwrap() = status.into();
+    }
+
+    pub fn hub_ieee(&self) -> String {
+        eui64_to_string(&self.ieee)
+    }
+
+    pub fn update_settings(&self, mut settings: store::Settings) -> Result<()> {
         settings.validate()?;
+        // The page never sees the password: an empty one keeps the saved one
+        if settings.mqtt.password.as_deref().is_none_or(str::is_empty) {
+            settings.mqtt.password = self.data.lock().unwrap().settings.mqtt.password.clone();
+        }
         if let Some(level) = &settings.log_level {
             self.logging.set_level(level)?;
         }
-        info!("Settings changed: {settings:?}");
+        info!(
+            "Settings changed: availability {}/{} min, permit join {} s, log level {:?}, MQTT {} {}:{}",
+            settings.availability_mains_minutes,
+            settings.availability_battery_minutes,
+            settings.permit_join_seconds,
+            settings.log_level,
+            if settings.mqtt.enabled { "on" } else { "off" },
+            settings.mqtt.host,
+            settings.mqtt.port
+        );
+        self.mqtt_settings.send_if_modified(|current| {
+            let changed = *current != settings.mqtt;
+            *current = settings.mqtt.clone();
+            changed
+        });
         self.data.lock().unwrap().settings = settings;
         self.dirty.notify_one();
         let _ = self.events.send(Event::Settings);
@@ -1050,6 +1096,14 @@ impl Hub {
             info!("{ieee} {key} = {name}");
             self.update_device(ieee, |d| {
                 d.state.insert(key.to_owned(), json!(name));
+            });
+            // Every press, also one that repeats the last value (the state then does not
+            // change and no device event goes out)
+            let _ = self.events.send(Event::Action {
+                ieee: ieee.to_owned(),
+                name: device.name.clone(),
+                key: key.to_owned(),
+                action: name,
             });
         }
         true

@@ -84,7 +84,7 @@ async fn state(State(hub): State<Arc<Hub>>) -> ApiResult {
     Ok(Json(json!({
         "devices": hub.devices(),
         "permit_join": hub.permit_remaining(),
-        "settings": hub.settings(),
+        "settings": hub.public_settings(),
         "groups": hub.groups(),
     })))
 }

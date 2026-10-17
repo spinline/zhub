@@ -2,6 +2,7 @@ mod hub;
 mod hue_reset;
 mod devices;
 mod logging;
+mod mqtt;
 mod radio;
 mod sniff;
 mod thermostat;
@@ -81,6 +82,8 @@ async fn run(args: Args, logging: std::sync::Arc<logging::Logging>) -> Result<()
         logging,
     })
     .await?;
+
+    tokio::spawn(mqtt::run(hub.clone()));
 
     let listener = tokio::net::TcpListener::bind(&args.listen)
         .await

@@ -59,6 +59,51 @@ pub struct Settings {
     /// Log filter; when absent the command line's applies
     #[serde(skip_serializing_if = "Option::is_none")]
     pub log_level: Option<String>,
+    pub mqtt: MqttSettings,
+}
+
+/// MQTT bridge, laid out like Zigbee2MQTT's (base topic, Home Assistant discovery)
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MqttSettings {
+    pub enabled: bool,
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    /// Kept in the state file only; the API never returns it
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+    pub base_topic: String,
+    pub discovery: bool,
+    pub discovery_prefix: String,
+}
+
+impl Default for MqttSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            host: String::new(),
+            port: 1883,
+            username: String::new(),
+            password: None,
+            base_topic: "zigbee2mqtt".into(),
+            discovery: true,
+            discovery_prefix: "homeassistant".into(),
+        }
+    }
+}
+
+impl MqttSettings {
+    fn validate(&self) -> Result<()> {
+        let topic_ok = |t: &str| !t.is_empty() && !t.contains(['+', '#']) && !t.starts_with('/') && !t.ends_with('/');
+        if self.enabled && self.host.trim().is_empty() {
+            bail!("MQTT: enter the broker address");
+        }
+        if !topic_ok(&self.base_topic) || !topic_ok(&self.discovery_prefix) {
+            bail!("MQTT: topics must not be empty, contain + or #, or start/end with /");
+        }
+        Ok(())
+    }
 }
 
 /// Zigbee2MQTT's availability defaults: 10 minutes and 25 hours
@@ -69,11 +114,22 @@ impl Default for Settings {
             availability_battery_minutes: 1500,
             permit_join_seconds: 180,
             log_level: None,
+            mqtt: MqttSettings::default(),
         }
     }
 }
 
 impl Settings {
+    /// For the API: the MQTT password replaced by whether one is set
+    pub fn public(&self) -> Json {
+        let mut value = serde_json::to_value(self).unwrap_or_default();
+        if let Some(mqtt) = value.get_mut("mqtt").and_then(Json::as_object_mut) {
+            mqtt.remove("password");
+            mqtt.insert("has_password".into(), Json::Bool(self.mqtt.password.is_some()));
+        }
+        value
+    }
+
     pub fn validate(&self) -> anyhow::Result<()> {
         if !(1..=1440).contains(&self.availability_mains_minutes) {
             anyhow::bail!("mains devices: 1-1440 minutes");
@@ -84,7 +140,7 @@ impl Settings {
         if self.permit_join_seconds == 0 || self.permit_join_seconds == 255 {
             anyhow::bail!("permit join: 1-254 seconds");
         }
-        Ok(())
+        self.mqtt.validate()
     }
 }
 

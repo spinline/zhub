@@ -13,6 +13,11 @@ Zigbee2MQTT needed: a single static binary with an embedded web UI.
 - Remotes and switch modules: button presses become the `action` value.
 - Groups: lights in a Zigbee group take one multicast command (on/off, brightness,
   color temperature); membership lives on the devices (Groups cluster).
+- MQTT (optional), laid out like Zigbee2MQTT: `zigbee2mqtt/<name>` state, `…/set`
+  commands (also `state: ON/OFF/TOGGLE` and `brightness`), `…/action` button presses,
+  `bridge/state|devices|groups`, and Home Assistant discovery (lights and groups as lights,
+  thermostats as climate, settings as number/select/switch, buttons as device triggers).
+  Live updates, including every button press, also stream over `/api/events`.
 - Bindings: a device's binding table can be read and edited (to the hub, a device or a
   group), so e.g. a switch controls lights directly.
 - Thermostats: SONOFF TRVZB (ZCL thermostat cluster) and Tuya thermostats (datapoints),

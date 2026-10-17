@@ -105,7 +105,7 @@
   .thermo { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
   .thermo .target { font-size: 26px; font-weight: 600; min-width: 92px; text-align: center; }
   .thermo button.step { width: 40px; height: 40px; padding: 0; font-size: 20px; border-radius: 50%; }
-  select, input[type=number], input[type=time], input[type=text] {
+  select, input[type=number], input[type=time], input[type=text], input[type=password] {
     font: inherit; padding: 5px 8px; border-radius: 8px; border: 1px solid var(--line); background: var(--card); color: var(--text);
   }
   .ctl { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 4px 12px; font-size: 14px; padding: 10px 0; border-bottom: 1px solid var(--line); }
@@ -234,6 +234,12 @@
     <div class="card"><h3>Network</h3><dl class="info" id="setNetwork"></dl><div id="setTxPower"></div></div>
     <div class="card"><h3>Adapter</h3><dl class="info" id="setAdapter"></dl></div>
     <div class="card"><h3>Availability and joining</h3><div id="setGeneral"></div></div>
+    <div class="card">
+      <h3>MQTT</h3>
+      <div class="desc" style="color:var(--muted);font-size:12px">Publishes devices like Zigbee2MQTT (<code>zigbee2mqtt/&lt;name&gt;</code>, <code>…/set</code>, <code>…/action</code>), so Home Assistant, Node-RED or Homey can use them. Home Assistant finds them through MQTT discovery.</div>
+      <dl class="info"><dt>Status</dt><dd id="mqttStatus"></dd></dl>
+      <div id="setMqtt"></div>
+    </div>
     <div class="card">
       <h3>Tools</h3>
       <div class="ctl">
@@ -1350,11 +1356,44 @@ async function loadSettings() {
       "How long the Permit join button keeps joining open.",
       (v) => saveSettings({ permit_join_seconds: v })),
   );
+  $("#mqttStatus").textContent = info.mqtt_status;
+  $("#mqttStatus").style.color = info.mqtt_status.startsWith("error") ? "var(--warn)" : "";
+  // Do not wipe what is being typed
+  if (!$("#setMqtt").contains(document.activeElement)) $("#setMqtt").replaceChildren(...mqttForm(hubSettings.mqtt));
   const select = $("#logLevel");
   const options = LOG_LEVELS.some(([v]) => v === info.log_level) ? LOG_LEVELS : [[info.log_level, info.log_level], ...LOG_LEVELS];
   select.replaceChildren(...options.map(([v, t]) => el("option", { value: v, textContent: t })));
   select.value = info.log_level;
   render();
+}
+
+function mqttForm(m) {
+  const field = (label, input, description) => el("div", { className: "ctl" },
+    el("div", { className: "label", textContent: label }), input,
+    description ? el("div", { className: "desc", textContent: description }) : null);
+  const enabled = el("input", { type: "checkbox", checked: m.enabled });
+  const host = el("input", { type: "text", value: m.host, placeholder: "e.g. 192.168.1.20", autocomplete: "off" });
+  const port = el("input", { type: "number", value: m.port, min: 1, max: 65535 });
+  const user = el("input", { type: "text", value: m.username, autocomplete: "off" });
+  const pass = el("input", { type: "password", placeholder: m.has_password ? "saved (type to change)" : "", autocomplete: "new-password" });
+  const base = el("input", { type: "text", value: m.base_topic });
+  const discovery = el("input", { type: "checkbox", checked: m.discovery });
+  const prefix = el("input", { type: "text", value: m.discovery_prefix });
+  const save = el("button", { textContent: "Save", className: "primary" });
+  save.onclick = () => run(saveSettings({ mqtt: {
+    enabled: enabled.checked, host: host.value.trim(), port: Number(port.value), username: user.value.trim(),
+    password: pass.value || null, base_topic: base.value.trim(), discovery: discovery.checked, discovery_prefix: prefix.value.trim(),
+  } }).then(() => { pass.value = ""; setTimeout(() => run(loadSettings()), 2000); }));
+  return [
+    field("Enabled", el("label", { className: "switch" }, enabled, el("span"))),
+    field("Broker", el("div", { className: "row" }, host, port), "Address and port of the MQTT broker, e.g. Mosquitto on the Raspberry Pi."),
+    field("Username", user),
+    field("Password", pass),
+    field("Base topic", base, "Zigbee2MQTT's default is zigbee2mqtt."),
+    field("Home Assistant discovery", el("label", { className: "switch" }, discovery, el("span"))),
+    field("Discovery prefix", prefix),
+    el("div", { className: "actions" }, save),
+  ];
 }
 
 $("#logLevel").onchange = () => run(saveSettings({ log_level: $("#logLevel").value }));
