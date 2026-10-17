@@ -347,7 +347,7 @@ fn apply_tuya_datapoints<'a>(device: &mut Device, datapoints: &'a [tuya::Datapoi
                     None => conv.decode_text(&String::from_utf8_lossy(&dp.data)),
                 },
                 Source::TuyaSchedule { divisor, .. } => Some(tuya::decode_schedule(&dp.data, divisor)),
-                Source::Attr { .. } | Source::Command(_) | Source::Actions(_) => None,
+                Source::Attr { .. } | Source::Command(_) | Source::Actions(_) | Source::ThermostatSchedule => None,
             };
             if let Some(value) = value {
                 device.state.insert(feature.key.to_owned(), value);
@@ -944,6 +944,20 @@ impl Hub {
                 },
                 data.to_vec(),
             );
+        }
+
+        if cluster_id == cluster::THERMOSTAT
+            && header.server_to_client()
+            && header.command == crate::thermostat::GET_WEEKLY_SCHEDULE_RSP
+        {
+            // TRVZB refuses Get Weekly Schedule (0x81), but a device may still send these
+            if let (Some(ieee), Some((days, day))) = (&ieee, crate::thermostat::parse_get_rsp(payload)) {
+                self.update_device(ieee, |d| {
+                    let merged = crate::thermostat::merge(d.state.get("weekly_schedule"), &days, &day);
+                    d.state.insert("weekly_schedule".into(), merged);
+                });
+            }
+            return;
         }
 
         if cluster_id == cluster::IAS_ZONE && header.server_to_client() {
@@ -1611,6 +1625,46 @@ impl Hub {
             }
             // Validation already refuses these
             Source::Actions(_) => bail!("{} is read-only", feature.label),
+            Source::ThermostatSchedule => {
+                let Kind::WeeklySchedule {
+                    min,
+                    max,
+                    step,
+                    max_transitions,
+                } = feature.kind
+                else {
+                    bail!("expected a weekly schedule kind");
+                };
+                let limits = crate::thermostat::Limits {
+                    min,
+                    max,
+                    step,
+                    max_transitions: usize::from(max_transitions),
+                };
+                let week = crate::thermostat::parse_week(&value, limits)?;
+                let ep = device.endpoint_with(cluster::THERMOSTAT).context("the device has no thermostat cluster")?;
+                for payload in crate::thermostat::set_payloads(&week) {
+                    let (header, body) = self
+                        .zcl_patient(&device, ep, cluster::THERMOSTAT, crate::thermostat::SET_WEEKLY_SCHEDULE, &payload)
+                        .await
+                        .map_err(|e| no_reply_hint(e, "take the schedule"))?;
+                    if header.command == zcl::cmd::DEFAULT_RSP
+                        && let Some(status) = zcl::default_response_status(&body)
+                        && status != zcl::STATUS_SUCCESS
+                    {
+                        bail!("the device rejected the schedule (status 0x{status:02x})");
+                    }
+                }
+                info!("{ieee} weekly schedule set: {value}");
+                self.update_device(ieee, |d| {
+                    let mut merged = d.state.get(key).and_then(Json::as_object).cloned().unwrap_or_default();
+                    if let Some(days) = value.as_object() {
+                        merged.extend(days.clone());
+                    }
+                    d.state.insert(key.to_owned(), Json::Object(merged));
+                });
+                Ok(false)
+            }
             Source::Command(command) => {
                 for frame in command.frames(&value)? {
                     self.cluster_command(&device, frame).await?;
@@ -2228,6 +2282,25 @@ impl Hub {
         let started = Instant::now();
         loop {
             match self.zdo_request_within(device.nwk, cluster_id, payload.clone(), wait).await {
+                Err(e) if e.is::<NoReply>() && started.elapsed() < window => {}
+                answer => return answer,
+            }
+        }
+    }
+
+    /// A cluster-specific command, repeated for a sleepy device like `zdo_patient`
+    async fn zcl_patient(&self, device: &Device, ep: u8, cluster_id: u16, command: u8, payload: &[u8]) -> Result<(zcl::Header, Vec<u8>)> {
+        let (window, wait) = if device.rx_on_when_idle {
+            (Duration::ZERO, None)
+        } else {
+            (SLEEPY_REQUEST_WINDOW, Some(EAGER_WRITE_WAIT))
+        };
+        let started = Instant::now();
+        loop {
+            match self
+                .zcl_request_within(device.nwk, ep, cluster_id, zcl::FC_CLUSTER_SPECIFIC, None, command, payload, wait)
+                .await
+            {
                 Err(e) if e.is::<NoReply>() && started.elapsed() < window => {}
                 answer => return answer,
             }

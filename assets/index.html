@@ -167,6 +167,13 @@
   details.members .member span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   details.members .member button { padding: 2px 8px; font-size: 12px; }
   details.members select { flex: 1; min-width: 0; }
+  .week { display: flex; flex-direction: column; gap: 2px; margin: 6px 0 10px; }
+  .week button { display: grid; grid-template-columns: 42px 1fr; gap: 8px; text-align: left; border: 0; background: none; padding: 6px 8px; border-radius: 8px; font-size: 13px; }
+  .week button span { color: var(--muted); }
+  .week button.active { background: var(--accent-soft); }
+  .tslot { display: grid; grid-template-columns: 1fr 1fr auto; gap: 8px; align-items: center; margin: 4px 0; }
+  .tslot input { width: 100%; }
+  .tslot button { padding: 4px 10px; }
   .log-tools { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; font-size: 13px; color: var(--muted); }
   pre.log {
     margin: 0; background: var(--bg); border: 1px solid var(--line); border-radius: 10px; padding: 10px;
@@ -503,6 +510,11 @@ function control(ieee, f) {
       },
     };
   }
+  if (f.kind.type === "weekly_schedule") {
+    const s = weekScheduleEditor(ieee, f);
+    const node = el("div", { className: "ctl" }, title, el("span"), desc, el("div", { style: "grid-column: 1 / -1" }, s.node), note);
+    return { node, update(d) { setTitle(d); s.update(d); } };
+  }
   if (f.kind.type === "schedule") {
     const s = scheduleEditor(ieee, f);
     const node = el("div", { className: "ctl" }, title, el("span"), desc, el("div", { style: "grid-column: 1 / -1" }, s.node), note);
@@ -510,6 +522,80 @@ function control(ieee, f) {
   }
   const out = el("span", { className: "ro" });
   return { node: row(out), update(d) { setTitle(d); out.textContent = formatValue(f, d.state[f.key], d); } };
+}
+
+// ZCL thermostat schedule (TRVZB): a week overview, and the chosen day's transitions
+const WEEK = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"];
+const WEEKDAYS = WEEK.slice(0, 5);
+
+function weekScheduleEditor(ieee, f) {
+  const { min, max, step, max_transitions: maxSlots } = f.kind;
+  let selected = "monday", draft = null, week = null, last;
+  const overview = el("div", { className: "week" });
+  const editor = el("div");
+  // The valve cannot report its schedule: days never saved here are unknown
+  const summary = (slots) => slots?.length ? slots.map(s => `${s.time} ${s.temperature}°`).join(" · ") : "unknown (not saved here yet)";
+
+  const send = (days) => {
+    const value = Object.fromEntries(days.map(day => [day, draft]));
+    return run(setValue(ieee, f.key, value).then(() => { toast("Schedule saved"); draft = null; }));
+  };
+
+  function renderEditor() {
+    if (!draft) draft = structuredClone(week?.[selected] ?? [{ time: "00:00", temperature: 20 }]);
+    const rows = draft.map((slot, i) => {
+      const time = el("input", { type: "time", value: slot.time, disabled: i === 0 });
+      const temp = el("input", { type: "number", min, max, step, value: slot.temperature });
+      time.onchange = () => { slot.time = time.value; };
+      temp.onchange = () => { slot.temperature = Number(temp.value); };
+      const drop = el("button", { textContent: "✕", title: "Remove", disabled: i === 0 });
+      drop.onclick = () => { draft.splice(i, 1); renderEditor(); };
+      return el("div", { className: "tslot" }, time, temp, drop);
+    });
+    const add = el("button", { textContent: "Add transition", disabled: draft.length >= maxSlots });
+    add.onclick = () => {
+      const lastSlot = draft[draft.length - 1];
+      const [h, m] = lastSlot.time.split(":").map(Number);
+      const next = Math.min(23, h + 1);
+      draft.push({ time: `${String(next).padStart(2, "0")}:${String(m).padStart(2, "0")}`, temperature: lastSlot.temperature });
+      renderEditor();
+    };
+    const name = label(selected);
+    const saveDay = el("button", { textContent: `Save ${name}`, className: "primary" });
+    const saveWeekdays = el("button", { textContent: "Save to Mon–Fri" });
+    const saveAll = el("button", { textContent: "Save to every day" });
+    saveDay.onclick = () => send([selected]);
+    saveWeekdays.onclick = () => send(WEEKDAYS);
+    saveAll.onclick = () => send(WEEK);
+    editor.replaceChildren(
+      el("div", { className: "label", textContent: `${name}: time and temperature (°C)` }),
+      ...rows,
+      el("div", { className: "actions" }, add),
+      el("div", { className: "actions" }, saveDay, saveWeekdays, saveAll),
+    );
+  }
+
+  function renderOverview() {
+    overview.replaceChildren(...WEEK.map(day => {
+      const row = el("button", { className: day === selected ? "active" : "" },
+        el("b", { textContent: label(day).slice(0, 3) }), el("span", { textContent: summary(week?.[day]) }));
+      row.onclick = () => { selected = day; draft = null; renderOverview(); renderEditor(); };
+      return row;
+    }));
+  }
+
+  return {
+    node: el("div", {}, overview, editor),
+    update(d) {
+      const json = JSON.stringify(d.state[f.key] ?? null);
+      if (json === last) return;
+      last = json;
+      week = d.state[f.key] ?? null;
+      renderOverview();
+      // Unsaved edits stay
+      if (!draft || !editor.contains(document.activeElement)) { draft = null; renderEditor(); }
+    },
+  };
 }
 
 // Weekly schedule: the slot count stays as the device reported it

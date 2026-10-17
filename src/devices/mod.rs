@@ -64,6 +64,14 @@ pub enum Kind {
         max: f64,
         step: f64,
     },
+    /// ZCL thermostat schedule: per day 1..max_transitions (time, temperature), the
+    /// first at 00:00
+    WeeklySchedule {
+        min: f64,
+        max: f64,
+        step: f64,
+        max_transitions: u8,
+    },
 }
 
 /// Conversion between a raw value and the feature value
@@ -275,6 +283,8 @@ pub enum Source {
     Command(Command),
     /// Commands the device sends; the last one is kept as the feature's value
     Actions(&'static [Action]),
+    /// ZCL Thermostat Set/Get Weekly Schedule
+    ThermostatSchedule,
 }
 
 impl Source {
@@ -282,7 +292,7 @@ impl Source {
         let writable = match self {
             Self::Attr { write, .. } => !matches!(write, Write::No),
             Self::Tuya { conv, .. } => matches!(conv, Conv::Number { .. } | Conv::Bool { .. } | Conv::Enum(_)),
-            Self::TuyaSchedule { .. } => true,
+            Self::TuyaSchedule { .. } | Self::ThermostatSchedule => true,
             Self::Command(_) => return Access::Write,
             Self::Actions(_) => false,
         };
@@ -292,7 +302,7 @@ impl Source {
     const fn conv(&self) -> Option<Conv> {
         match *self {
             Self::Attr { conv, .. } | Self::Tuya { conv, .. } => Some(conv),
-            Self::TuyaSchedule { .. } | Self::Command(_) | Self::Actions(_) => None,
+            Self::TuyaSchedule { .. } | Self::Command(_) | Self::Actions(_) | Self::ThermostatSchedule => None,
         }
     }
 }
@@ -442,6 +452,21 @@ impl Feature {
                 Some(v) if values.contains(&v) => Ok(value),
                 _ => bail!("{}: invalid option", self.label),
             },
+            Kind::WeeklySchedule {
+                min,
+                max,
+                step,
+                max_transitions,
+            } => {
+                let limits = crate::thermostat::Limits {
+                    min,
+                    max,
+                    step,
+                    max_transitions: usize::from(max_transitions),
+                };
+                let week = crate::thermostat::parse_week(&value, limits).with_context(|| self.label.to_owned())?;
+                Ok(crate::thermostat::week_to_json(&week))
+            }
             Kind::Schedule { .. } | Kind::Text => Ok(value),
         }
     }

@@ -347,6 +347,26 @@ pub static TRVZB: Definition = Definition {
         )
         .describe("In timer mode, the temperature can be set to 4-35 ℃."),
         Feature::new(
+            "weekly_schedule",
+            "Weekly schedule",
+            Kind::WeeklySchedule {
+                min: 4.0,
+                max: 35.0,
+                step: 0.5,
+                max_transitions: 6,
+            },
+            Place::Config,
+            Source::ThermostatSchedule,
+        )
+        .describe(
+            "The preset heating schedule to use when the system mode is set to \"auto\" (indicated with ⏲ on the TRV). \
+             Up to 6 transitions can be defined per day. The first transition for each day must start at 00:00 and the \
+             valid temperature range is 4-35°C (in 0.5°C steps). The temperature will be set at the time of the first \
+             transition until the time of the next transition, e.g. 04:00 20°C and 10:00 25°C will result in the \
+             temperature being set to 20°C at 04:00 until 10:00, when it will change to 25°C. The valve does not \
+             report its schedule, so the days show what was saved here.",
+        ),
+        Feature::new(
             "idle_steps",
             "Idle steps",
             numeric("", None, None, None),

@@ -4,6 +4,7 @@ mod devices;
 mod logging;
 mod radio;
 mod sniff;
+mod thermostat;
 mod store;
 mod tuya;
 mod web;

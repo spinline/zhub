@@ -16,7 +16,8 @@ Zigbee2MQTT needed: a single static binary with an embedded web UI.
 - Bindings: a device's binding table can be read and edited (to the hub, a device or a
   group), so e.g. a switch controls lights directly.
 - Thermostats: SONOFF TRVZB (ZCL thermostat cluster) and Tuya thermostats (datapoints),
-  including weekly schedules where supported.
+  both with weekly schedules (the TRVZB takes a schedule but cannot report it, so the UI
+  shows what was saved from the hub).
 - Hue lights can be factory reset by serial number (like the Hue Bridge).
 - Web UI at `http://<router>:8099` (no authentication; local network only).
 - Settings page: hub and radio firmware info, network parameters, transmit power,
