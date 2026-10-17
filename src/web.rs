@@ -144,8 +144,9 @@ async fn hub_info(State(hub): State<Arc<Hub>>) -> ApiResult {
     Ok(Json(json!(hub.info())))
 }
 
-async fn settings(State(hub): State<Arc<Hub>>, Json(body): Json<crate::store::Settings>) -> ApiResult {
-    hub.update_settings(body)?;
+/// Takes the settings to change; what the body leaves out stays as it is
+async fn settings(State(hub): State<Arc<Hub>>, Json(body): Json<serde_json::Value>) -> ApiResult {
+    hub.patch_settings(body)?;
     ok()
 }
 

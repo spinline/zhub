@@ -49,6 +49,18 @@ const SAVE_DELAY: Duration = Duration::from_secs(5);
 const TABLE_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(300);
 const AVAILABILITY_CHECK: Duration = Duration::from_secs(30);
 
+/// Puts `patch` into `target`: objects merge key by key, anything else replaces
+fn merge_json(target: &mut Json, patch: Json) {
+    match (target, patch) {
+        (Json::Object(target), Json::Object(patch)) => {
+            for (key, value) in patch {
+                merge_json(target.entry(key).or_insert(Json::Null), value);
+            }
+        }
+        (target, patch) => *target = patch,
+    }
+}
+
 /// Zigbee2MQTT's availability: no message for longer than the device type's limit
 fn offline(settings: &store::Settings, device: &Device) -> bool {
     let Some(seen) = device.last_seen else {
@@ -774,6 +786,13 @@ impl Hub {
 
     pub fn hub_ieee(&self) -> String {
         eui64_to_string(&self.ieee)
+    }
+
+    /// Changes the settings the patch names (objects merge key by key)
+    pub fn patch_settings(&self, patch: Json) -> Result<()> {
+        let mut merged = serde_json::to_value(&self.data.lock().unwrap().settings)?;
+        merge_json(&mut merged, patch);
+        self.update_settings(serde_json::from_value(merged).context("invalid settings")?)
     }
 
     pub fn update_settings(&self, mut settings: store::Settings) -> Result<()> {
@@ -2926,5 +2945,12 @@ mod tests {
 
         settle_pending(&mut pending, ieee, "temperature_calibration", &json!(-0.5));
         assert!(!pending.contains_key(ieee));
+    }
+
+    #[test]
+    fn a_settings_patch_keeps_what_it_leaves_out() {
+        let mut current = json!({"availability_mains_minutes": 10, "mqtt": {"enabled": true, "host": "127.0.0.1", "port": 1883}});
+        merge_json(&mut current, json!({"availability_mains_minutes": 1, "mqtt": {"port": 1884}}));
+        assert_eq!(current, json!({"availability_mains_minutes": 1, "mqtt": {"enabled": true, "host": "127.0.0.1", "port": 1884}}));
     }
 }
