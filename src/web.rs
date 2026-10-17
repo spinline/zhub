@@ -35,6 +35,8 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .route("/api/devices/{ieee}/set", post(set))
         .route("/api/devices/{ieee}/rename", post(rename))
         .route("/api/devices/{ieee}/interview", post(interview))
+        .route("/api/devices/{ieee}/bindings", get(bindings))
+        .route("/api/devices/{ieee}/bind", post(bind))
         .with_state(hub)
 }
 
@@ -174,6 +176,33 @@ async fn rename(
 async fn interview(State(hub): State<Arc<Hub>>, Path(ieee): Path<String>) -> ApiResult {
     let waiting = hub.reinterview(&ieee)?;
     Ok(Json(json!({ "ok": true, "waiting_for_wake": waiting })))
+}
+
+async fn bindings(State(hub): State<Arc<Hub>>, Path(ieee): Path<String>) -> ApiResult {
+    Ok(Json(json!({ "bindings": hub.bindings(&ieee).await? })))
+}
+
+#[derive(Deserialize)]
+struct BindBody {
+    src_ep: u8,
+    clusters: Vec<u16>,
+    /// "hub" or a device's IEEE address
+    dst: String,
+    #[serde(default)]
+    dst_ep: u8,
+    #[serde(default)]
+    unbind: bool,
+}
+
+async fn bind(State(hub): State<Arc<Hub>>, Path(ieee): Path<String>, Json(body): Json<BindBody>) -> ApiResult {
+    if body.clusters.is_empty() {
+        return Err(ApiError(anyhow::anyhow!("choose at least one cluster")));
+    }
+    for cluster in body.clusters {
+        hub.set_binding(&ieee, body.src_ep, cluster, &body.dst, body.dst_ep, body.unbind)
+            .await?;
+    }
+    ok()
 }
 
 #[derive(Deserialize)]

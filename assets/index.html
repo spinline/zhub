@@ -712,7 +712,7 @@ $("#dlgClose").onclick = () => $("#detail").close();
 $("#detail").addEventListener("close", () => { detail.ieee = null; });
 $("#detail").addEventListener("click", (e) => { if (e.target === $("#detail")) $("#detail").close(); });
 
-const TABS = [["about", "About"], ["exposes", "Exposes"], ["state", "State"], ["clusters", "Clusters"]];
+const TABS = [["about", "About"], ["exposes", "Exposes"], ["bind", "Bind"], ["state", "State"], ["clusters", "Clusters"]];
 
 function renderDetail() {
   const d = devices.get(detail.ieee);
@@ -733,7 +733,7 @@ function renderDetail() {
   // Rebuild a tab only when its structure changes; otherwise just update its values
   const sig = detail.tab + "|" + signature(d);
   if (detail.signature !== sig) {
-    detail.view = { about: aboutTab, exposes: exposesTab, state: stateTab, clusters: clustersTab }[detail.tab](d);
+    detail.view = { about: aboutTab, exposes: exposesTab, bind: bindTab, state: stateTab, clusters: clustersTab }[detail.tab](d);
     detail.signature = sig;
     $("#dlgPanel").replaceChildren(detail.view.node);
   }
@@ -819,6 +819,122 @@ function exposesTab(d) {
     }
   }
   return { node, update: (d) => controls.forEach(c => c.update(d)) };
+}
+
+// Zigbee2MQTT's Bind tab: the device's own binding table and a form for new bindings.
+// A binding lives on the device, so e.g. a switch keeps controlling a light without the hub.
+function bindTab(d) {
+  const ieee = d.ieee;
+  const sleepy = !d.rx_on_when_idle;
+  const clusterName = (id) => `${CLUSTERS[id] ?? "Unknown"} (${hex(id)})`;
+  const wakeHint = sleepy ? el("div", { className: "desc", textContent:
+    "Battery device: press its button right after clicking, so it wakes up and answers. The hub keeps asking for 30 s." }) : null;
+
+  // ---- Existing bindings ----
+  const list = el("div");
+  const read = el("button", { textContent: sleepy ? "Read bindings" : "Refresh" });
+  const showBindings = (bindings) => {
+    if (!bindings.length) { list.replaceChildren(el("p", { className: "desc", textContent: "No bindings." })); return; }
+    list.replaceChildren(...bindings.map(b => {
+      const target = b.group != null ? `Group ${hex(b.group)}`
+        : `${b.dst_name ?? b.dst_ieee}${b.dst_ep != null ? ` · ep ${b.dst_ep}` : ""}`;
+      const unbind = el("button", { textContent: "Unbind" });
+      unbind.disabled = b.group != null;
+      unbind.onclick = () => {
+        const dst = b.dst_name === "Hub" ? "hub" : b.dst_ieee;
+        unbind.disabled = true;
+        unbind.textContent = "Unbinding…";
+        run(api(`/api/devices/${ieee}/bind`, { src_ep: b.src_ep, clusters: [b.cluster], dst, dst_ep: b.dst_ep, unbind: true })
+          .then(() => { toast("Unbound"); load(); })
+          .finally(() => { unbind.disabled = false; unbind.textContent = "Unbind"; }));
+      };
+      return el("div", { className: "ctl" },
+        el("div", {}, el("div", { className: "label", textContent: clusterName(b.cluster) }),
+          el("div", { className: "desc", textContent: `ep ${b.src_ep} → ${target}` })),
+        unbind);
+    }));
+  };
+  const load = () => {
+    read.disabled = true;
+    read.textContent = "Reading…";
+    return run(api(`/api/devices/${ieee}/bindings`, null, "GET")
+      .then(r => showBindings(r.bindings))
+      .finally(() => { read.disabled = false; read.textContent = sleepy ? "Read bindings" : "Refresh"; }));
+  };
+  read.onclick = load;
+
+  // ---- New binding ----
+  const srcEp = el("select", {}, ...d.endpoints.map(ep => el("option", { value: ep.id, textContent: `ep ${ep.id}` })));
+  const others = [...devices.values()].filter(o => o.ieee !== ieee && o.endpoints.length).sort((a, b) => a.name.localeCompare(b.name));
+  const dst = el("select", {}, el("option", { value: "hub", textContent: "Hub" }),
+    ...others.map(o => el("option", { value: o.ieee, textContent: o.name })));
+  const dstEp = el("select");
+  const clusterBox = el("div", { className: "presets" });
+  const endpoint = (dev, id) => dev.endpoints.find(ep => ep.id === Number(id));
+  // A device destination takes the clusters the source sends (output) and it serves
+  // (input); the hub takes any
+  const refreshClusters = () => {
+    const src = endpoint(d, srcEp.value);
+    let ids;
+    if (dst.value === "hub") {
+      ids = [...new Set([...src.in_clusters, ...src.out_clusters])].filter(id => id !== 0x0000);
+    } else {
+      const target = endpoint(devices.get(dst.value), dstEp.value);
+      ids = src.out_clusters.filter(id => id !== 0x0000 && target?.in_clusters.includes(id));
+    }
+    clusterBox.replaceChildren(...(ids.length
+      ? ids.map(id => el("label", { className: "chip" }, el("input", { type: "checkbox", value: id }), " " + clusterName(id)))
+      : [el("span", { className: "desc", textContent: "No cluster the two have in common." })]));
+  };
+  const refreshDst = () => {
+    const isHub = dst.value === "hub";
+    dstEp.hidden = isHub;
+    if (!isHub) {
+      const eps = devices.get(dst.value).endpoints;
+      dstEp.replaceChildren(...eps.map(ep => el("option", { value: ep.id, textContent: `ep ${ep.id}` })));
+    }
+    refreshClusters();
+  };
+  srcEp.onchange = refreshClusters;
+  dst.onchange = refreshDst;
+  dstEp.onchange = refreshClusters;
+
+  const submit = (unbind) => {
+    const clusters = [...clusterBox.querySelectorAll("input:checked")].map(i => Number(i.value));
+    if (!clusters.length) { toast("Choose at least one cluster"); return; }
+    const button = unbind ? unbindBtn : bindBtn;
+    button.disabled = true;
+    button.textContent = sleepy ? "Waiting for the device…" : "Sending…";
+    run(api(`/api/devices/${ieee}/bind`, { src_ep: Number(srcEp.value), clusters, dst: dst.value, dst_ep: Number(dstEp.value || 0), unbind })
+      .then(() => { toast(unbind ? "Unbound" : "Bound"); load(); })
+      .finally(() => { button.disabled = false; button.textContent = unbind ? "Unbind" : "Bind"; }));
+  };
+  const bindBtn = el("button", { textContent: "Bind", className: "primary" });
+  const unbindBtn = el("button", { textContent: "Unbind" });
+  bindBtn.onclick = () => submit(false);
+  unbindBtn.onclick = () => submit(true);
+
+  const field = (label, widget) => el("div", { className: "ctl" }, el("div", { className: "label", textContent: label }), widget);
+  const node = el("div", {},
+    el("h3", { textContent: "Bindings on this device" }),
+    list,
+    el("div", { className: "actions" }, read),
+    el("h3", { textContent: "New binding" }),
+    el("p", { className: "desc", textContent:
+      "The device sends the chosen clusters' commands straight to the destination, e.g. a switch's On/Off to a light. " +
+      "It keeps working when the hub is off." }),
+    field("Source endpoint", srcEp),
+    field("Destination", el("div", { className: "row" }, dst, dstEp)),
+    el("div", { className: "label", style: "margin-top:10px", textContent: "Clusters" }),
+    clusterBox,
+    el("div", { className: "actions" }, bindBtn, unbindBtn),
+    wakeHint,
+  );
+  if (d.endpoints.length) refreshDst();
+  else node.replaceChildren(el("p", { textContent: "Not interviewed yet." }));
+  if (sleepy) list.replaceChildren(el("p", { className: "desc", textContent: "Press Read bindings, then the device's button." }));
+  else if (d.endpoints.length) load();
+  return { node, update() {} };
 }
 
 function stateTab() {

@@ -14,6 +14,8 @@ pub mod cluster {
     pub const MATCH_DESC_REQ: u16 = 0x0006;
     pub const DEVICE_ANNCE: u16 = 0x0013;
     pub const BIND_REQ: u16 = 0x0021;
+    pub const UNBIND_REQ: u16 = 0x0022;
+    pub const MGMT_BIND_REQ: u16 = 0x0033;
     pub const MGMT_LEAVE_REQ: u16 = 0x0034;
     pub const MGMT_PERMIT_JOINING_REQ: u16 = 0x0036;
     pub const RESPONSE: u16 = 0x8000;
@@ -138,6 +140,78 @@ pub fn bind_req(src_ieee: [u8; 8], src_ep: u8, cluster: u16, dst_ieee: [u8; 8], 
     out
 }
 
+/// One entry of a device's binding table
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Binding {
+    pub src_ep: u8,
+    pub cluster: u16,
+    /// A group (address mode 0x01) or a device with its endpoint (0x03)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dst_ieee: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dst_ep: Option<u8>,
+}
+
+pub fn mgmt_bind_req(start_index: u8) -> Vec<u8> {
+    vec![start_index]
+}
+
+/// Mgmt_Bind_rsp: (total entries, entries in this response)
+pub fn parse_mgmt_bind_rsp(payload: &[u8]) -> Result<(u8, Vec<Binding>)> {
+    let rest = check_status(payload)?;
+    let [total, _start, count, entries @ ..] = rest else {
+        bail!("short Mgmt_Bind response");
+    };
+    let mut bindings = Vec::new();
+    let mut data = entries;
+    for _ in 0..*count {
+        let Some((_src_ieee, after)) = data.split_at_checked(8) else {
+            bail!("short binding entry");
+        };
+        let [src_ep, c0, c1, mode, after @ ..] = after else {
+            bail!("short binding entry");
+        };
+        let cluster = u16::from_le_bytes([*c0, *c1]);
+        match mode {
+            0x01 => {
+                let [g0, g1, after @ ..] = after else {
+                    bail!("short binding entry");
+                };
+                bindings.push(Binding {
+                    src_ep: *src_ep,
+                    cluster,
+                    group: Some(u16::from_le_bytes([*g0, *g1])),
+                    dst_ieee: None,
+                    dst_ep: None,
+                });
+                data = after;
+            }
+            0x03 => {
+                let Some((ieee, after)) = after.split_at_checked(8) else {
+                    bail!("short binding entry");
+                };
+                let [dst_ep, after @ ..] = after else {
+                    bail!("short binding entry");
+                };
+                let mut bytes = [0u8; 8];
+                bytes.copy_from_slice(ieee);
+                bindings.push(Binding {
+                    src_ep: *src_ep,
+                    cluster,
+                    group: None,
+                    dst_ieee: Some(crate::store::eui64_to_string(&ziggurat_driver::ziggurat_ieee_802154::types::Eui64(bytes))),
+                    dst_ep: Some(*dst_ep),
+                });
+                data = after;
+            }
+            other => bail!("unknown binding address mode 0x{other:02x}"),
+        }
+    }
+    Ok((*total, bindings))
+}
+
 pub fn parse_status_rsp(payload: &[u8]) -> Result<()> {
     check_status(payload).map(|_| ())
 }
@@ -256,6 +330,22 @@ mod tests {
         assert_eq!(desc.logical_type, 2);
         assert!(!desc.rx_on_when_idle());
         assert_eq!(desc.manufacturer_code, 0x1002);
+    }
+
+    #[test]
+    fn parses_binding_table() {
+        // status, 2 entries, start 0, 2 listed: On/Off to a light (ep 11), Level to group 0x0001
+        let mut rsp = vec![0x00, 0x02, 0x00, 0x02];
+        rsp.extend_from_slice(&[0x67, 0xbb, 0xc4, 0x0c, 0x01, 0x88, 0x17, 0x00, 0x01, 0x06, 0x00, 0x03]);
+        rsp.extend_from_slice(&[0x29, 0xbc, 0x1d, 0x0b, 0x01, 0x88, 0x17, 0x00, 0x0b]);
+        rsp.extend_from_slice(&[0x67, 0xbb, 0xc4, 0x0c, 0x01, 0x88, 0x17, 0x00, 0x01, 0x08, 0x00, 0x01, 0x01, 0x00]);
+        let (total, bindings) = parse_mgmt_bind_rsp(&rsp).unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(bindings[0].cluster, 0x0006);
+        assert_eq!(bindings[0].dst_ieee.as_deref(), Some("00:17:88:01:0b:1d:bc:29"));
+        assert_eq!(bindings[0].dst_ep, Some(11));
+        assert_eq!(bindings[1].group, Some(1));
+        assert!(parse_mgmt_bind_rsp(&[0x00, 0x01, 0x00, 0x01, 0x00]).is_err());
     }
 
     #[test]

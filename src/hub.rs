@@ -59,8 +59,8 @@ const EAGER_WRITE_WINDOW: Duration = Duration::from_secs(60);
 const EAGER_WRITE_WAIT: Duration = Duration::from_secs(10);
 /// How long a write waits for another write to the same device to finish
 const SLOT_WAIT: Duration = Duration::from_secs(3);
-/// How long a sleepy device is asked to leave before the removal gives up
-const SLEEPY_REMOVE_WINDOW: Duration = Duration::from_secs(30);
+/// How long a request to a sleepy device (leave, bind) is repeated before giving up
+const SLEEPY_REQUEST_WINDOW: Duration = Duration::from_secs(30);
 /// Attributes per read request, so the response fits in one frame
 const READ_CHUNK: usize = 4;
 const SECONDS_1970_TO_2000: u64 = 946_684_800;
@@ -165,6 +165,23 @@ pub struct HubInfo {
 
 /// Transmit power the MG24 RCP accepts (dBm)
 const TX_POWER_RANGE: std::ops::RangeInclusive<i8> = -10..=20;
+
+/// A binding with its destination's name (the hub or a known device)
+#[derive(Debug, Serialize)]
+pub struct BindingView {
+    #[serde(flatten)]
+    pub binding: zdo::Binding,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dst_name: Option<String>,
+}
+
+fn no_reply_hint(e: anyhow::Error, what: &str) -> anyhow::Error {
+    if e.is::<NoReply>() {
+        anyhow!("the device did not answer, so it could not {what}. Battery devices: press its button and try again")
+    } else {
+        e
+    }
+}
 
 /// The device did not answer a request in time
 #[derive(Debug)]
@@ -1973,34 +1990,98 @@ impl Hub {
         let device = self.device(ieee).context("device not found")?;
         if !force {
             let device_ieee = parse_eui64(ieee)?;
-            let (window, wait) = if device.rx_on_when_idle {
-                (Duration::ZERO, None)
-            } else {
-                (SLEEPY_REMOVE_WINDOW, Some(EAGER_WRITE_WAIT))
-            };
-            let started = Instant::now();
-            loop {
-                let answer = self
-                    .zdo_request_within(device.nwk, zdo::cluster::MGMT_LEAVE_REQ, zdo::mgmt_leave_req(device_ieee.0), wait)
-                    .await;
-                match answer {
-                    Ok(rsp) => {
-                        zdo::parse_status_rsp(&rsp)
-                            .map_err(|e| anyhow!("the device refused to leave ({e:#}); use force remove to delete it anyway"))?;
-                        break;
+            let rsp = self
+                .zdo_patient(&device, zdo::cluster::MGMT_LEAVE_REQ, zdo::mgmt_leave_req(device_ieee.0))
+                .await
+                .map_err(|e| {
+                    if e.is::<NoReply>() {
+                        anyhow!(
+                            "the device did not confirm leaving. Wake it up (battery devices: press its button) and \
+                             try again, or use force remove"
+                        )
+                    } else {
+                        e
                     }
-                    Err(e) if e.is::<NoReply>() && started.elapsed() < window => {}
-                    Err(e) if e.is::<NoReply>() => bail!(
-                        "the device did not confirm leaving. Wake it up (battery devices: press its button) and try \
-                         again, or use force remove"
-                    ),
-                    Err(e) => return Err(e),
-                }
-            }
+                })?;
+            zdo::parse_status_rsp(&rsp)
+                .map_err(|e| anyhow!("the device refused to leave ({e:#}); use force remove to delete it anyway"))?;
             info!("{ieee} left the network");
         }
         self.forget(ieee);
         info!("{ieee} removed{}", if force { " (forced)" } else { "" });
+        Ok(())
+    }
+
+    /// A ZDO request that a sleepy device may answer only once a button press wakes it:
+    /// repeated for a while, each attempt waiting as long as the parent keeps the frame
+    async fn zdo_patient(&self, device: &Device, cluster_id: u16, payload: Vec<u8>) -> Result<Vec<u8>> {
+        let (window, wait) = if device.rx_on_when_idle {
+            (Duration::ZERO, None)
+        } else {
+            (SLEEPY_REQUEST_WINDOW, Some(EAGER_WRITE_WAIT))
+        };
+        let started = Instant::now();
+        loop {
+            match self.zdo_request_within(device.nwk, cluster_id, payload.clone(), wait).await {
+                Err(e) if e.is::<NoReply>() && started.elapsed() < window => {}
+                answer => return answer,
+            }
+        }
+    }
+
+    /// The device's binding table, destinations named where known
+    pub async fn bindings(&self, ieee: &str) -> Result<Vec<BindingView>> {
+        let device = self.device(ieee).context("device not found")?;
+        let mut all = Vec::new();
+        // The table comes in pages; a page holds a few entries
+        for _ in 0..16 {
+            let rsp = self
+                .zdo_patient(&device, zdo::cluster::MGMT_BIND_REQ, zdo::mgmt_bind_req(all.len() as u8))
+                .await
+                .map_err(|e| no_reply_hint(e, "read the bindings"))?;
+            let (total, page) = zdo::parse_mgmt_bind_rsp(&rsp)
+                .map_err(|e| anyhow!("the device does not report its bindings ({e:#})"))?;
+            let empty = page.is_empty();
+            all.extend(page);
+            if empty || all.len() >= usize::from(total) {
+                break;
+            }
+        }
+        let hub = eui64_to_string(&self.ieee);
+        let data = self.data.lock().unwrap();
+        Ok(all
+            .into_iter()
+            .map(|binding| {
+                let dst_name = binding.dst_ieee.as_deref().and_then(|dst| {
+                    if dst == hub {
+                        Some("Hub".to_owned())
+                    } else {
+                        data.devices.get(dst).map(|d| d.name.clone())
+                    }
+                });
+                BindingView { binding, dst_name }
+            })
+            .collect())
+    }
+
+    /// Binds (or unbinds) a cluster of the device to the hub or another device; the
+    /// binding lives in the device's own table, so it works without the hub
+    pub async fn set_binding(&self, ieee: &str, src_ep: u8, cluster_id: u16, dst: &str, dst_ep: u8, unbind: bool) -> Result<()> {
+        let device = self.device(ieee).context("device not found")?;
+        let src = parse_eui64(ieee)?;
+        let (dst_ieee, dst_ep) = if dst == "hub" {
+            (self.ieee, HUB_ENDPOINT)
+        } else {
+            (parse_eui64(dst)?, dst_ep)
+        };
+        let request = if unbind { zdo::cluster::UNBIND_REQ } else { zdo::cluster::BIND_REQ };
+        let what = if unbind { "unbind" } else { "bind" };
+        let rsp = self
+            .zdo_patient(&device, request, zdo::bind_req(src.0, src_ep, cluster_id, dst_ieee.0, dst_ep))
+            .await
+            .map_err(|e| no_reply_hint(e, what))?;
+        zdo::parse_status_rsp(&rsp).map_err(|e| anyhow!("the device refused to {what} cluster 0x{cluster_id:04x} ({e:#})"))?;
+        info!("{ieee} {what} ep {src_ep} cluster 0x{cluster_id:04x} → {dst} ep {dst_ep}");
         Ok(())
     }
 
