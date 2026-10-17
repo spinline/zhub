@@ -4,7 +4,9 @@
 //!   `brightness` besides the feature keys
 //! - `<base>/<name>/action`: button presses (not retained)
 //! - `<base>/<name>/availability`: `{"state":"online"}` or `offline` (retained)
-//! - `<base>/bridge/state`, `<base>/bridge/devices`, `<base>/bridge/groups`
+//! - `<base>/bridge/state`, `<base>/bridge/info`, `<base>/bridge/devices` (with
+//!   Zigbee2MQTT's `exposes`), `<base>/bridge/groups`
+//! - `<base>/bridge/request/permit_join` and `restart`
 //! - Home Assistant discovery under `<prefix>/…/config`
 //!
 //! The connection restarts when the settings change.
@@ -25,6 +27,13 @@ use crate::store::{Group, MqttSettings};
 /// Keys a light or climate entity already covers
 const LIGHT_KEYS: &[&str] = &["on", "level", "color_temp"];
 const CLIMATE_KEYS: &[&str] = &["temperature", "setpoint", "system_mode", "heating"];
+/// Binary features Zigbee2MQTT publishes as words (on, off) rather than true/false
+const BINARY_WORDS: &[(&str, &str, &str)] = &[("child_lock", "LOCK", "UNLOCK"), ("open_window", "ON", "OFF")];
+
+fn binary_words(key: &str) -> Option<(&'static str, &'static str)> {
+    BINARY_WORDS.iter().find(|(k, _, _)| *k == key).map(|&(_, on, off)| (on, off))
+}
+
 const HA_MODES: &[&str] = &["off", "heat", "auto", "cool", "heat_cool", "dry", "fan_only"];
 
 pub async fn run(hub: Arc<Hub>) {
@@ -148,7 +157,12 @@ impl Bridge {
 
     async fn connected(&mut self) {
         let base = self.base().to_owned();
-        for topic in [format!("{base}/+/set"), format!("{base}/+/set/+"), format!("{}/status", self.cfg.discovery_prefix)] {
+        for topic in [
+            format!("{base}/+/set"),
+            format!("{base}/+/set/+"),
+            format!("{base}/bridge/request/+"),
+            format!("{}/status", self.cfg.discovery_prefix),
+        ] {
             if let Err(e) = self.client.subscribe(topic, QoS::AtLeastOnce).await {
                 warn!("MQTT subscribe failed: {e}");
             }
@@ -158,6 +172,7 @@ impl Bridge {
     }
 
     async fn publish_all(&mut self) {
+        self.publish_info().await;
         let devices = self.hub.devices();
         self.publish_bridge_lists(&devices).await;
         for view in &devices {
@@ -176,13 +191,24 @@ impl Bridge {
                 json!({
                     "ieee_address": v.device.ieee,
                     "network_address": v.device.nwk,
-                    "friendly_name": v.device.name,
+                    "friendly_name": topic_name(&v.device.name),
                     "type": if v.device.router { "Router" } else { "EndDevice" },
+                    "power_source": if v.device.rx_on_when_idle { "Mains (single phase)" } else { "Battery" },
                     "model_id": v.device.model,
                     "manufacturer": v.device.manufacturer,
                     "supported": v.definition.is_some(),
+                    "disabled": false,
+                    "interviewing": v.interviewing,
                     "interview_completed": v.device.interviewed,
-                    "definition": v.definition.map(|d| json!({"vendor": d.vendor, "description": d.description})),
+                    "definition": v.definition.map(|d| json!({
+                        "model": v.device.model,
+                        "vendor": d.vendor,
+                        "description": d.description,
+                        "exposes": exposes(v),
+                        "options": [],
+                        "supports_ota": false,
+                        "source": "native",
+                    })),
                 })
             })
             .collect();
@@ -195,13 +221,56 @@ impl Bridge {
             .map(|g| {
                 json!({
                     "id": g.id,
-                    "friendly_name": g.name,
+                    "friendly_name": topic_name(&g.name),
                     "members": g.members.iter().map(|m| json!({"ieee_address": m.ieee, "endpoint": m.ep})).collect::<Vec<_>>(),
                 })
             })
             .collect();
         self.publish(&format!("{}/bridge/groups", self.base()), Json::Array(groups).to_string(), true)
             .await;
+    }
+
+    /// Zigbee2MQTT's bridge info: tools find the bridge by it
+    async fn publish_info(&self) {
+        let info = self.hub.info();
+        let remaining = self.hub.permit_remaining();
+        let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
+        let devices: Map<String, Json> = self.hub.devices().iter().map(|v| (v.device.ieee.clone(), json!({"friendly_name": v.device.name}))).collect();
+        let groups: Map<String, Json> = self.hub.groups().iter().map(|g| (g.id.to_string(), json!({"friendly_name": g.name}))).collect();
+        let payload = json!({
+            "version": format!("zhub {}", info.version),
+            "commit": null,
+            "coordinator": {"ieee_address": format!("0x{}", info.ieee.replace(':', "")), "type": "Spinel", "meta": {"firmware": info.radio_firmware}},
+            "network": {"channel": info.channel, "pan_id": info.pan_id, "extended_pan_id": info.extended_pan_id},
+            "log_level": info.log_level,
+            "permit_join": remaining > 0,
+            "permit_join_end": if remaining > 0 { json!(now_ms + remaining * 1000) } else { Json::Null },
+            "restart_required": false,
+            "config": {"devices": devices, "groups": groups},
+        });
+        self.publish(&format!("{}/bridge/info", self.base()), payload.to_string(), true).await;
+    }
+
+    /// `bridge/request/<name>` as Zigbee2MQTT takes it
+    fn request(&self, name: &str, payload: &[u8]) {
+        let body: Json = serde_json::from_slice(payload).unwrap_or(Json::Null);
+        match name {
+            "permit_join" => {
+                // {"value": bool, "time": s}, {"time": s} or a bare bool
+                let on = body.get("value").and_then(Json::as_bool).or(body.as_bool());
+                let time = body.get("time").and_then(Json::as_u64);
+                let seconds = match (on, time) {
+                    (Some(false), _) | (None, Some(0)) => 0,
+                    (_, Some(t)) => t.min(254) as u8,
+                    _ => self.hub.public_settings()["permit_join_seconds"].as_u64().unwrap_or(180).min(254) as u8,
+                };
+                if let Err(e) = self.hub.permit_join(seconds) {
+                    warn!("MQTT permit_join: {e:#}");
+                }
+            }
+            "restart" => self.hub.request_restart(),
+            _ => debug!("MQTT bridge request {name} not supported"),
+        }
     }
 
     async fn hub_event(&mut self, event: Event) {
@@ -232,10 +301,19 @@ impl Bridge {
                 }
                 self.publish_bridge_lists(&devices).await;
             }
-            Event::Action { name, action, .. } => {
-                self.publish(&format!("{}/{}/action", self.base(), topic_name(&name)), action, false).await;
+            Event::Action { ieee, name, action, .. } => {
+                self.publish(&format!("{}/{}/action", self.base(), topic_name(&name)), action.clone(), false).await;
+                // Zigbee2MQTT also puts the action into a state message; not retained, so the
+                // press is not replayed
+                if let Some(view) = self.hub.device_view(&ieee)
+                    && let Some(topic) = self.state_topics.get(&ieee)
+                {
+                    let mut payload = device_payload(&view);
+                    payload["action"] = json!(action);
+                    self.publish(topic, payload.to_string(), false).await;
+                }
             }
-            Event::PermitJoin { .. } | Event::Settings => {}
+            Event::PermitJoin { .. } | Event::Settings => self.publish_info().await,
         }
     }
 
@@ -326,6 +404,10 @@ impl Bridge {
         let Some(rest) = topic.strip_prefix(&format!("{}/", self.base())) else {
             return;
         };
+        if let Some(request) = rest.strip_prefix("bridge/request/") {
+            self.request(request, payload);
+            return;
+        }
         let mut parts = rest.splitn(3, '/');
         let (Some(name), Some("set")) = (parts.next(), parts.next()) else {
             return;
@@ -375,6 +457,20 @@ pub fn device_payload(view: &DeviceView) -> Json {
     }
     if view.device.state.contains_key("color_temp") {
         out.insert("color_mode".into(), json!("color_temp"));
+    }
+    for (key, on, off) in BINARY_WORDS {
+        if let Some(value) = out.get_mut(*key)
+            && let Some(b) = value.as_bool()
+        {
+            *value = json!(if b { on } else { off });
+        }
+    }
+    // Zigbee2MQTT's thermostat names
+    if let Some(setpoint) = view.device.state.get("setpoint") {
+        out.insert("current_heating_setpoint".into(), setpoint.clone());
+    }
+    if let Some(heating) = view.device.state.get("heating").and_then(Json::as_bool) {
+        out.insert("running_state".into(), json!(if heating { "heat" } else { "idle" }));
     }
     if let Some(lqi) = view.device.lqi {
         out.insert("linkquality".into(), json!(lqi));
@@ -543,6 +639,8 @@ fn device_discovery(view: &DeviceView, cfg: &MqttSettings, state_topic: &str) ->
             continue;
         }
         let value = format!("value_json.{}", f.key);
+        // A binary feature's truth, for those published as words
+        let truthy = binary_words(f.key).map_or(value.clone(), |(on, _)| format!("{value} == '{on}'"));
         let mut config = Map::new();
         config.insert("name".into(), json!(f.label));
         config.insert("object_id".into(), json!(format!("{}_{}", topic_name(&view.device.name), f.key)));
@@ -606,7 +704,7 @@ fn device_discovery(view: &DeviceView, cfg: &MqttSettings, state_topic: &str) ->
                 add("sensor", f.key, config);
             }
             (Kind::Binary, Access::ReadWrite, _) => {
-                config.insert("value_template".into(), json!(format!("{{{{ 'ON' if {value} else 'OFF' }}}}")));
+                config.insert("value_template".into(), json!(format!("{{{{ 'ON' if {truthy} else 'OFF' }}}}")));
                 config.insert("command_topic".into(), json!(command_topic));
                 config.insert("payload_on".into(), json!(format!(r#"{{"{}": true}}"#, f.key)));
                 config.insert("payload_off".into(), json!(format!(r#"{{"{}": false}}"#, f.key)));
@@ -615,7 +713,7 @@ fn device_discovery(view: &DeviceView, cfg: &MqttSettings, state_topic: &str) ->
                 add("switch", f.key, config);
             }
             (Kind::Binary, _, _) => {
-                config.insert("value_template".into(), json!(format!("{{{{ 'ON' if {value} else 'OFF' }}}}")));
+                config.insert("value_template".into(), json!(format!("{{{{ 'ON' if {truthy} else 'OFF' }}}}")));
                 if f.key == "battery_low" {
                     config.insert("device_class".into(), json!("battery"));
                 }
@@ -647,6 +745,96 @@ fn device_discovery(view: &DeviceView, cfg: &MqttSettings, state_topic: &str) ->
     }
     configs.extend(triggers);
     configs
+}
+
+/// Zigbee2MQTT's `exposes` for a device: lights and thermostats as composites with
+/// Zigbee2MQTT's property names, the other features under their own names
+pub fn exposes(view: &DeviceView) -> Vec<Json> {
+    let feature = |key: &str| view.features.iter().find(|f| f.key == key);
+    let access = |f: &Feature| match f.access {
+        Access::Read => 1,
+        Access::Write => 2,
+        Access::ReadWrite => 7,
+    };
+    let numeric = |f: &Feature, name: &str| {
+        let mut e = json!({"type": "numeric", "name": name, "property": name, "label": f.label, "access": access(f)});
+        if let Kind::Numeric { unit, step, .. } = f.kind {
+            let (min, max) = f.range(&view.device);
+            if let Some(min) = min {
+                e["value_min"] = json!(min);
+            }
+            if let Some(max) = max {
+                e["value_max"] = json!(max);
+            }
+            if let Some(step) = step {
+                e["value_step"] = json!(step);
+            }
+            if !unit.is_empty() {
+                e["unit"] = json!(unit);
+            }
+        }
+        e
+    };
+    let mut out = Vec::new();
+    let mut covered: Vec<&str> = Vec::new();
+    if view.card == Card::Light
+        && let Some(on) = feature("on")
+    {
+        let mut features = vec![json!({
+            "type": "binary", "name": "state", "property": "state", "label": "State", "access": access(on),
+            "value_on": "ON", "value_off": "OFF", "value_toggle": "TOGGLE",
+        })];
+        if let Some(f) = feature("level") {
+            let mut e = numeric(f, "brightness");
+            e["value_min"] = json!(0);
+            e["value_max"] = json!(254);
+            features.push(e);
+        }
+        if let Some(f) = feature("color_temp") {
+            features.push(numeric(f, "color_temp"));
+        }
+        out.push(json!({"type": "light", "features": features}));
+        covered.extend(LIGHT_KEYS);
+    }
+    if let Some(setpoint) = feature("setpoint") {
+        // The measured temperature stays a feature of its own (`temperature`)
+        let mut features = vec![numeric(setpoint, "current_heating_setpoint")];
+        if let Some(f) = feature("system_mode")
+            && let Kind::Enum { values } = f.kind
+        {
+            features.push(json!({"type": "enum", "name": "system_mode", "property": "system_mode", "label": f.label, "access": access(f), "values": values}));
+            covered.push("system_mode");
+        }
+        if feature("heating").is_some() {
+            features.push(json!({"type": "enum", "name": "running_state", "property": "running_state", "label": "Running state", "access": 1, "values": ["idle", "heat"]}));
+            covered.push("heating");
+        }
+        out.push(json!({"type": "climate", "features": features}));
+        covered.push("setpoint");
+    }
+    for f in view.features.iter().filter(|f| !covered.contains(&f.key)) {
+        let base = |kind: &str| json!({"type": kind, "name": f.key, "property": f.key, "label": f.label, "access": access(f)});
+        out.push(match f.kind {
+            Kind::Numeric { .. } => numeric(f, f.key),
+            Kind::Binary => {
+                let mut e = base("binary");
+                let (on, off) = binary_words(f.key).map_or((json!(true), json!(false)), |(on, off)| (json!(on), json!(off)));
+                e["value_on"] = on;
+                e["value_off"] = off;
+                e
+            }
+            Kind::Enum { values } => {
+                let mut e = base("enum");
+                e["values"] = json!(values);
+                e
+            }
+            Kind::Text => base("text"),
+            // Edited in the hub's UI
+            Kind::Schedule { .. } | Kind::WeeklySchedule { .. } => continue,
+        });
+    }
+    out.push(json!({"type": "numeric", "name": "linkquality", "property": "linkquality", "label": "Linkquality", "access": 1, "unit": "lqi", "value_min": 0, "value_max": 255}));
+    out
 }
 
 fn writable(f: &Feature) -> bool {
@@ -683,10 +871,32 @@ async fn apply(hub: &Arc<Hub>, name: &str, command: Map<String, Json>) -> anyhow
         }
         Some(other) => anyhow::bail!("unknown state {other}"),
     }
-    for (key, value) in command {
-        if key != "state" && key != "brightness" && !(state.as_deref() == Some("OFF") && key == "color_temp") {
-            writes.push((key, value));
+    for (key, mut value) in command {
+        if key == "state" || key == "brightness" || (state.as_deref() == Some("OFF") && key == "color_temp") {
+            continue;
         }
+        let key = match key.as_str() {
+            "current_heating_setpoint" | "occupied_heating_setpoint" => "setpoint".to_owned(),
+            _ => key,
+        };
+        if let Some((on, off)) = binary_words(&key)
+            && let Some(word) = value.as_str()
+        {
+            value = match word {
+                w if w.eq_ignore_ascii_case(on) => json!(true),
+                w if w.eq_ignore_ascii_case(off) => json!(false),
+                _ => value,
+            };
+        }
+        // Tools scale color temperature over 153-500 mireds; the light's range is narrower
+        if key == "color_temp"
+            && let (Some(d), Some(v)) = (&target, value.as_f64())
+            && let Some(f) = d.features.iter().find(|f| f.key == "color_temp")
+        {
+            let (min, max) = f.range(&d.device);
+            value = json!(v.clamp(min.unwrap_or(v), max.unwrap_or(v)).round());
+        }
+        writes.push((key, value));
     }
     for (key, value) in writes {
         match (&target, &group) {
@@ -788,5 +998,45 @@ mod tests {
     #[test]
     fn wildcards_leave_topic_names() {
         assert_eq!(topic_name("Lamp #1 + 2"), "Lamp _1 _ 2");
+    }
+
+    #[test]
+    fn exposes_use_zigbee2mqtt_names() {
+        let props = |e: &[Json]| -> Vec<String> {
+            e.iter()
+                .flat_map(|x| x.get("features").and_then(Json::as_array).cloned().unwrap_or_else(|| vec![x.clone()]))
+                .filter_map(|x| x["property"].as_str().map(str::to_owned))
+                .collect()
+        };
+        let light = exposes(&view("LTA009", json!({"on": true, "level": 100, "color_temp": 300})));
+        assert_eq!(light[0]["type"], "light");
+        let p = props(&light);
+        for key in ["state", "brightness", "color_temp", "power_on_behavior", "linkquality"] {
+            assert!(p.iter().any(|k| k == key), "{key} in {p:?}");
+        }
+        assert!(!p.iter().any(|k| k == "on" || k == "level"));
+
+        let trv = view("TRVZB", json!({"setpoint": 21.5, "heating": true, "temperature": 20.1}));
+        let e = exposes(&trv);
+        assert_eq!(e[0]["type"], "climate");
+        let p = props(&e);
+        for key in ["current_heating_setpoint", "system_mode", "running_state", "temperature", "battery"] {
+            assert!(p.iter().any(|k| k == key), "{key} in {p:?}");
+        }
+        assert!(!p.iter().any(|k| k == "setpoint" || k == "weekly_schedule"));
+        let payload = device_payload(&trv);
+        assert_eq!(payload["current_heating_setpoint"], 21.5);
+        assert_eq!(payload["running_state"], "heat");
+    }
+
+    #[test]
+    fn child_lock_and_open_window_as_zigbee2mqtt_words() {
+        let trv = view("TRVZB", json!({"child_lock": true, "open_window": false}));
+        let payload = device_payload(&trv);
+        assert_eq!(payload["child_lock"], "LOCK");
+        assert_eq!(payload["open_window"], "OFF");
+        let e = exposes(&trv);
+        let lock = e.iter().find(|x| x["property"] == "child_lock").unwrap();
+        assert_eq!((lock["value_on"].clone(), lock["value_off"].clone()), (json!("LOCK"), json!("UNLOCK")));
     }
 }
