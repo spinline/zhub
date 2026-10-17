@@ -50,13 +50,16 @@ Adding a device: open its definition in Zigbee2MQTT (`zigbee-herdsman-converters
 write the same information as a `Definition` in `devices/<vendor>.rs` and add it to the
 list in `devices/mod.rs`. Feature labels and descriptions are taken from Zigbee2MQTT.
 
-Defined devices: Philips Hue LTA005, LTA009, RDM001 (wall switch module), SONOFF SNZB-02D,
+Defined devices: Philips Hue LTA005, LTA009, LWA017, RDM001/RDM004 (wall switch module), SONOFF SNZB-02D,
 SNZB-02P, TRVZB, Tuya ZWT07 (`_TZE200_g9a3awaj`).
 
 ## Hardware
 
-SONOFF Dongle Plus MG24 with Silicon Labs OpenThread RCP 3.1.1 (921600 baud, no flow
-control). On Keenetic the "USB to Serial Port Converters" component must be installed.
+SONOFF ZBDongle-E ("Zigbee 3.0 USB Dongle Plus V2", EFR32MG21) with Nerivec's OpenThread
+RCP build `sonoff_zbdonglee_openthread_rcp_2026.6.2_3.1.2_460800_sw_flow.gbl`: 460800 baud,
+XON/XOFF flow control (`--baudrate 460800 --flow-control software`; both must match the
+firmware build). On Keenetic the "USB to Serial Port Converters" component must be
+installed. The dongle is a USB 2.0 device; a USB 3 port only adds 2.4 GHz noise.
 
 Known issue: some sleepy devices (SONOFF TRVZB) cannot join the dongle directly with a
 MAC association; pair them through a router (e.g. a Hue light). After that they can

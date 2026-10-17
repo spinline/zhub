@@ -99,6 +99,7 @@ pub struct Options {
     pub tx_power: i8,
     /// Diagnostics: put the radio in promiscuous mode and log MAC command frames
     pub sniff: bool,
+    pub flow_control: crate::radio::Flow,
     pub logging: Arc<crate::logging::Logging>,
 }
 
@@ -222,7 +223,7 @@ pub struct HubInfo {
     pub matter: Json,
 }
 
-/// Transmit power the MG24 RCP accepts (dBm)
+/// Transmit power the RCP accepts (dBm)
 const TX_POWER_RANGE: std::ops::RangeInclusive<i8> = -10..=20;
 
 /// A binding with its destination's name (the hub or a known device)
@@ -474,7 +475,7 @@ impl Hub {
     pub async fn start(opts: Options) -> Result<Arc<Self>> {
         let mut data = Persisted::load(&opts.state_path)?;
 
-        let (phy, spinel) = crate::radio::open(&opts.device, opts.baudrate, opts.sniff).await?;
+        let (phy, spinel) = crate::radio::open(&opts.device, opts.baudrate, opts.flow_control, opts.sniff).await?;
         let radio_ieee = phy
             .hw_address()
             .await

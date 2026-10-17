@@ -8,14 +8,26 @@ use tokio_serial::{FlowControl, SerialPortBuilderExt};
 use ziggurat_phy_spinel::SpinelPhy;
 use ziggurat_spinel::client::SpinelClient;
 
-/// On some dongles (e.g. SONOFF Dongle Plus MG24) opening the port resets the RCP via
+/// Serial flow control, as the RCP firmware was built
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum Flow {
+    None,
+    /// XON/XOFF: the RCP pauses the host when its receive buffer fills. Spinel's HDLC
+    /// framing escapes both bytes, so the data never contains them.
+    Software,
+}
+
+/// On some dongles opening the port resets the RCP via
 /// the DTR/RTS lines. Wait for that boot to finish and drain the leftover bytes, or the
 /// Spinel client's first command collides with the reset.
 const BOOT_SETTLE: Duration = Duration::from_secs(2);
 
-pub async fn open(device: &str, baudrate: u32, sniff: bool) -> Result<(Arc<SpinelPhy>, Arc<SpinelClient>)> {
+pub async fn open(device: &str, baudrate: u32, flow: Flow, sniff: bool) -> Result<(Arc<SpinelPhy>, Arc<SpinelClient>)> {
     let mut port = tokio_serial::new(device, baudrate)
-        .flow_control(FlowControl::None)
+        .flow_control(match flow {
+            Flow::None => FlowControl::None,
+            Flow::Software => FlowControl::Software,
+        })
         .open_native_async()
         .with_context(|| format!("cannot open {device}"))?;
 

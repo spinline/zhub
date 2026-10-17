@@ -2,7 +2,7 @@
 # zhub: Zigbee hub. Entware runs /opt/etc/init.d/S* scripts at boot.
 # If the process dies (or the dongle is not ready yet at boot) it restarts after 5 s.
 
-ARGS="--device /dev/ttyUSB0 --baudrate 921600 --log-level info,ziggurat_driver=warn"
+ARGS="--device /dev/ttyUSB0 --baudrate 460800 --flow-control software --log-level info,ziggurat_driver=warn"
 BIN=/opt/bin/zhub
 LOG=/opt/var/log/zhub.log
 PIDFILE=/opt/var/run/zhub.pid

@@ -30,9 +30,14 @@ struct Args {
     #[arg(long, default_value = "/dev/ttyUSB0")]
     device: String,
 
-    /// Serial baud rate; SONOFF's OpenThread RCP 3.x builds use 921600
+    /// Serial baud rate; it must match the RCP firmware build
     #[arg(long, default_value_t = 921_600)]
     baudrate: u32,
+
+    /// Serial flow control; it must match the RCP firmware build (`sw_flow` builds
+    /// signal with XON/XOFF)
+    #[arg(long, value_enum, default_value_t = radio::Flow::None)]
+    flow_control: radio::Flow,
 
     /// File holding the network and device records
     #[arg(long, default_value = "/opt/var/lib/zhub/state.json")]
@@ -78,6 +83,7 @@ async fn run(args: Args, logging: std::sync::Arc<logging::Logging>) -> Result<()
     let hub = hub::Hub::start(hub::Options {
         device: args.device,
         baudrate: args.baudrate,
+        flow_control: args.flow_control,
         state_path: args.state,
         channel: args.channel,
         tx_power: args.tx_power,
