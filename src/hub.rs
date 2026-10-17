@@ -952,6 +952,8 @@ impl Hub {
         {
             // TRVZB refuses Get Weekly Schedule (0x81), but a device may still send these
             if let (Some(ieee), Some((days, day))) = (&ieee, crate::thermostat::parse_get_rsp(payload)) {
+                let names: Vec<_> = days.iter().map(|&i| crate::thermostat::DAYS[i]).collect();
+                info!("{ieee} sent its weekly schedule for {}: {day:?}", names.join(", "));
                 self.update_device(ieee, |d| {
                     let merged = crate::thermostat::merge(d.state.get("weekly_schedule"), &days, &day);
                     d.state.insert("weekly_schedule".into(), merged);
