@@ -530,6 +530,14 @@ pub fn device_payload(view: &DeviceView) -> Json {
     if let Some(heating) = view.device.state.get("heating").and_then(Json::as_bool) {
         out.insert("running_state".into(), json!(if heating { "heat" } else { "idle" }));
     }
+    // Zigbee2MQTT's SONOFF schedule names: weekly_schedule_<day> in text form
+    if let Some(days) = out.remove("weekly_schedule").as_ref().and_then(Json::as_object) {
+        for (day, slots) in days {
+            if let Some(text) = crate::thermostat::day_to_z2m(slots) {
+                out.insert(format!("weekly_schedule_{day}"), json!(text));
+            }
+        }
+    }
     if let Some(lqi) = view.device.lqi {
         out.insert("linkquality".into(), json!(lqi));
     }
@@ -906,8 +914,18 @@ pub fn exposes(view: &DeviceView) -> Vec<Json> {
                 e
             }
             Kind::Text => base("text"),
+            // Zigbee2MQTT's SONOFF schedule: one text per day, set only (the valve cannot
+            // report it; the state holds what was saved)
+            Kind::WeeklySchedule { .. } => {
+                for day in crate::thermostat::DAYS {
+                    let name = format!("weekly_schedule_{day}");
+                    out.push(json!({"type": "text", "name": name, "property": name, "label": format!("Weekly schedule {day}"),
+                        "access": 3, "category": "config", "description": f.description}));
+                }
+                continue;
+            }
             // Edited in the hub's UI
-            Kind::Schedule { .. } | Kind::WeeklySchedule { .. } => continue,
+            Kind::Schedule { .. } => continue,
         });
     }
     out.push(json!({"type": "numeric", "name": "linkquality", "property": "linkquality", "label": "Linkquality", "access": 1, "unit": "lqi", "value_min": 0, "value_max": 255}));
@@ -1071,10 +1089,11 @@ pub async fn apply(hub: &Arc<Hub>, name: &str, command: Map<String, Json>) -> an
     let mut done_any = false;
     let run_rest = async |done_any: &mut bool, last_error: &mut Option<anyhow::Error>| {
         for (key, value) in translate_rest(rest.clone()) {
-            let result = match (&target, &group) {
-                (Some(d), _) => hub.set(&d.device.ieee, &key, value).await.map(drop),
-                (None, Some(g)) => hub.set_group(g.id, &key, &value),
-                (None, None) => Ok(()),
+            let result = match (value, &target, &group) {
+                (Err(e), _, _) => Err(e),
+                (Ok(value), Some(d), _) => hub.set(&d.device.ieee, &key, value).await.map(drop),
+                (Ok(value), None, Some(g)) => hub.set_group(g.id, &key, &value),
+                (Ok(_), None, None) => Ok(()),
             };
             match result {
                 Ok(()) => *done_any = true,
@@ -1145,7 +1164,25 @@ async fn run_light(hub: &Arc<Hub>, target: &Option<&DeviceView>, group: &Option<
 }
 
 /// Zigbee2MQTT's names and words for the hub's other features
-fn translate_rest(command: Map<String, Json>) -> Vec<(String, Json)> {
+fn translate_rest(command: Map<String, Json>) -> Vec<(String, anyhow::Result<Json>)> {
+    // Zigbee2MQTT's weekly_schedule_<day> keys become one schedule write, so the days that
+    // share a schedule go out in one command (as Zigbee2MQTT batches them). The hub checks
+    // the device's own limits; here only the text form is read.
+    let (days, command): (Map<String, Json>, Map<String, Json>) =
+        command.into_iter().partition(|(k, _)| k.strip_prefix("weekly_schedule_").is_some_and(|d| crate::thermostat::DAYS.contains(&d)));
+    let schedule = (!days.is_empty()).then(|| {
+        let lenient = crate::thermostat::Limits { min: f64::MIN, max: f64::MAX, step: 0.5, max_transitions: usize::MAX };
+        let week: anyhow::Result<Map<String, Json>> = days
+            .into_iter()
+            .map(|(key, value)| {
+                let day = &key["weekly_schedule_".len()..];
+                let text = value.as_str().with_context(|| format!("{key}: expected text"))?;
+                let slots = crate::thermostat::day_from_z2m(text, lenient).with_context(|| format!("Invalid schedule for {day}"))?;
+                Ok((day.to_owned(), slots))
+            })
+            .collect();
+        ("weekly_schedule".to_owned(), week.map(Json::Object))
+    });
     command
         .into_iter()
         .map(|(key, mut value)| {
@@ -1162,8 +1199,9 @@ fn translate_rest(command: Map<String, Json>) -> Vec<(String, Json)> {
                     _ => value,
                 };
             }
-            (key, value)
+            (key, Ok(value))
         })
+        .chain(schedule)
         .collect()
 }
 
@@ -1253,6 +1291,28 @@ mod tests {
     }
 
     #[test]
+    fn weekly_schedule_in_zigbee2mqtt_form() {
+        let command = json!({"weekly_schedule_monday": "00:00/18 17:00/22 22:00/19 22:00/19", "weekly_schedule_sunday": "00:00/20", "child_lock": "LOCK"});
+        let mut keys = translate_rest(command.as_object().unwrap().clone());
+        keys.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(keys[0].0, "child_lock");
+        assert_eq!(keys[1].0, "weekly_schedule");
+        let week = keys[1].1.as_ref().unwrap();
+        assert_eq!(week["monday"].as_array().unwrap().len(), 3);
+        assert_eq!(week["sunday"], json!([{"time": "00:00", "temperature": 20.0}]));
+        let bad = translate_rest(json!({"weekly_schedule_monday": "00:00/20.3"}).as_object().unwrap().clone());
+        assert!(format!("{:#}", bad[0].1.as_ref().unwrap_err()).contains("monday"));
+
+        // The saved schedule goes out as Zigbee2MQTT's text per day
+        let mut trv = view("TRVZB", json!({"setpoint": 21.0}));
+        trv.device.state.insert("weekly_schedule".into(), week.clone());
+        let payload = device_payload(&trv);
+        assert_eq!(payload["weekly_schedule_monday"], "00:00/18 17:00/22 22:00/19");
+        assert_eq!(payload["weekly_schedule_sunday"], "00:00/20");
+        assert!(payload.get("weekly_schedule").is_none());
+    }
+
+    #[test]
     fn thermostat_is_a_climate_entity() {
         let mut v = view("TRVZB", json!({"setpoint": 21.0, "system_mode": "heat"}));
         v.device.ieee = "0c:ae:5f:ff:fe:b4:5b:eb".into();
@@ -1308,6 +1368,7 @@ mod tests {
             assert!(p.iter().any(|k| k == key), "{key} in {p:?}");
         }
         assert!(!p.iter().any(|k| k == "setpoint" || k == "weekly_schedule"));
+        assert!(p.iter().any(|k| k == "weekly_schedule_monday"));
         let payload = device_payload(&trv);
         assert_eq!(payload["current_heating_setpoint"], 21.5);
         assert_eq!(payload["running_state"], "heat");

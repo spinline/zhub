@@ -148,6 +148,49 @@ pub fn merge(state: Option<&Json>, days: &[usize], day: &Day) -> Json {
     Json::Object(object)
 }
 
+/// Zigbee2MQTT's text form of one day, `HH:mm/temperature` transitions separated by
+/// spaces (`weekly_schedule_<day>`), as the UI's list of transitions. Like Zigbee2MQTT
+/// the transitions are sorted and temperatures take whole or half degrees; a transition
+/// repeated word for word is kept once, since the valve cannot take two at one time.
+pub fn day_from_z2m(text: &str, limits: Limits) -> Result<Json> {
+    let mut words: Vec<&str> = text.split_whitespace().collect();
+    words.sort_unstable();
+    words.dedup();
+    if words.is_empty() || words.len() > limits.max_transitions {
+        bail!("days must have 1-{} transitions", limits.max_transitions);
+    }
+    let mut slots = Vec::new();
+    for word in words {
+        let parsed = word.split_once('/').and_then(|(time, temperature)| {
+            let minutes = parse_time(time)?;
+            let temperature: f64 = temperature.parse().ok().filter(|t: &f64| t.is_finite() && (t * 2.0).fract() == 0.0)?;
+            Some((minutes, temperature))
+        });
+        let Some((minutes, temperature)) = parsed else {
+            bail!("transitions must be in format HH:mm/temperature (e.g. 12:00/15.5), found: {word}");
+        };
+        if temperature < limits.min || temperature > limits.max {
+            bail!("temperature value must be between {}-{} (inclusive), found: {temperature}", limits.min, limits.max);
+        }
+        slots.push(json!({"time": format!("{:02}:{:02}", minutes / 60, minutes % 60), "temperature": temperature}));
+    }
+    Ok(Json::Array(slots))
+}
+
+/// One day of the state's schedule in Zigbee2MQTT's text form
+pub fn day_to_z2m(day: &Json) -> Option<String> {
+    let words: Option<Vec<String>> = day
+        .as_array()?
+        .iter()
+        .map(|slot| {
+            let time = slot.get("time")?.as_str()?;
+            let temperature = slot.get("temperature")?.as_f64()?;
+            Some(format!("{time}/{temperature}"))
+        })
+        .collect();
+    words.map(|w| w.join(" "))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,6 +201,30 @@ mod tests {
         step: 0.5,
         max_transitions: 6,
     };
+
+    #[test]
+    fn zigbee2mqtt_text_form() {
+        let day = day_from_z2m("22:00/19 00:00/18 17:00/22 22:00/19 22:00/19", LIMITS).unwrap();
+        assert_eq!(
+            day,
+            json!([
+                {"time": "00:00", "temperature": 18.0},
+                {"time": "17:00", "temperature": 22.0},
+                {"time": "22:00", "temperature": 19.0},
+            ])
+        );
+        assert_eq!(day_to_z2m(&day).unwrap(), "00:00/18 17:00/22 22:00/19");
+        // The UI's checks still apply (first transition at 00:00, distinct times)
+        let week = |d: Json| parse_week(&json!({"monday": d}), LIMITS);
+        assert!(week(day).is_ok());
+        assert!(week(day_from_z2m("06:00/20", LIMITS).unwrap()).is_err());
+        assert!(week(day_from_z2m("00:00/20 06:00/21 06:00/22", LIMITS).unwrap()).is_err());
+        let seven = "00:00/20 01:00/20 02:00/20 03:00/20 04:00/20 05:00/20 06:00/20";
+        for bad in ["", "00:00/20.3", "00:00/40", "24:00/20", "0:00/20", "00:00-20", seven] {
+            assert!(day_from_z2m(bad, LIMITS).is_err(), "{bad}");
+        }
+        assert_eq!(day_to_z2m(&json!([{"time": "00:00", "temperature": 19.5}])).unwrap(), "00:00/19.5");
+    }
 
     #[test]
     fn days_with_the_same_schedule_share_a_command() {
