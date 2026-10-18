@@ -17,6 +17,7 @@ axum = { version = "0.8", default-features = false, features = ["http1", "json",
 clap = { version = "4.6", features = ["derive"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 getrandom = "0.3"
+sha2 = "0.11"
 rumqttc = { version = "0.24", default-features = false }
 # Matter bridge (feature "matter"); a pinned commit, the crate is not released often
 rs-matter = { git = "https://github.com/project-chip/rs-matter", rev = "c69916a5a78957d46500145486df375acf4ab490", features = ["groups"], optional = true }

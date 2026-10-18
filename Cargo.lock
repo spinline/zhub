@@ -3080,6 +3080,7 @@ dependencies = [
  "rumqttc",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "tokio-serial",
  "tokio-stream",

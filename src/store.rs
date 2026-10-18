@@ -64,6 +64,55 @@ pub struct Settings {
     pub log_level: Option<String>,
     pub mqtt: MqttSettings,
     pub matter: MatterSettings,
+    /// The web UI's password, as Zigbee2MQTT's `frontend.auth_token`; never sent to the page
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ui_auth: Option<UiAuth>,
+}
+
+/// A salted, stretched hash of the web UI password. The derived key is also what the
+/// browser keeps in its cookie, so a hash leaked from the state file still logs in; the
+/// password itself is not kept anywhere.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UiAuth {
+    pub salt: String,
+    pub key: String,
+}
+
+/// SHA-256 rounds: a guess costs ~10 ms on the router, a login is still instant
+const UI_AUTH_ROUNDS: u32 = 20_000;
+
+impl UiAuth {
+    pub fn new(password: &str) -> Self {
+        let salt = hex(&random_bytes::<16>());
+        let key = Self::derive(&salt, password);
+        Self { salt, key }
+    }
+
+    pub fn derive(salt: &str, password: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let mut digest = Sha256::new().chain_update(salt.as_bytes()).chain_update(password.as_bytes()).finalize();
+        for _ in 1..UI_AUTH_ROUNDS {
+            digest = Sha256::new().chain_update(digest).chain_update(password.as_bytes()).finalize();
+        }
+        hex(&digest)
+    }
+
+    pub fn matches(&self, password: &str) -> bool {
+        constant_time_eq(Self::derive(&self.salt, password).as_bytes(), self.key.as_bytes())
+    }
+
+    /// The cookie the browser shows on every request
+    pub fn accepts_key(&self, key: &str) -> bool {
+        constant_time_eq(key.as_bytes(), self.key.as_bytes())
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 /// Matter bridge. The setup code (passcode, discriminator) is drawn once and kept, so the
@@ -161,6 +210,7 @@ impl Default for Settings {
             log_level: None,
             mqtt: MqttSettings::default(),
             matter: MatterSettings::default(),
+            ui_auth: None,
         }
     }
 }
@@ -177,6 +227,9 @@ impl Settings {
         if let Some(mqtt) = value.get_mut("mqtt").and_then(Json::as_object_mut) {
             mqtt.remove("password");
             mqtt.insert("has_password".into(), Json::Bool(self.mqtt.password.is_some()));
+        }
+        if let Some(object) = value.as_object_mut() {
+            object.insert("ui_auth".into(), Json::Bool(self.ui_auth.is_some()));
         }
         value
     }
@@ -511,5 +564,26 @@ mod tests {
     #[test]
     fn rejects_short_hex() {
         assert!(parse_eui64("00:11").is_err());
+    }
+}
+
+#[cfg(test)]
+mod ui_auth_tests {
+    use super::*;
+
+    #[test]
+    fn the_password_is_kept_as_a_salted_hash() {
+        let auth = UiAuth::new("hunter22");
+        assert!(auth.matches("hunter22"));
+        assert!(!auth.matches("hunter23"));
+        assert!(auth.accepts_key(&auth.key));
+        assert!(!auth.accepts_key("x"));
+        // Another salt, another key for the same password
+        assert_ne!(UiAuth::new("hunter22").key, auth.key);
+        // The page learns only whether a password is set
+        let settings = Settings { ui_auth: Some(auth.clone()), ..Settings::default() };
+        let public = settings.public().to_string();
+        assert!(public.contains("\"ui_auth\":true"));
+        assert!(!public.contains(&auth.key) && !public.contains(&auth.salt));
     }
 }

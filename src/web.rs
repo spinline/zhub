@@ -47,7 +47,89 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .route("/api/groups/{id}/members", post(group_member))
         .route("/api/groups/{id}/set", post(set_group))
         .route("/api/devices/{ieee}/bind", post(bind))
+        .route("/api/login", post(login))
+        .route("/api/logout", post(logout))
+        .route("/api/hub/password", post(set_password))
+        .layer(axum::middleware::from_fn_with_state(hub.clone(), require_password))
         .with_state(hub)
+}
+
+// ---- Web UI password (Zigbee2MQTT's frontend.auth_token) ----
+
+const AUTH_COOKIE: &str = "zhub_auth";
+
+fn cookie<'a>(headers: &'a axum::http::HeaderMap, name: &str) -> Option<&'a str> {
+    headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(';'))
+        .find_map(|pair| pair.trim().strip_prefix(name)?.strip_prefix('='))
+}
+
+fn auth_cookie(key: Option<&str>) -> String {
+    match key {
+        Some(key) => format!("{AUTH_COOKIE}={key}; Path=/; HttpOnly; SameSite=Strict; Max-Age=31536000"),
+        None => format!("{AUTH_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0"),
+    }
+}
+
+/// With a password set, the API answers only a browser that logged in; the page itself
+/// loads so it can ask for the password
+async fn require_password(
+    State(hub): State<Arc<Hub>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let path = request.uri().path();
+    let open = !path.starts_with("/api/") || path == "/api/login" || path == "/api/logout";
+    let allowed = open
+        || match hub.ui_auth() {
+            None => true,
+            Some(auth) => cookie(request.headers(), AUTH_COOKIE).is_some_and(|key| auth.accepts_key(key)),
+        };
+    if allowed {
+        next.run(request).await
+    } else {
+        (StatusCode::UNAUTHORIZED, Json(json!({ "error": "password required", "auth": true }))).into_response()
+    }
+}
+
+#[derive(Deserialize)]
+struct Login {
+    password: String,
+}
+
+async fn login(State(hub): State<Arc<Hub>>, Json(body): Json<Login>) -> Response {
+    let Some(auth) = hub.ui_auth() else {
+        return Json(json!({ "ok": true })).into_response();
+    };
+    let key = auth.key.clone();
+    // Stretching the password takes a moment on the router: off the async threads
+    let matches = tokio::task::spawn_blocking(move || auth.matches(&body.password)).await.unwrap_or(false);
+    if !matches {
+        tracing::warn!("Web UI: wrong password");
+        // Slows down guessing
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "wrong password", "auth": true }))).into_response();
+    }
+    ([(header::SET_COOKIE, auth_cookie(Some(&key)))], Json(json!({ "ok": true }))).into_response()
+}
+
+async fn logout() -> Response {
+    ([(header::SET_COOKIE, auth_cookie(None))], Json(json!({ "ok": true }))).into_response()
+}
+
+#[derive(Deserialize)]
+struct NewPassword {
+    password: Option<String>,
+}
+
+/// Sets, changes or (null) removes the password; this browser stays logged in
+async fn set_password(State(hub): State<Arc<Hub>>, Json(body): Json<NewPassword>) -> Result<Response, ApiError> {
+    let password = body.password.filter(|p| !p.is_empty());
+    let key = tokio::task::spawn_blocking(move || hub.set_ui_password(password.as_deref())).await.map_err(anyhow::Error::from)??;
+    Ok(([(header::SET_COOKIE, auth_cookie(key.as_deref()))], Json(json!({ "ok": true }))).into_response())
 }
 
 struct ApiError(anyhow::Error);
@@ -320,4 +402,18 @@ async fn remove(
 ) -> ApiResult {
     hub.remove(&ieee, query.force).await?;
     ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finds_the_auth_cookie_among_others() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(header::COOKIE, "a=1; zhub_auth=abc123; b=2".parse().unwrap());
+        assert_eq!(cookie(&headers, AUTH_COOKIE), Some("abc123"));
+        headers.insert(header::COOKIE, "zhub_authx=1".parse().unwrap());
+        assert_eq!(cookie(&headers, AUTH_COOKIE), None);
+    }
 }

@@ -59,6 +59,10 @@ struct Args {
     #[arg(long)]
     sniff: bool,
 
+    /// Remove the web UI password (for a forgotten one), then run as usual
+    #[arg(long)]
+    reset_ui_password: bool,
+
     /// Log level (RUST_LOG takes precedence; a level saved in the UI overrides both)
     #[arg(long, default_value = "info")]
     log_level: String,
@@ -91,6 +95,9 @@ async fn run(args: Args, logging: std::sync::Arc<logging::Logging>) -> Result<()
         logging,
     })
     .await?;
+    if args.reset_ui_password {
+        hub.set_ui_password(None)?;
+    }
 
     tokio::spawn(mqtt::run(hub.clone()));
     #[cfg(feature = "matter")]

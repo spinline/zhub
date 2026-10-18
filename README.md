@@ -24,7 +24,11 @@ Zigbee2MQTT needed: a single static binary with an embedded web UI.
   both with weekly schedules (the TRVZB takes a schedule but cannot report it, so the UI
   shows what was saved from the hub).
 - Hue lights can be factory reset by serial number (like the Hue Bridge).
-- Web UI at `http://<router>:8099` (no authentication; local network only).
+- Web UI at `http://<router>:8099`. Without a password anyone on the network can control
+  every device; like Zigbee2MQTT's auth token, Settings → Web UI password protects the page
+  and its API (one password, remembered per browser; kept as a salted hash). A forgotten
+  password is removed by starting zhub once with `--reset-ui-password`. Do not expose the UI
+  to the internet.
 - Settings page: hub and radio firmware info, network parameters, transmit power,
   availability limits (cards show Offline), permit join duration, log level with a live
   log viewer, restart, Hue reset.

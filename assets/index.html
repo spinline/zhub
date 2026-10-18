@@ -131,12 +131,13 @@
     width: min(720px, calc(100% - 24px)); max-height: calc(100% - 24px); padding: 0;
     border: 1px solid var(--line); border-radius: 16px; background: var(--card); color: var(--text);
   }
-  dialog#detail::backdrop, dialog#removeDlg::backdrop { background: rgba(0, 0, 0, .45); }
-  dialog#removeDlg {
+  dialog#detail::backdrop, dialog#removeDlg::backdrop, dialog#loginDlg::backdrop { background: rgba(0, 0, 0, .45); }
+  dialog#removeDlg, dialog#loginDlg {
     width: min(440px, calc(100% - 24px)); padding: 18px;
     border: 1px solid var(--line); border-radius: 16px; background: var(--card); color: var(--text);
   }
-  dialog#removeDlg h3 { margin: 0 0 4px; font-size: 18px; }
+  dialog#removeDlg h3, dialog#loginDlg h3 { margin: 0 0 4px; font-size: 18px; }
+  dialog#loginDlg input { width: 100%; margin: 12px 0; box-sizing: border-box; }
   dialog#removeDlg .sub { margin-bottom: 12px; }
   .option { display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; padding: 10px 0; border-top: 1px solid var(--line); cursor: pointer; }
   .option input { margin: 3px 0 0; }
@@ -235,6 +236,7 @@
 <main id="pageSettings" hidden>
   <div class="settings">
     <div class="card"><h3>Hub</h3><dl class="info" id="setHub"></dl></div>
+    <div class="card"><h3>Web UI password</h3><div id="setPassword"></div></div>
     <div class="card"><h3>Network</h3><dl class="info" id="setNetwork"></dl><div id="setTxPower"></div></div>
     <div class="card"><h3>Adapter</h3><dl class="info" id="setAdapter"></dl></div>
     <div class="card"><h3>Availability and joining</h3><div id="setGeneral"></div></div>
@@ -296,6 +298,15 @@
   <div class="panel" id="dlgPanel"></div>
 </dialog>
 
+<dialog id="loginDlg">
+  <form id="loginForm" method="dialog">
+    <h3>zhub</h3>
+    <div class="desc">This page is protected. Enter the web UI password.</div>
+    <input id="loginPassword" type="password" autocomplete="current-password" required>
+    <div class="desc" id="loginError" style="color:var(--warn)"></div>
+    <div class="actions"><button class="primary" type="submit">Log in</button></div>
+  </form>
+</dialog>
 <dialog id="removeDlg">
   <h3>Remove device</h3>
   <div class="sub" id="removeName"></div>
@@ -346,9 +357,33 @@ async function api(path, body, method = "POST") {
     body: body ? JSON.stringify(body) : undefined,
   });
   const data = await res.json().catch(() => ({}));
+  if (res.status === 401 && data.auth) {
+    showLogin();
+    throw new Error("Password required");
+  }
   if (!res.ok) throw new Error(data.error || res.statusText);
   return data;
 }
+
+// Zigbee2MQTT's frontend.auth_token: one password, kept by the browser in a cookie
+function showLogin() {
+  const dlg = $("#loginDlg");
+  if (!dlg.open) dlg.showModal();
+  $("#loginPassword").focus();
+}
+
+$("#loginForm").onsubmit = async (e) => {
+  e.preventDefault();
+  $("#loginError").textContent = "";
+  const res = await fetch("/api/login", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ password: $("#loginPassword").value }),
+  });
+  if (res.ok) location.reload();
+  else $("#loginError").textContent = (await res.json().catch(() => ({}))).error || "Login failed";
+};
+// The login cannot be dismissed while the API refuses the page
+$("#loginDlg").addEventListener("cancel", (e) => e.preventDefault());
 
 const run = (promise) => promise.catch(e => toast(e.message));
 
@@ -1367,6 +1402,37 @@ function numberSetting(label, unit, value, { min, max, step = 1 }, description, 
     el("div", { className: "desc", textContent: description }));
 }
 
+// Set, change or remove the web UI password; this browser stays logged in
+function passwordForm(enabled) {
+  const input = el("input", { type: "password", placeholder: enabled ? "New password" : "Password", autocomplete: "new-password" });
+  const save = el("button", { textContent: enabled ? "Change" : "Set", className: "primary" });
+  save.onclick = () => {
+    if (input.value.length < 4) { toast("At least 4 characters"); return; }
+    run(api("/api/hub/password", { password: input.value }).then(() => {
+      input.value = ""; toast(enabled ? "Password changed" : "Password set"); return loadSettings();
+    }));
+  };
+  const nodes = [
+    el("div", { className: "desc", textContent: enabled
+      ? "On: the page and its API ask for the password once per browser. MQTT and Matter are not affected."
+      : "Off: anyone on the network can open this page and control every device. Like Zigbee2MQTT's auth token, a password protects the page and its API." }),
+    el("div", { className: "row", style: "margin-top:8px" }, input, save),
+  ];
+  if (enabled) {
+    const remove = el("button", { textContent: "Remove", className: "danger" });
+    remove.onclick = () => {
+      if (confirm("Remove the password? Anyone on the network can then open this page.")) {
+        run(api("/api/hub/password", { password: null }).then(() => { toast("Password removed"); return loadSettings(); }));
+      }
+    };
+    const logout = el("button", { textContent: "Log out" });
+    logout.onclick = () => run(api("/api/logout").then(() => location.reload()));
+    nodes.push(el("div", { className: "actions", style: "margin-top:8px" }, logout, remove),
+      el("div", { className: "desc", style: "font-size:12px;color:var(--muted)", textContent: "Forgot it? Start zhub once with --reset-ui-password." }));
+  }
+  return nodes;
+}
+
 function saveSettings(patch) {
   return api("/api/hub/settings", { ...hubSettings, ...patch }).then(() => toast("Settings saved"));
 }
@@ -1385,8 +1451,9 @@ async function loadSettings() {
     ["Channel", String(info.channel)],
     ["PAN ID", hex(info.pan_id)],
     ["Extended PAN ID", info.extended_pan_id],
-    ["Network key", "Not shown (the page has no password yet)"],
+    ["Network key", info.network_key ?? "Not shown (set a web UI password to see it)"],
   ]);
+  $("#setPassword").replaceChildren(...passwordForm(!!hubSettings.ui_auth));
   $("#setTxPower").replaceChildren(numberSetting("Transmit power", "dBm", info.tx_power, { min: -10, max: 20 },
     "Radio output of the dongle. Higher reaches farther devices. Applies now and after restarts. " +
     "Channel, PAN ID and network key cannot be changed here: every device would have to be paired again.",
@@ -1595,7 +1662,8 @@ function connect() {
 setInterval(() => { renderPermit(); render(); }, 1000 * 15);
 setInterval(renderPermit, 1000);
 showPage();
-connect();
+// With a password set, connect only after logging in (the event stream would just fail)
+fetch("/api/state").then((res) => res.status === 401 ? showLogin() : connect(), () => connect());
 </script>
 </body>
 </html>

@@ -219,6 +219,9 @@ pub struct HubInfo {
     pub serial_port: String,
     pub baudrate: u32,
     pub flow_control: &'static str,
+    /// Shown only when the page has a password
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network_key: Option<String>,
     pub log_level: String,
     pub settings: Json,
     pub mqtt_status: String,
@@ -638,6 +641,8 @@ impl Hub {
             pan_id: network.map_or(0, |n| n.pan_id),
             extended_pan_id: network.map(|n| n.extended_pan_id.clone()).unwrap_or_default(),
             tx_power: network.map_or(0, |n| n.tx_power),
+            // Only behind a password: with it the network can be joined or sniffed
+            network_key: network.filter(|_| data.settings.ui_auth.is_some()).map(|n| n.network_key.clone()),
             serial_port: self.serial_port.clone(),
             baudrate: self.baudrate,
             flow_control: match self.flow_control {
@@ -853,6 +858,26 @@ impl Hub {
         eui64_to_string(&self.ieee)
     }
 
+    /// The web UI's password check, if one is set
+    pub fn ui_auth(&self) -> Option<store::UiAuth> {
+        self.data.lock().unwrap().settings.ui_auth.clone()
+    }
+
+    /// Sets (or with `None` removes) the web UI password; returns the new cookie key
+    pub fn set_ui_password(&self, password: Option<&str>) -> Result<Option<String>> {
+        let auth = match password {
+            Some(p) if p.chars().count() < 4 => bail!("the password must be at least 4 characters"),
+            Some(p) => Some(store::UiAuth::new(p)),
+            None => None,
+        };
+        let key = auth.as_ref().map(|a| a.key.clone());
+        info!("Web UI password {}", if auth.is_some() { "set" } else { "removed" });
+        self.data.lock().unwrap().settings.ui_auth = auth;
+        self.dirty.notify_one();
+        let _ = self.events.send(Event::Settings);
+        Ok(key)
+    }
+
     /// Changes the settings the patch names (objects merge key by key)
     pub fn patch_settings(&self, patch: Json) -> Result<()> {
         let mut merged = serde_json::to_value(&self.data.lock().unwrap().settings)?;
@@ -862,11 +887,13 @@ impl Hub {
 
     pub fn update_settings(&self, mut settings: store::Settings) -> Result<()> {
         settings.validate()?;
-        // The setup code never comes from the page; it is drawn once
+        // The setup code never comes from the page; it is drawn once. The UI password
+        // changes only through `set_ui_password`.
         {
-            let current = &self.data.lock().unwrap().settings.matter;
-            settings.matter.passcode = current.passcode;
-            settings.matter.discriminator = current.discriminator;
+            let current = &self.data.lock().unwrap().settings;
+            settings.matter.passcode = current.matter.passcode;
+            settings.matter.discriminator = current.matter.discriminator;
+            settings.ui_auth = current.ui_auth.clone();
         }
         if settings.matter.enabled {
             settings.matter.ensure_setup_code();
