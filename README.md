@@ -1,8 +1,10 @@
 # zhub
 
-A lightweight Zigbee hub that runs on the router itself, built on the
-[Ziggurat](https://github.com/zigpy/ziggurat) Zigbee stack. No Home Assistant or
-Zigbee2MQTT needed: a single static binary with an embedded web UI.
+A lightweight Zigbee hub built on the [Ziggurat](https://github.com/zigpy/ziggurat) Zigbee
+stack: a single static binary with an embedded web UI, small enough to run on a router. It
+was developed on a Keenetic router (MIPS) and should run on any Linux system with an
+OpenThread RCP dongle (e.g. a Raspberry Pi), though only Keenetic has been tested. No Home
+Assistant or Zigbee2MQTT needed.
 
 - Forms a network and keeps the network key, frame counters and stack tables in
   `/opt/var/lib/zhub/state.json`.
@@ -77,6 +79,11 @@ RCP build `sonoff_zbdonglee_openthread_rcp_2026.6.2_3.1.2_460800_sw_flow.gbl`: 4
 XON/XOFF flow control (`--baudrate 460800 --flow-control software`; both must match the
 firmware build). On Keenetic the "USB to Serial Port Converters" component must be
 installed. The dongle is a USB 2.0 device; a USB 3 port only adds 2.4 GHz noise.
+
+Other Linux systems: build for the target (`cargo build --release`, or `--features matter`)
+and pass the dongle's serial port, baud rate and flow control. The Matter bridge announces
+itself through Avahi static service files in `/tmp/avahi/services`, where Keenetic's Avahi
+reads them; elsewhere that directory has to be one the local Avahi watches.
 
 Known issue: some sleepy devices (SONOFF TRVZB) cannot join the dongle directly with a
 MAC association; pair them through a router (e.g. a Hue light). After that they can
