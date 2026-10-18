@@ -191,6 +191,24 @@
     opacity: 0; transition: opacity .2s; pointer-events: none; max-width: calc(100% - 32px);
   }
   #toast.show { opacity: 1; }
+  .map-card { padding: 0; overflow: hidden; }
+  #mapGraph { display: block; width: 100%; height: 400px; }
+  #mapGraph text { font-size: 11px; fill: var(--text); }
+  #mapGraph .lqi { font-size: 10px; fill: var(--muted); }
+  #mapGraph .node { cursor: default; }
+  #mapGraph line.edge { stroke-opacity: .15; }
+  #mapGraph line.edge.main { stroke-opacity: .85; }
+  #mapGraph text.edge { display: none; }
+  #mapGraph text.edge.main { display: inline; }
+  #mapGraph.focus .edge { stroke-opacity: .06; display: none; }
+  #mapGraph.focus line.edge { display: inline; }
+  #mapGraph.focus .edge.hi { stroke-opacity: 1; display: inline; }
+  .map-legend { display: flex; flex-wrap: wrap; gap: 6px 14px; padding: 10px 14px; border-top: 1px solid var(--line); font-size: 12px; color: var(--muted); }
+  .map-legend i { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 5px; border: 1px solid #0003; vertical-align: -1px; }
+  .map-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  .map-table th, .map-table td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  .map-table th { color: var(--muted); font-weight: 500; }
+  label.check { display: inline-flex; align-items: center; gap: 6px; font-size: 14px; }
 </style>
 </head>
 <body>
@@ -201,6 +219,7 @@
   <nav id="menu">
     <a href="#devices" data-page="devices"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>Devices</a>
     <a href="#groups" data-page="groups"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="9" cy="8" r="3"/><circle cx="17" cy="9" r="2.5"/><path d="M3 20c0-3.3 2.7-6 6-6s6 2.7 6 6"/><path d="M15 14.5c.6-.3 1.3-.5 2-.5 2.8 0 4 2 4 5"/></svg>Groups</a>
+    <a href="#map" data-page="map"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="5" r="2.5"/><circle cx="5" cy="19" r="2.5"/><circle cx="19" cy="19" r="2.5"/><path d="M11 7.2 6.2 16.8M13 7.2l4.8 9.6M7.5 19h9"/></svg>Network map</a>
     <a href="#settings" data-page="settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>Settings</a>
     <a href="#logs" data-page="logs"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M14 3v6h6"/><path d="M8 13h8M8 17h6"/></svg>Logs</a>
   </nav>
@@ -232,6 +251,18 @@
     </div>
   </div>
   <div id="groups" class="grid"></div>
+</main>
+<main id="pageMap" hidden>
+  <div class="card" style="margin-bottom:12px">
+    <div class="ctl" style="border:0;padding:0">
+      <div class="row"><button id="mapScan" class="primary">Scan</button><label class="check"><input id="mapRoutes" type="checkbox"> Include routes</label></div>
+      <div class="desc">Asks the hub and every router for its neighbor table (and with routes, its routing table); this takes a few seconds per router. Lines are labeled with link quality (LQI, 0–255). End devices sit next to their parent; links between routers are faint until you point at a device.</div>
+    </div>
+  </div>
+  <div class="card map-card" id="mapGraphCard" hidden><svg id="mapGraph"></svg>
+    <div class="map-legend"><span><i style="background:#e04e5d"></i>Coordinator</span><span><i style="background:#4ea3e0"></i>Router</span><span><i style="background:#fff8ce"></i>End device</span><span><i style="background:var(--ok)"></i>LQI ≥ 150</span><span><i style="background:#d9a400"></i>80–149</span><span><i style="background:var(--warn)"></i>&lt; 80</span></div>
+  </div>
+  <div class="card" id="mapTableCard" hidden style="margin-top:12px;overflow-x:auto"><table class="map-table"><thead><tr><th>Device</th><th>Neighbor</th><th>Relationship</th><th>LQI</th><th>Depth</th><th>Routes</th></tr></thead><tbody id="mapRows"></tbody></table><div class="desc" id="mapFailed"></div></div>
 </main>
 <main id="pageSettings" hidden>
   <div class="settings">
@@ -1350,11 +1381,146 @@ $("#groupCreate").onclick = () => {
   run(api("/api/groups", { name }).then(() => { $("#groupName").value = ""; toast("Group created"); }));
 };
 
+// ---- Network map page ----
+
+const RELATIONSHIP = ["Parent", "Child", "Sibling", "None", "Previous child"];
+const NODE_COLOR = { Coordinator: "#e04e5d", Router: "#4ea3e0", EndDevice: "#fff8ce" };
+const lqiColor = (lqi) => lqi >= 150 ? "var(--ok)" : lqi >= 80 ? "#d9a400" : "var(--warn)";
+
+$("#mapScan").onclick = () => {
+  const button = $("#mapScan");
+  button.disabled = true;
+  button.textContent = "Scanning…";
+  run(api(`/api/networkmap?routes=${$("#mapRoutes").checked}`, null, "GET")
+    .then(res => drawMap(res.value))
+    .finally(() => { button.disabled = false; button.textContent = "Scan"; }));
+};
+
+function drawMap(map) {
+  const svgNs = "http://www.w3.org/2000/svg";
+  const svg = $("#mapGraph");
+  const name = new Map(map.nodes.map(n => [n.ieeeAddr, n.friendlyName]));
+  const kind = new Map(map.nodes.map(n => [n.ieeeAddr, n.type]));
+  // One line per device pair. Both ends report the link; the lower reading is the one that
+  // limits it. The hub's own table has no measured values (0 or 255), so a router's reading
+  // of the hub wins. A child's parent comes from the child's entry in the parent's table.
+  const edges = new Map(), parent = new Map();
+  for (const l of map.links) {
+    const a = l.source.ieeeAddr, b = l.target.ieeeAddr;
+    if (!name.has(a) || !name.has(b) || a === b) continue;
+    if (l.relationship === 1) parent.set(a, b);
+    const key = a < b ? a + b : b + a;
+    const measured = kind.get(b) !== "Coordinator";
+    const e = edges.get(key);
+    if (!e) {
+      edges.set(key, { a, b, lqi: l.lqi, measured, active: l.routes.length > 0, tree: l.relationship <= 1 });
+      continue;
+    }
+    if (measured && !e.measured) e.lqi = l.lqi;
+    else if (measured === e.measured) e.lqi = Math.min(e.lqi, l.lqi);
+    e.measured ||= measured; e.active ||= l.routes.length > 0; e.tree ||= l.relationship <= 1;
+  }
+
+  // Radial layout: the hub in the middle, routers on the inner ring, end devices on the
+  // outer ring next to their parent
+  const width = svg.clientWidth || 800;
+  // Room for the outer ring's labels beside it (about 6 px a letter); names that would
+  // take more than a third of the width are shortened
+  const longest = Math.max(0, ...map.nodes.filter(n => n.type === "EndDevice").map(n => n.friendlyName.length));
+  const pad = Math.min(longest * 6 + 24, width / 3);
+  const fits = Math.floor((pad - 24) / 6);
+  const outer = Math.max(Math.min(width / 2 - pad, 260), 60), inner = outer * 0.55;
+  // The drawing is as tall as the rings need
+  const height = 2 * outer + 90;
+  svg.style.height = `${height}px`;
+  svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+  const cx = width / 2, cy = height / 2;
+  const label = (text) => text.length > fits ? text.slice(0, fits - 1) + "…" : text;
+  const pos = new Map();
+  const routers = map.nodes.filter(n => n.type === "Router").sort((x, y) => x.friendlyName.localeCompare(y.friendlyName));
+  const angleOf = new Map();
+  routers.forEach((n, i) => {
+    const angle = -Math.PI / 2 + 2 * Math.PI * i / Math.max(routers.length, 1);
+    angleOf.set(n.ieeeAddr, angle);
+    pos.set(n.ieeeAddr, { x: cx + Math.cos(angle) * inner, y: cy + Math.sin(angle) * inner, angle });
+  });
+  for (const n of map.nodes) if (n.type === "Coordinator") pos.set(n.ieeeAddr, { x: cx, y: cy, angle: Math.PI / 2 });
+  const children = new Map();
+  for (const n of map.nodes.filter(n => n.type === "EndDevice")) {
+    const p = parent.get(n.ieeeAddr) || "";
+    children.set(p, [...(children.get(p) || []), n]);
+  }
+  const step = 0.2;
+  for (const [p, list] of children) {
+    const base = angleOf.get(p) ?? Math.PI / 2;
+    list.forEach((n, i) => {
+      const angle = base + (i - (list.length - 1) / 2) * step;
+      pos.set(n.ieeeAddr, { x: cx + Math.cos(angle) * outer, y: cy + Math.sin(angle) * outer, angle });
+    });
+  }
+
+  const svgEl = (tag, attrs, text) => {
+    const node = document.createElementNS(svgNs, tag);
+    for (const [k, v] of Object.entries(attrs)) node.setAttribute(k, v);
+    if (text != null) node.textContent = text;
+    return node;
+  };
+  const lines = [], labels = [], dots = [];
+  for (const e of edges.values()) {
+    const s = pos.get(e.a), t = pos.get(e.b);
+    if (!s || !t) continue;
+    // The hub's and parents' links stand out; the router mesh stays faint until hovered
+    const main = e.tree || kind.get(e.a) === "Coordinator" || kind.get(e.b) === "Coordinator";
+    const cls = main ? "edge main" : "edge";
+    lines.push(svgEl("line", { class: cls, "data-a": e.a, "data-b": e.b, x1: s.x, y1: s.y, x2: t.x, y2: t.y,
+      stroke: lqiColor(e.lqi), "stroke-width": e.active ? 3 : 2 }));
+    labels.push(svgEl("text", { class: cls + " lqi", "data-a": e.a, "data-b": e.b,
+      x: (s.x + t.x) / 2, y: (s.y + t.y) / 2 - 3, "text-anchor": "middle" }, e.lqi));
+  }
+  for (const n of map.nodes) {
+    const p = pos.get(n.ieeeAddr);
+    if (!p) continue;
+    const g = svgEl("g", { class: "node", "data-ieee": n.ieeeAddr });
+    g.append(svgEl("circle", { cx: p.x, cy: p.y, r: n.type === "Coordinator" ? 11 : 8,
+      fill: NODE_COLOR[n.type] || "#ccc", stroke: "#0006" }));
+    // Labels point away from the middle so they do not cover the lines
+    const cos = Math.cos(p.angle), sin = Math.sin(p.angle);
+    const anchor = n.type === "Coordinator" || Math.abs(cos) < 0.3 ? "middle" : cos > 0 ? "start" : "end";
+    g.append(svgEl("text", { x: p.x + cos * 14, y: p.y + sin * 14 + (Math.abs(cos) < 0.3 ? (sin > 0 ? 8 : -2) : 4),
+      "text-anchor": anchor }, label(n.friendlyName)));
+    const model = n.definition ? `${n.definition.vendor} ${n.definition.model}` : n.type;
+    g.append(svgEl("title", {}, `${n.friendlyName}\n${model}\n${n.ieeeAddr} (0x${n.networkAddress.toString(16).padStart(4, "0")})`));
+    g.onmouseenter = () => {
+      svg.classList.add("focus");
+      for (const x of svg.querySelectorAll(".edge")) x.classList.toggle("hi", x.dataset.a === n.ieeeAddr || x.dataset.b === n.ieeeAddr);
+    };
+    g.onmouseleave = () => svg.classList.remove("focus");
+    dots.push(g);
+  }
+  svg.replaceChildren(...lines, ...labels, ...dots);
+  $("#mapGraphCard").hidden = false;
+
+  const rows = map.links
+    .slice()
+    .sort((x, y) => (name.get(x.target.ieeeAddr) || "").localeCompare(name.get(y.target.ieeeAddr) || "") || y.lqi - x.lqi)
+    .map(l => el("tr", {},
+      el("td", { textContent: name.get(l.target.ieeeAddr) || l.target.ieeeAddr }),
+      el("td", { textContent: name.get(l.source.ieeeAddr) || l.source.ieeeAddr }),
+      el("td", { textContent: RELATIONSHIP[l.relationship] || String(l.relationship) }),
+      el("td", {}, el("span", { textContent: l.lqi, style: `color:${lqiColor(l.lqi)};font-weight:600` })),
+      el("td", { textContent: l.depth === 255 ? "–" : l.depth }),
+      el("td", { textContent: l.routes.map(r => "0x" + r.destinationAddress.toString(16).padStart(4, "0")).join(", ") })));
+  $("#mapRows").replaceChildren(...rows);
+  const failed = map.nodes.filter(n => n.failed.length).map(n => n.friendlyName);
+  $("#mapFailed").textContent = failed.length ? `No answer from: ${failed.join(", ")}` : "";
+  $("#mapTableCard").hidden = false;
+}
+
 // ---- Settings page ----
 
 let page = "devices";
 
-const PAGES = { devices: "Devices", groups: "Groups", settings: "Settings", logs: "Logs" };
+const PAGES = { devices: "Devices", groups: "Groups", map: "Network map", settings: "Settings", logs: "Logs" };
 
 function showPage() {
   const wanted = location.hash.slice(1);
@@ -1363,6 +1529,7 @@ function showPage() {
   $("#pageSettings").hidden = page !== "settings";
   $("#pageLogs").hidden = page !== "logs";
   $("#pageGroups").hidden = page !== "groups";
+  $("#pageMap").hidden = page !== "map";
   $("#pageTitle").textContent = PAGES[page];
   for (const a of document.querySelectorAll("#menu a")) a.classList.toggle("active", a.dataset.page === page);
   document.body.classList.remove("menu-open");

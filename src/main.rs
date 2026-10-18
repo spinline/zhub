@@ -5,6 +5,7 @@ mod logging;
 #[cfg(feature = "matter")]
 mod matter;
 mod mqtt;
+mod networkmap;
 mod radio;
 mod sniff;
 mod thermostat;

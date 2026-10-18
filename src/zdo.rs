@@ -15,6 +15,8 @@ pub mod cluster {
     pub const DEVICE_ANNCE: u16 = 0x0013;
     pub const BIND_REQ: u16 = 0x0021;
     pub const UNBIND_REQ: u16 = 0x0022;
+    pub const MGMT_LQI_REQ: u16 = 0x0031;
+    pub const MGMT_RTG_REQ: u16 = 0x0032;
     pub const MGMT_BIND_REQ: u16 = 0x0033;
     pub const MGMT_LEAVE_REQ: u16 = 0x0034;
     pub const MGMT_PERMIT_JOINING_REQ: u16 = 0x0036;

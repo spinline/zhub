@@ -34,6 +34,7 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .route("/api/matter/open", post(matter_open))
         .route("/api/matter/reset", post(matter_reset))
         .route("/api/logs", get(logs))
+        .route("/api/networkmap", get(network_map))
         .route("/api/devices/{ieee}", axum::routing::delete(remove))
         .route("/api/devices/{ieee}/set", post(set))
         .route("/api/devices/{ieee}/rename", post(rename))
@@ -262,6 +263,27 @@ async fn matter_reset(State(hub): State<Arc<Hub>>) -> ApiResult {
 async fn mqtt_cleanup(State(hub): State<Arc<Hub>>) -> ApiResult {
     let removed = crate::mqtt::clean_stale(&hub).await?;
     Ok(Json(json!({ "ok": true, "removed": removed })))
+}
+
+#[derive(Deserialize)]
+struct MapQuery {
+    #[serde(rename = "type", default = "raw_format")]
+    kind: String,
+    #[serde(default)]
+    routes: bool,
+}
+
+fn raw_format() -> String {
+    "raw".into()
+}
+
+/// The network map, as Zigbee2MQTT's bridge/response/networkmap data
+async fn network_map(State(hub): State<Arc<Hub>>, Query(q): Query<MapQuery>) -> ApiResult {
+    if !crate::networkmap::FORMATS.contains(&q.kind.as_str()) {
+        return Err(anyhow::anyhow!("Type '{}' not supported", q.kind).into());
+    }
+    let map = hub.network_map(q.routes).await;
+    Ok(Json(crate::networkmap::render(&map, &q.kind, q.routes, crate::networkmap::now_ms())?))
 }
 
 async fn restart(State(hub): State<Arc<Hub>>) -> ApiResult {

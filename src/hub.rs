@@ -192,6 +192,8 @@ pub struct Hub {
     matter_command_rx: Mutex<Option<mpsc::UnboundedReceiver<MatterCommand>>>,
     /// Devices last seen offline by the availability check
     offline: Mutex<HashSet<String>>,
+    /// One network scan at a time: a second would only double the traffic
+    scanning: tokio::sync::Mutex<()>,
     mqtt_status: Mutex<String>,
 }
 
@@ -602,6 +604,7 @@ impl Hub {
             matter_command_rx: Mutex::new(Some(matter_command_rx)),
             mqtt_status: Mutex::new("disabled".into()),
             offline: Mutex::new(HashSet::new()),
+            scanning: tokio::sync::Mutex::new(()),
         });
 
         tokio::spawn(hub.clone().notification_loop());
@@ -2670,6 +2673,174 @@ impl Hub {
             {
                 Err(e) if e.is::<NoReply>() && started.elapsed() < window => {}
                 answer => return answer,
+            }
+        }
+    }
+
+    /// Zigbee2MQTT's network scan: the hub's own tables, then every router's neighbor
+    /// table (and routing table with `routes`), a second apart; a failed read is retried
+    /// once after 5 s and noted in the node's `failed`
+    pub async fn network_map(&self, routes: bool) -> crate::networkmap::NetworkMap {
+        use crate::networkmap::{self as nm, Address, Node, Scanned};
+        use ziggurat_driver::zigbee_stack::NwkDeviceType;
+
+        let _one_at_a_time = self.scanning.lock().await;
+        info!("Network scan started (routes: {routes})");
+        let hub = nm::eui64_hex(&eui64_to_string(&self.ieee));
+        let mut nodes = vec![Node {
+            ieee_addr: hub.clone(),
+            friendly_name: "Coordinator".into(),
+            kind: "Coordinator",
+            network_address: 0,
+            manufacturer_name: None,
+            model_id: None,
+            failed: Vec::new(),
+            last_seen: None,
+            definition: None,
+        }];
+        let own = {
+            let core = self.stack.state.core.lock();
+            let neighbors = core
+                .nib
+                .neighbors
+                .entries()
+                .map(|e| nm::Neighbor {
+                    eui64: nm::eui64_hex(&eui64_to_string(&e.extended_address)),
+                    nwk_address: e.network_address.as_u16(),
+                    device_type: match e.device_type {
+                        NwkDeviceType::Coordinator => 0,
+                        NwkDeviceType::Router => 1,
+                        NwkDeviceType::EndDevice => 2,
+                    },
+                    rx_on_when_idle: u8::from(e.rx_on_when_idle),
+                    relationship: {
+                        use ziggurat_driver::ziggurat_zigbee::nwk::neighbors::Relationship as R;
+                        match e.relationship {
+                            R::Parent => 0,
+                            R::Child => 1,
+                            R::Sibling => 2,
+                            R::NoneOfTheAbove => 3,
+                            R::PreviousChild => 4,
+                            R::UnauthenticatedChild => 5,
+                            R::UnauthorizedChildWithRelayAllowed => 6,
+                            R::LostChild => 7,
+                            R::AddressConflictChild => 8,
+                            R::BackboneMeshSibling => 9,
+                        }
+                    },
+                    permit_joining: 2,
+                    // The coordinator is at depth 0, its neighbors at 1
+                    depth: 1,
+                    lqi: e.lqa().unwrap_or(0),
+                })
+                .collect();
+            let own_routes = if routes {
+                core.nib
+                    .routing
+                    .entries()
+                    .map(|r| nm::Route {
+                        destination_address: r.destination.as_u16(),
+                        status: nm::route_status(r.status as u8),
+                        next_hop: r.next_hop_address.as_u16(),
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            Scanned {
+                target: Address {
+                    ieee_addr: hub,
+                    network_address: 0,
+                },
+                neighbors,
+                routes: own_routes,
+            }
+        };
+        let mut scans = vec![own];
+
+        let mut devices: Vec<Device> = self.data.lock().unwrap().devices.values().cloned().collect();
+        devices.sort_by(|a, b| a.name.cmp(&b.name));
+        for device in devices {
+            let mut failed = Vec::new();
+            if device.router {
+                // Zigbee2MQTT pauses between devices to spare the network
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let target = Address {
+                    ieee_addr: nm::eui64_hex(&device.ieee),
+                    network_address: device.nwk,
+                };
+                let neighbors = match self.read_table(device.nwk, zdo::cluster::MGMT_LQI_REQ, nm::parse_lqi_rsp).await {
+                    Ok(n) => n,
+                    Err(e) => {
+                        warn!("Network scan: no neighbor table from {} ({e:#})", device.name);
+                        failed.push("lqi");
+                        Vec::new()
+                    }
+                };
+                let device_routes = if routes {
+                    match self.read_table(device.nwk, zdo::cluster::MGMT_RTG_REQ, nm::parse_rtg_rsp).await {
+                        Ok(r) => r,
+                        Err(e) => {
+                            warn!("Network scan: no routing table from {} ({e:#})", device.name);
+                            failed.push("routingTable");
+                            Vec::new()
+                        }
+                    }
+                } else {
+                    Vec::new()
+                };
+                if !failed.contains(&"lqi") {
+                    scans.push(Scanned {
+                        target,
+                        neighbors,
+                        routes: device_routes,
+                    });
+                }
+            }
+            let definition = devices::definition_info(&device).map(|d| nm::Definition {
+                model: device.model.clone().unwrap_or_default(),
+                vendor: d.vendor.to_owned(),
+                description: d.description.to_owned(),
+                supports: devices::features(&device).iter().map(|f| f.key).collect::<Vec<_>>().join(", "),
+            });
+            nodes.push(Node {
+                ieee_addr: nm::eui64_hex(&device.ieee),
+                friendly_name: device.name.clone(),
+                kind: if device.router { "Router" } else { "EndDevice" },
+                network_address: device.nwk,
+                manufacturer_name: device.manufacturer.clone(),
+                model_id: device.model.clone(),
+                failed,
+                last_seen: device.last_seen.map(|s| s * 1000),
+                definition,
+            });
+        }
+        let links = nm::links(&scans, &nodes);
+        info!("Network scan finished: {} devices, {} links", nodes.len(), links.len());
+        nm::NetworkMap { nodes, links }
+    }
+
+    /// Reads a paged ZDO management table (Mgmt_Lqi, Mgmt_Rtg); one retry after 5 s
+    async fn read_table<T>(&self, nwk: u16, cluster_id: u16, parse: fn(&[u8]) -> Result<(u8, Vec<T>)>) -> Result<Vec<T>> {
+        let read = async || -> Result<Vec<T>> {
+            let mut all = Vec::new();
+            for _ in 0..32 {
+                let rsp = self.zdo_request(nwk, cluster_id, vec![all.len() as u8]).await?;
+                let (total, page) = parse(&rsp)?;
+                let empty = page.is_empty();
+                all.extend(page);
+                if empty || all.len() >= usize::from(total) {
+                    break;
+                }
+            }
+            Ok(all)
+        };
+        match read().await {
+            Ok(all) => Ok(all),
+            Err(_) => {
+                // The network may be busy: let it settle, as Zigbee2MQTT does
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                read().await
             }
         }
     }

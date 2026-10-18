@@ -26,6 +26,9 @@ Assistant or Zigbee2MQTT needed.
   both with weekly schedules (the TRVZB takes a schedule but cannot report it, so the UI
   shows what was saved from the hub).
 - Hue lights can be factory reset by serial number (like the Hue Bridge).
+- Network map: the hub and every router report their neighbor (and optionally routing)
+  tables; the UI draws the mesh with link quality, and MQTT answers Zigbee2MQTT's
+  `bridge/request/networkmap` (`raw`, `graphviz`, `plantuml`).
 - Web UI at `http://<router>:8099`. Without a password anyone on the network can control
   every device; like Zigbee2MQTT's auth token, Settings → Web UI password protects the page
   and its API (one password, remembered per browser; kept as a salted hash). A forgotten
@@ -71,7 +74,7 @@ support; zhub trades that for a footprint that fits on a router.
 | Matter | Built-in bridge (optional build feature) | Not built in |
 | Groups and bindings | Yes | Yes, plus scenes and reporting configuration |
 | OTA firmware updates | No | Yes |
-| Network map | No | Yes |
+| Network map | Yes (web UI and MQTT: raw, Graphviz, PlantUML) | Yes |
 | Touchlink | Hue factory reset by serial number | Scan, identify and factory reset |
 | UI password | Yes (one password) | Yes (auth token) |
 | Maturity | New; used in one home | Mature, large community |

@@ -281,6 +281,33 @@ impl Bridge {
                 }
             }
             "restart" => self.hub.request_restart(),
+            "networkmap" => {
+                // "raw", or {"type": "raw", "routes": true, "transaction": …}
+                let text = String::from_utf8_lossy(payload).trim().trim_matches('"').to_owned();
+                let kind = body.get("type").and_then(Json::as_str).map_or(text, str::to_owned);
+                let routes = body.get("routes").and_then(Json::as_bool).unwrap_or(false);
+                let transaction = body.get("transaction").cloned();
+                let (hub, client, topic) = (self.hub.clone(), self.client.clone(), format!("{}/bridge/response/networkmap", self.base()));
+                // A scan takes seconds: off the bridge's loop
+                tokio::spawn(async move {
+                    let result = if z2m_networkmap_format(&kind) {
+                        let map = hub.network_map(routes).await;
+                        crate::networkmap::render(&map, &kind, routes, crate::networkmap::now_ms())
+                    } else {
+                        Err(anyhow::anyhow!("Type '{kind}' not supported, allowed are: {}", crate::networkmap::FORMATS.join(",")))
+                    };
+                    let mut response = match result {
+                        Ok(data) => json!({ "data": data, "status": "ok" }),
+                        Err(e) => json!({ "data": {}, "status": "error", "error": format!("{e:#}") }),
+                    };
+                    if let Some(t) = transaction {
+                        response["transaction"] = t;
+                    }
+                    if let Err(e) = client.publish(topic, QoS::AtLeastOnce, false, response.to_string()).await {
+                        warn!("MQTT networkmap response not sent: {e}");
+                    }
+                });
+            }
             _ => debug!("MQTT bridge request {name} not supported"),
         }
     }
@@ -974,6 +1001,10 @@ pub async fn clean_stale(hub: &Arc<Hub>) -> anyhow::Result<Vec<String>> {
     })
     .await;
     Ok(stale)
+}
+
+fn z2m_networkmap_format(kind: &str) -> bool {
+    crate::networkmap::FORMATS.contains(&kind)
 }
 
 /// Zigbee2MQTT's per-light memory between commands (the level before a fade to off)
