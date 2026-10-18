@@ -38,6 +38,16 @@ Zigbee2MQTT needed: a single static binary with an embedded web UI.
   sensors appear in Apple Home, Google Home or Home Assistant; a group can be shown as one
   light. It uses the test vendor ID, so controllers treat it as uncertified.
 
+## Screenshots
+
+| Devices | Lights |
+|---|---|
+| ![Devices: thermostats and radiator valves](docs/screenshots/devices.jpg) | ![Lights with brightness and color temperature](docs/screenshots/lights.jpg) |
+| **Device details** | **Groups** |
+| ![A light's features, as Zigbee2MQTT's Exposes tab](docs/screenshots/device-details.jpg) | ![A group with its members](docs/screenshots/groups.jpg) |
+
+<img src="docs/screenshots/mobile.jpg" alt="The device list on a phone" width="280">
+
 ## Architecture
 
 Following Zigbee2MQTT: the hub knows no device types; devices are defined as data under
