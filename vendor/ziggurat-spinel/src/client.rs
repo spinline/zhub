@@ -1,3 +1,6 @@
+// Modified by zhub (2026): transmits wait TX_TIMEOUT for their status; see
+// ../ZHUB-CHANGES.md. Original: https://github.com/zigpy/ziggurat (Apache-2.0).
+
 use crate::{
     HdlcSpecial, SPINEL_FRAME_MAX_SIZE, SpinelCommandId, SpinelFrame, SpinelFrameParsingError,
     SpinelFramePropValueIs, SpinelHeader, SpinelPropertyId, SpinelProtocol, SpinelResetReason,

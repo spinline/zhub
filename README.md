@@ -30,6 +30,9 @@ Zigbee2MQTT needed: a single static binary with an embedded web UI.
   log viewer, restart, Hue reset.
 - Values for sleepy devices are written at once and repeated until taken; ones still
   waiting survive a restart (kept in the state file).
+- Matter bridge (optional, `--features matter`): lights, thermostats and temperature
+  sensors appear in Apple Home, Google Home or Home Assistant; a group can be shown as one
+  light. It uses the test vendor ID, so controllers treat it as uncertified.
 
 ## Architecture
 
@@ -96,3 +99,24 @@ Then Settings → MQTT in zhub: broker 127.0.0.1, user zhub.
 
 Log: `/opt/var/log/zhub.log`. `--sniff` logs MAC command frames for diagnostics (the
 radio does not acknowledge frames while sniffing; use it only briefly).
+
+## Credits
+
+zhub builds on the work of these projects:
+
+- [Ziggurat](https://github.com/zigpy/ziggurat) (Apache-2.0): the Zigbee stack zhub runs
+  on, from the zigpy project. `vendor/ziggurat-spinel` is a modified copy of its Spinel
+  client (see `vendor/ziggurat-spinel/ZHUB-CHANGES.md`).
+- [rs-matter](https://github.com/project-chip/rs-matter) (Apache-2.0): the Rust Matter
+  stack behind the Matter bridge.
+- [Zigbee2MQTT](https://github.com/Koenkk/zigbee2mqtt) and
+  [zigbee-herdsman-converters](https://github.com/Koenkk/zigbee-herdsman-converters) (MIT) by
+  Koen Kanters and contributors: the device definitions, feature names and descriptions, and
+  the light command behavior are derived from zigbee-herdsman-converters; the MQTT topics
+  and payloads follow Zigbee2MQTT so that tools made for it work with zhub.
+- [Nerivec's silabs-firmware-builder](https://github.com/Nerivec/silabs-firmware-builder):
+  the OpenThread RCP firmware zhub is tested with.
+
+## License
+
+Apache License 2.0, see [LICENSE](LICENSE). Third-party notices are in [NOTICE](NOTICE).

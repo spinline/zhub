@@ -1,0 +1,46 @@
+zhub
+Copyright 2026 Bilal Karatatar
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product includes or is derived from the following third-party works.
+
+--------------------------------------------------------------------------------
+zigbee-herdsman-converters
+https://github.com/Koenkk/zigbee-herdsman-converters
+
+The device definitions in src/devices/ (fingerprints, features, labels and
+descriptions, value conversions) and the light command handling in
+src/z2m_light.rs (ported from the on_off, light_onoff_brightness,
+light_colortemp and light step/move converters) are derived from
+zigbee-herdsman-converters, which is distributed under the following license:
+
+MIT License
+
+Copyright (c) 2018 Koen Kanters
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+--------------------------------------------------------------------------------
+Ziggurat
+https://github.com/zigpy/ziggurat
+
+vendor/ziggurat-spinel is a modified copy of Ziggurat's ziggurat-spinel crate,
+licensed under the Apache License, Version 2.0 (vendor/ziggurat-spinel/LICENSE.md).
+The changes are listed in vendor/ziggurat-spinel/ZHUB-CHANGES.md.
