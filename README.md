@@ -151,6 +151,15 @@ Then Settings → MQTT in zhub: broker 127.0.0.1, user zhub.
 Log: `/opt/var/log/zhub.log`. `--sniff` logs MAC command frames for diagnostics (the
 radio does not acknowledge frames while sniffing; use it only briefly).
 
+## Roadmap
+
+- **OTA firmware updates**: an OTA server (ZCL cluster 0x0019) that serves images from
+  Zigbee2MQTT's [zigbee-OTA](https://github.com/Koenkk/zigbee-OTA) index, with a version
+  check per device, progress in the UI and Zigbee2MQTT's `ota_update` MQTT requests.
+- **More device definitions**: ported from zigbee-herdsman-converters, starting with
+  common sensors, plugs, switches and lights. Devices without a definition already work
+  through a generic definition built from their clusters.
+
 ## Credits
 
 zhub builds on the work of these projects:
