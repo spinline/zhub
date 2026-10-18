@@ -156,6 +156,9 @@ radio does not acknowledge frames while sniffing; use it only briefly).
 - **OTA firmware updates**: an OTA server (ZCL cluster 0x0019) that serves images from
   Zigbee2MQTT's [zigbee-OTA](https://github.com/Koenkk/zigbee-OTA) index, with a version
   check per device, progress in the UI and Zigbee2MQTT's `ota_update` MQTT requests.
+- **Reporting settings**: like Zigbee2MQTT's Reporting tab, per attribute minimum and
+  maximum report interval and reportable change, read from and written to the device
+  (today the hub configures reporting with fixed values taken from the definitions).
 - **More device definitions**: ported from zigbee-herdsman-converters, starting with
   common sensors, plugs, switches and lights. Devices without a definition already work
   through a generic definition built from their clusters.
