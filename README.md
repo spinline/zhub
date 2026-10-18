@@ -50,6 +50,33 @@ Assistant or Zigbee2MQTT needed.
 
 <img src="docs/screenshots/mobile.jpg" alt="The device list on a phone" width="280">
 
+## zhub and Zigbee2MQTT
+
+zhub follows [Zigbee2MQTT](https://www.zigbee2mqtt.io/)'s device model and MQTT interface, but
+is built for a smaller machine. Zigbee2MQTT is the mature choice with far wider device
+support; zhub trades that for a footprint that fits on a router.
+
+| | zhub | Zigbee2MQTT |
+|---|---|---|
+| Runtime | One static binary (Rust), no runtime to install | Node.js (22 or later) application with npm dependencies |
+| Size | 4.1 MB, or 6.0 MB with the Matter bridge (MIPS build) | npm package 1.6 MB plus 19 dependencies and Node.js; Docker image about 48 MB compressed |
+| Memory | 6.2 MB resident, 15 devices, with Matter (measured on the router) | about 50–60 MB in [one user's report](https://community.home-assistant.io/t/ha-ram-usage-optimization/535105) (Raspberry Pi 4, 21 devices) |
+| Hardware | Router-class devices; developed on a Keenetic (MIPS 1004Kc, 256 MB RAM) | Raspberry Pi, PC, NAS, Docker: anywhere Node.js runs |
+| Zigbee stack | [Ziggurat](https://github.com/zigpy/ziggurat) on the host; the dongle is only a radio | [zigbee-herdsman](https://github.com/Koenkk/zigbee-herdsman); the stack runs on the adapter |
+| Adapter firmware | OpenThread RCP (Spinel) on Silicon Labs EFR32, e.g. SONOFF ZBDongle-E | EmberZNet (Silicon Labs), Z-Stack (Texas Instruments), deCONZ (Dresden Elektronik); ZiGate, ZBOSS |
+| Network data | Kept by the host (`state.json`): reflashing or replacing the dongle needs no re-pairing | Kept on the adapter; backup and restore when changing adapters |
+| Supported devices | 9 models defined; others get a generic definition from their clusters | 5,798 devices from 608 vendors |
+| Web UI | Built in | Built in (separate frontend package) |
+| MQTT | Optional; Zigbee2MQTT topics, payloads and Home Assistant discovery | Required; the main interface |
+| Matter | Built-in bridge (optional build feature) | Not built in |
+| Groups and bindings | Yes | Yes, plus scenes and reporting configuration |
+| OTA firmware updates | No | Yes |
+| Network map | No | Yes |
+| Touchlink | Hue factory reset by serial number | Scan, identify and factory reset |
+| UI password | Yes (one password) | Yes (auth token) |
+| Maturity | New; used in one home | Mature, large community |
+| License | Apache-2.0 | GPL-3.0 |
+
 ## Architecture
 
 Following Zigbee2MQTT: the hub knows no device types; devices are defined as data under
