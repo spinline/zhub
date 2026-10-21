@@ -743,6 +743,14 @@ impl Hub {
         self.read_attributes(device.nwk, ep, cluster_id, None, attrs).await.map(drop)
     }
 
+    /// Reads any attributes of a cluster as they come (Zigbee2MQTT's `read` command), with
+    /// each one's status: a device says which it does not have
+    pub async fn read_records(&self, ieee: &str, cluster_id: u16, attrs: &[u16]) -> Result<Vec<zcl::AttributeRecord>> {
+        let device = self.device(ieee).context("device not found")?;
+        let ep = device.endpoint_with(cluster_id).context("the device does not have this cluster")?;
+        self.read_attributes(device.nwk, ep, cluster_id, None, attrs).await
+    }
+
     /// Reads the attribute behind a feature (Zigbee2MQTT's `/get`)
     pub async fn read_feature(&self, ieee: &str, key: &str) -> Result<()> {
         let device = self.device(ieee).context("device not found")?;
