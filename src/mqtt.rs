@@ -1062,14 +1062,7 @@ fn light_target(views: &[&DeviceView]) -> Option<z2m_light::Target> {
 
 /// A command from MQTT: the device or group by name (or IEEE address). Light keys run as
 /// Zigbee2MQTT's light converters do, the other keys set the hub's features.
-pub async fn apply(hub: &Arc<Hub>, name: &str, mut command: Map<String, Json>) -> anyhow::Result<()> {
-    // Zigbee2MQTT's `read`: any attributes of a cluster, for finding out what a device has
-    if let Some(spec) = command.remove("read") {
-        read(hub, name, &spec).await?;
-        if command.is_empty() {
-            return Ok(());
-        }
-    }
+pub async fn apply(hub: &Arc<Hub>, name: &str, command: Map<String, Json>) -> anyhow::Result<()> {
     let devices = hub.devices();
     let target = devices.iter().find(|d| topic_name(&d.device.name) == name || d.device.ieee == name);
     let group = hub.groups().into_iter().find(|g| topic_name(&g.name) == name);
@@ -1212,66 +1205,6 @@ fn translate_rest(command: Map<String, Json>) -> Vec<(String, anyhow::Result<Jso
         .collect()
 }
 
-/// Zigbee2MQTT's cluster names that `read` takes besides numbers
-const CLUSTER_NAMES: &[(&str, u16)] = &[("genBasic", 0x0000), ("genOnOff", 0x0006), ("genLevelCtrl", 0x0008), ("lightingColorCtrl", 0x0300)];
-
-/// Zigbee2MQTT's attribute names that `read` takes besides numbers, by cluster
-const ATTRIBUTE_NAMES: &[(u16, &str, u16)] = &[
-    (0x0006, "onOff", 0x0000),
-    (0x0006, "startUpOnOff", 0x4003),
-    (0x0008, "currentLevel", 0x0000),
-    (0x0008, "options", 0x000f),
-    (0x0008, "onOffTransitionTime", 0x0010),
-    (0x0008, "onLevel", 0x0011),
-    (0x0008, "onTransitionTime", 0x0012),
-    (0x0008, "offTransitionTime", 0x0013),
-    (0x0008, "startUpCurrentLevel", 0x4000),
-];
-
-/// `{"cluster": "genLevelCtrl" or 8, "attributes": ["onOffTransitionTime" or 16, ...]}`
-fn read_spec(spec: &Json) -> anyhow::Result<(u16, Vec<u16>)> {
-    let id = |value: &Json, names: &[(&str, u16)]| -> Option<u16> {
-        match value {
-            Json::Number(n) => n.as_u64().and_then(|n| u16::try_from(n).ok()),
-            Json::String(s) => names.iter().find(|(name, _)| name == s).map(|&(_, id)| id),
-            _ => None,
-        }
-    };
-    let raw = spec.get("cluster").context("read: a cluster (name or number)")?;
-    let cluster = id(raw, CLUSTER_NAMES).with_context(|| format!("read: unknown cluster {raw}"))?;
-    let list = spec.get("attributes").and_then(Json::as_array).filter(|a| !a.is_empty()).context("read: a list of attributes")?;
-    let names: Vec<(&str, u16)> = ATTRIBUTE_NAMES.iter().filter(|(c, _, _)| *c == cluster).map(|&(_, name, id)| (name, id)).collect();
-    let attributes = list
-        .iter()
-        .map(|a| {
-            id(a, &names).with_context(|| format!("read: unknown attribute {a} of cluster 0x{cluster:04x}"))
-        })
-        .collect::<anyhow::Result<Vec<u16>>>()?;
-    Ok((cluster, attributes))
-}
-
-/// Reads and logs each attribute: its value, or that the device does not have it
-async fn read(hub: &Arc<Hub>, name: &str, spec: &Json) -> anyhow::Result<()> {
-    let (cluster, attributes) = read_spec(spec)?;
-    let devices = hub.devices();
-    let ieee = match devices.iter().find(|d| topic_name(&d.device.name) == name || d.device.ieee == name) {
-        Some(d) => d.device.ieee.clone(),
-        None => anyhow::bail!("read: no device named {name} (a group cannot be read)"),
-    };
-    let records = hub.read_records(&ieee, cluster, &attributes).await?;
-    let text: Vec<String> = attributes
-        .iter()
-        .map(|id| match records.iter().find(|r| r.id == *id) {
-            Some(r) if r.status == 0 => format!("0x{id:04x} = {:?}", r.value),
-            Some(r) if r.status == 0x86 => format!("0x{id:04x} unsupported"),
-            Some(r) => format!("0x{id:04x} status 0x{:02x}", r.status),
-            None => format!("0x{id:04x} no answer"),
-        })
-        .collect();
-    info!("MQTT {name} read cluster 0x{cluster:04x}: {}", text.join(", "));
-    Ok(())
-}
-
 /// `<name>/get`: reads what the keys stand for, then publishes the state
 async fn get(hub: &Arc<Hub>, name: &str, keys: Vec<String>) -> anyhow::Result<()> {
     let devices = hub.devices();
@@ -1304,18 +1237,6 @@ mod tests {
     use super::*;
     use crate::devices;
     use crate::store::Device;
-
-    #[test]
-    fn read_takes_zigbee2mqtt_names_and_numbers() {
-        let spec = json!({"cluster": "genLevelCtrl", "attributes": ["onOffTransitionTime", "onTransitionTime", "offTransitionTime", 0x4000]});
-        assert_eq!(read_spec(&spec).unwrap(), (0x0008, vec![0x0010, 0x0012, 0x0013, 0x4000]));
-        assert_eq!(read_spec(&json!({"cluster": 6, "attributes": ["onOff"]})).unwrap(), (0x0006, vec![0x0000]));
-        // A name of another cluster, an unknown cluster, no attributes, a number too large
-        assert!(read_spec(&json!({"cluster": "genOnOff", "attributes": ["onLevel"]})).is_err());
-        assert!(read_spec(&json!({"cluster": "genFoo", "attributes": [0]})).is_err());
-        assert!(read_spec(&json!({"cluster": 8, "attributes": []})).is_err());
-        assert!(read_spec(&json!({"cluster": 8, "attributes": [70000]})).is_err());
-    }
 
     fn view(model: &str, state: Json) -> DeviceView {
         let mut device = Device::new("00:17:88:01:0b:1d:bc:29".into(), 0x1234);
