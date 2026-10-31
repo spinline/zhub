@@ -34,6 +34,8 @@ use crate::store::{
 use crate::zcl::{self, ReportConfig, Value, cluster, types};
 use crate::{tuya, zdo};
 
+mod scenes;
+
 /// The coordinator's own endpoint; bindings and reports arrive here
 pub const HUB_ENDPOINT: u8 = 1;
 const HA_PROFILE: u16 = 0x0104;
@@ -113,6 +115,8 @@ pub enum Event {
     Settings,
     /// Groups were created, renamed, deleted or changed members
     Groups { groups: Vec<store::Group> },
+    /// Confirmed scene metadata changed; clients refresh their scene lists.
+    Scenes,
     /// A button press or other command the device sent (Zigbee2MQTT's `action`)
     Action {
         ieee: String,
@@ -194,6 +198,7 @@ pub struct Hub {
     offline: Mutex<HashSet<String>>,
     /// One network scan at a time: a second would only double the traffic
     scanning: tokio::sync::Mutex<()>,
+    scene_lock: tokio::sync::Mutex<()>,
     mqtt_status: Mutex<String>,
 }
 
@@ -605,6 +610,7 @@ impl Hub {
             mqtt_status: Mutex::new("disabled".into()),
             offline: Mutex::new(HashSet::new()),
             scanning: tokio::sync::Mutex::new(()),
+            scene_lock: tokio::sync::Mutex::new(()),
         });
 
         tokio::spawn(hub.clone().notification_loop());
@@ -2508,6 +2514,7 @@ impl Hub {
     /// Asks every member to leave the group, then forgets it (a member that does not
     /// answer keeps the membership, which is harmless without the group)
     pub async fn delete_group(&self, id: u16) -> Result<()> {
+        let _scene_lock=self.scene_lock.lock().await;
         let members = {
             let data = self.data.lock().unwrap();
             data.groups.iter().find(|g| g.id == id).context("group not found")?.members.clone()
@@ -2517,7 +2524,11 @@ impl Hub {
                 warn!("{} did not leave group {id}: {e:#}", member.ieee);
             }
         }
-        self.data.lock().unwrap().groups.retain(|g| g.id != id);
+        {
+            let mut data=self.data.lock().unwrap();
+            data.groups.retain(|g| g.id != id);
+            data.scenes.retain(|s|s.group_id!=id);
+        }
         info!("Group {id} deleted");
         self.groups_changed();
         Ok(())
@@ -2558,6 +2569,7 @@ impl Hub {
     }
 
     pub async fn set_group_member(&self, id: u16, ieee: &str, ep: u8, add: bool) -> Result<()> {
+        let _scene_lock=self.scene_lock.lock().await;
         if !self.data.lock().unwrap().groups.iter().any(|g| g.id == id) {
             bail!("group not found");
         }
@@ -2569,6 +2581,8 @@ impl Hub {
             group.members.retain(|m| *m != member);
             if add {
                 group.members.push(member);
+            } else {
+                data.scenes.retain(|s|!(s.group_id==id && s.ieee==ieee && s.ep==ep));
             }
         }
         info!("{ieee} ep {ep} {} group {id}", if add { "joined" } else { "left" });
@@ -2910,6 +2924,7 @@ impl Hub {
         {
             let mut data = self.data.lock().unwrap();
             data.devices.remove(ieee);
+            data.scenes.retain(|s|s.ieee!=ieee);
             data.link_keys.retain(|k| k.ieee != ieee);
             data.children.retain(|c| c.ieee != ieee);
             for group in &mut data.groups {

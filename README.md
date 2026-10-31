@@ -72,13 +72,78 @@ support; zhub trades that for a footprint that fits on a router.
 | Web UI | Built in | Built in (separate frontend package) |
 | MQTT | Optional; Zigbee2MQTT topics, payloads and Home Assistant discovery | Required; the main interface |
 | Matter | Built-in bridge (optional build feature) | Not built in |
-| Groups and bindings | Yes | Yes, plus scenes and reporting configuration |
+| Groups, scenes and bindings | Yes | Yes, plus reporting configuration |
 | OTA firmware updates | No | Yes |
 | Network map | Yes (web UI and MQTT: raw, Graphviz, PlantUML) | Yes |
 | Touchlink | Hue factory reset by serial number | Scan, identify and factory reset |
 | UI password | Yes (one password) | Yes (auth token) |
 | Maturity | New; used in one home | Mature, large community |
 | License | Apache-2.0 | GPL-3.0 |
+
+## Scenes
+
+Lights with a Scenes server (`0x0005`) can keep their settings on the device.
+Open a device's **Scenes** tab (choose its endpoint and device/group scope), or
+use **Scenes** on a group card. **Store current state** captures the lights as
+they are without changing their output. **Specify values and transition** writes
+only the supplied light attributes. A group may store different values and
+transition times on each member; recalling it sends one group command.
+
+The MQTT interface follows Zigbee2MQTT. Publish one operation per message to
+`zigbee2mqtt/<device-or-group-name>/set`:
+
+```json
+{"scene_store": {"ID": 1, "name": "Normal"}}
+{"scene_add": {"ID": 2, "name": "Night", "state": "ON", "brightness": 38, "color_temp": 400, "transition": 0.2}}
+{"scene_recall": 2}
+{"scene_rename": {"ID": 2, "name": "Evening"}}
+{"scene_remove": 2}
+{"scene_remove_all": ""}
+```
+
+`scene_store`, `scene_recall` and `scene_remove` also accept a bare numeric ID.
+The ID range is 0–255; ID 0 in device scope (group 0) is reserved. For a
+multi-endpoint device, pass `ep` in the operation object. To modify just one
+member's entry in a group scene, send the operation to that device with
+`group_id` and its endpoint. It must already be a member of that group.
+For example:
+
+```json
+{"scene_add": {"ID": 2, "group_id": 3, "ep": 11, "brightness": 80, "transition": 0.2}}
+```
+
+`scene_add` accepts `state` (`ON`/`OFF`), `brightness` (0–254), and either
+`color_temp` (mireds, clamped to the light's range) or `color` (`#RRGGBB`,
+`{"x":0.3,"y":0.3}` or `{"hue":180,"saturation":80}`). Color temperature
+is encoded as XY for compatibility with older scene servers, as in Z2M.
+Integer transition times use Add Scene (seconds); fractional times use Enhanced
+Add Scene (tenths of a second, rounded down, maximum 6553.4 seconds).
+An unsupported Enhanced Add is reported as an error. Store Scene preserves the
+existing scene's transition. Saving the same ID replaces its previous settings.
+
+**Read from devices** discovers their real scene tables, including scenes set
+by another controller. Names and confirmed per-endpoint settings are kept in
+zhub's state file; MQTT bridge device/group lists include the known scene names.
+Management commands check each device's response. Partial group installations
+are shown explicitly and cannot be recalled until every current member has
+that scene. Retry the operation or read the device tables after an error.
+Deleting scenes is scoped to the selected group and endpoint. Changing group
+membership may leave a scene incomplete until saved on the new members.
+
+For zauto, zhub also publishes a retained `<base>/bridge/scenes` array of
+complete scene predictions (`target`, `id`, `state`, `transition`). This is a
+zhub extension. Only attributes set on every group member are predicted;
+brightness uses the group's maximum and on/off uses any-on, matching group
+state reporting. The payload is published on changes and on broker reconnect.
+
+HTTP API (protected by the existing UI password):
+
+- `GET /api/scenes?target=group%3A3` (or a device IEEE/name, optional `ep` and `group_id`).
+- `POST /api/scenes/refresh` with `{"target":"group:3"}`.
+- `POST /api/scenes` with `{"target":"group:3","command":"scene_recall","value":2}`.
+
+This adds Zigbee scenes and MQTT/UI management. It does not expose scenes to
+Matter controllers or change existing zauto rules automatically.
 
 ## Architecture
 

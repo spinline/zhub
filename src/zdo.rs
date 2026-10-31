@@ -281,7 +281,7 @@ pub fn our_active_ep_rsp(nwk: u16, endpoint: u8) -> Vec<u8> {
 pub fn our_simple_desc_rsp(nwk: u16, endpoint: u8) -> Vec<u8> {
     // Basic, Identify and Time: some devices (SONOFF TRVZB) read the time from the hub
     let in_clusters: [u16; 3] = [0x0000, 0x0003, 0x000A];
-    let out_clusters: [u16; 7] = [0x0001, 0x0006, 0x0008, 0x0300, 0x0402, 0x0405, 0x0500];
+    let out_clusters: [u16; 9] = [0x0001, 0x0004, 0x0005, 0x0006, 0x0008, 0x0300, 0x0402, 0x0405, 0x0500];
     let mut desc = vec![endpoint];
     desc.extend_from_slice(&0x0104u16.to_le_bytes());
     desc.extend_from_slice(&0x0400u16.to_le_bytes()); // IAS merkezi kontrol birimi
@@ -376,5 +376,6 @@ mod tests {
         let ep = parse_simple_desc_rsp(&our_simple_desc_rsp(0x0000, 1)).unwrap();
         assert_eq!(ep.id, 1);
         assert!(ep.out_clusters.contains(&0x0500));
+        assert!(ep.out_clusters.contains(&0x0005));
     }
 }

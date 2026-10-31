@@ -71,6 +71,7 @@ struct Bridge {
     discovery: HashMap<String, BTreeMap<String, String>>,
     /// A device or group got a new topic: bridge/info lists the names too
     renamed: bool,
+    scene_payload: Option<String>,
 }
 
 async fn session(hub: Arc<Hub>, cfg: MqttSettings) {
@@ -115,6 +116,7 @@ async fn session(hub: Arc<Hub>, cfg: MqttSettings) {
         state_topics: HashMap::new(),
         discovery: HashMap::new(),
         renamed: false,
+        scene_payload: None,
     };
     let mut events = hub.subscribe();
     loop {
@@ -125,6 +127,7 @@ async fn session(hub: Arc<Hub>, cfg: MqttSettings) {
                     info!("MQTT connected to {}:{}", bridge.cfg.host, bridge.cfg.port);
                     bridge.state_topics.clear();
                     bridge.discovery.clear();
+                    bridge.scene_payload = None;
                     bridge.connected().await;
                 }
                 Some(Some((topic, payload))) => bridge.incoming(&topic, &payload).await,
@@ -196,7 +199,12 @@ impl Bridge {
         }
     }
 
-    async fn publish_bridge_lists(&self, devices: &[DeviceView]) {
+    async fn publish_bridge_lists(&mut self, devices: &[DeviceView]) {
+        let payload=serde_json::to_string(&self.hub.automation_scenes()).unwrap();
+        if self.scene_payload.as_ref()!=Some(&payload) {
+            self.publish(&format!("{}/bridge/scenes",self.base()),payload.clone(),true).await;
+            self.scene_payload=Some(payload);
+        }
         let list: Vec<Json> = devices
             .iter()
             .map(|v| {
@@ -212,6 +220,10 @@ impl Bridge {
                     "disabled": false,
                     "interviewing": v.interviewing,
                     "interview_completed": v.device.interviewed,
+                    "endpoints": v.device.endpoints.iter().map(|ep| (ep.id.to_string(),json!({
+                        "clusters":{"input":ep.in_clusters,"output":ep.out_clusters},
+                        "scenes":self.hub.scene_list(&v.device.ieee,Some(ep.id),None).unwrap_or_default().iter().map(|s|json!({"id":s["id"],"name":s["name"]})).collect::<Vec<_>>()
+                    }))).collect::<Map<String,Json>>(),
                     "definition": v.definition.map(|d| json!({
                         "model": v.device.model,
                         "vendor": d.vendor,
@@ -234,6 +246,7 @@ impl Bridge {
                 json!({
                     "id": g.id,
                     "friendly_name": topic_name(&g.name),
+                    "scenes": self.hub.scene_list(&format!("group:{}",g.id),None,None).unwrap_or_default(),
                     "members": g.members.iter().map(|m| json!({"ieee_address": m.ieee, "endpoint": m.ep})).collect::<Vec<_>>(),
                 })
             })
@@ -322,6 +335,9 @@ impl Bridge {
                     self.group_state(group, &devices).await;
                 }
                 self.publish_bridge_lists(&devices).await;
+            }
+            Event::Scenes => {
+                self.publish_bridge_lists(&self.hub.devices()).await;
             }
             Event::Removed { ieee } => {
                 self.clear(&ieee).await;
@@ -1063,6 +1079,11 @@ fn light_target(views: &[&DeviceView]) -> Option<z2m_light::Target> {
 /// A command from MQTT: the device or group by name (or IEEE address). Light keys run as
 /// Zigbee2MQTT's light converters do, the other keys set the hub's features.
 pub async fn apply(hub: &Arc<Hub>, name: &str, command: Map<String, Json>) -> anyhow::Result<()> {
+    let scene_keys:Vec<_>=command.keys().filter(|k|crate::scenes::KEYS.contains(&k.as_str())).collect();
+    if !scene_keys.is_empty() {
+        anyhow::ensure!(command.len()==1, "send one scene operation per MQTT message, without other light commands");
+        return hub.scene_apply(name,scene_keys[0],&command[scene_keys[0]]).await;
+    }
     let devices = hub.devices();
     let target = devices.iter().find(|d| topic_name(&d.device.name) == name || d.device.ieee == name);
     let group = hub.groups().into_iter().find(|g| topic_name(&g.name) == name);

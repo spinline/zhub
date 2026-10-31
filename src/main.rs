@@ -7,6 +7,7 @@ mod matter;
 mod mqtt;
 mod networkmap;
 mod radio;
+mod scenes;
 mod sniff;
 mod thermostat;
 mod store;

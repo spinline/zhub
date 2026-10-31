@@ -127,6 +127,12 @@
   .slot input { width: 100%; }
   .slot span { color: var(--muted); }
 
+  dialog#scenesDlg { width: min(680px, calc(100vw - 32px)); max-height: 85vh; overflow: auto; border: 1px solid var(--line); border-radius: 14px; background: var(--card); color: var(--text); padding: 20px; }
+  .scene-row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; padding:10px 0; border-bottom:1px solid var(--line); }
+  .scene-row .scene-name { flex:1; min-width:140px; }
+  .scene-form { display:grid; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); gap:10px; margin:12px 0; }
+  .scene-form input, .scene-form select { width:100%; box-sizing:border-box; }
+  dialog#scenesDlg::backdrop { background:rgba(0,0,0,.45); }
   dialog#detail {
     width: min(720px, calc(100% - 24px)); max-height: calc(100% - 24px); padding: 0;
     border: 1px solid var(--line); border-radius: 16px; background: var(--card); color: var(--text);
@@ -328,6 +334,8 @@
   <nav class="tabs" id="dlgTabs"></nav>
   <div class="panel" id="dlgPanel"></div>
 </dialog>
+
+<dialog id="scenesDlg"><div class="row" style="justify-content:space-between"><h3 id="scenesTitle" style="margin:0">Scenes</h3><button id="scenesClose">Close</button></div><div id="scenesPanel"></div></dialog>
 
 <dialog id="loginDlg">
   <form id="loginForm" method="dialog">
@@ -875,7 +883,7 @@ $("#dlgClose").onclick = () => $("#detail").close();
 $("#detail").addEventListener("close", () => { detail.ieee = null; });
 $("#detail").addEventListener("click", (e) => { if (e.target === $("#detail")) $("#detail").close(); });
 
-const TABS = [["about", "About"], ["exposes", "Exposes"], ["bind", "Bind"], ["settings", "Settings"], ["state", "State"], ["clusters", "Clusters"]];
+const TABS = [["about", "About"], ["exposes", "Exposes"], ["bind", "Bind"], ["scenes", "Scenes"], ["settings", "Settings"], ["state", "State"], ["clusters", "Clusters"]];
 
 function renderDetail() {
   const d = devices.get(detail.ieee);
@@ -892,11 +900,14 @@ function renderDetail() {
       return b;
     }));
   }
-  for (const b of $("#dlgTabs").children) b.classList.toggle("active", b.dataset.tab === detail.tab);
+  for (const b of $("#dlgTabs").children) {
+    b.classList.toggle("active", b.dataset.tab === detail.tab);
+    b.hidden = b.dataset.tab === "scenes" && !d.endpoints.some(ep => ep.in_clusters.includes(5));
+  }
   // Rebuild a tab only when its structure changes; otherwise just update its values
   const sig = detail.tab + "|" + signature(d);
   if (detail.signature !== sig) {
-    detail.view = { about: aboutTab, exposes: exposesTab, bind: bindTab, settings: settingsTab, state: stateTab, clusters: clustersTab }[detail.tab](d);
+    detail.view = { about: aboutTab, exposes: exposesTab, bind: bindTab, scenes: scenesTab, settings: settingsTab, state: stateTab, clusters: clustersTab }[detail.tab](d);
     detail.signature = sig;
     $("#dlgPanel").replaceChildren(detail.view.node);
   }
@@ -1221,6 +1232,99 @@ $("#hueReset").onclick = () => {
     .finally(() => { button.disabled = false; button.textContent = "Reset"; }));
 };
 
+// ---- Scenes ----
+
+const scenePanels = new Set();
+function scenePanel(target, ep = null) {
+  const node = el("div");
+  const note = el("p", { className: "desc", textContent: "Scenes are stored on the lights. A group recalls each member’s own settings with one command. Saving does not change the current light output." });
+  const list = el("div");
+  const status = el("div", { className: "desc", role: "status", style: "margin:8px 0" });
+  const groupSelect = el("select");
+  const deviceGroups = ep == null ? [] : groups.filter(g => g.members.some(m => m.ieee === target && m.ep === ep));
+  groupSelect.append(el("option", { value: "0", textContent: "Device scenes" }), ...deviceGroups.map(g => el("option", { value: String(g.id), textContent: `Group: ${g.name}` })));
+  const scope = () => ({ target, ...(ep == null ? {} : { ep, group_id: Number(groupSelect.value) }) });
+  const options = () => ep == null ? {} : { ep, group_id: Number(groupSelect.value) };
+  let rows = [], busy = false;
+  const tracked = [];
+  const button = (text, fn, className = "") => {
+    const b = el("button", { textContent: text, type: "button", className, disabled: busy });
+    b.onclick = () => run(execute(fn)); tracked.push(b); return b;
+  };
+  async function execute(fn) {
+    if (busy) return;
+    busy = true; groupSelect.disabled = true; tracked.forEach(b => b.disabled = true); status.textContent = "Working…";
+    try { await fn(); status.textContent = "Done"; }
+    catch (e) { status.textContent = e.message; throw e; }
+    finally { busy = false; groupSelect.disabled = false; tracked.forEach(b => b.disabled = false); await refresh().catch(() => {}); }
+  }
+  async function send(command, value) { return api("/api/scenes", { target, command, value: { ...value, ...options() } }); }
+  async function refresh() {
+    const q = new URLSearchParams(scope());
+    rows = (await api(`/api/scenes?${q}`, null, "GET")).scenes;
+    for (let i=tracked.length-1;i>=0;i--) if (list.contains(tracked[i])) tracked.splice(i,1);
+    list.replaceChildren(...(rows.length ? rows.map(s => {
+      const name = el("div", { className: "scene-name" }, el("div", { textContent: `${s.id} · ${s.name}` }),
+        el("div", { className: "desc", textContent: `${s.installed}/${s.members} devices${s.complete ? "" : " · incomplete"} · ${s.entries.map(e => e.transition).filter((v,i,a) => a.indexOf(v) === i).join(" / ")} s transition` }));
+      const recall = button("Recall", () => send("scene_recall", { ID: s.id }).then(() => toast("Scene sent")));
+      recall.disabled = busy || !s.complete;
+      const rename = button("Rename", async () => { const name = prompt("Scene name", s.name); if (name?.trim()) await send("scene_rename", { ID: s.id, name }); });
+      const remove = button("Delete", async () => { if (confirm(`Delete scene “${s.name}” from this device/group?`)) await send("scene_remove", { ID: s.id }); }, "danger");
+      return el("div", { className: "scene-row" }, name, recall, rename, remove);
+    }) : [el("p", { className: "desc", textContent: "No known scenes. Read from devices to discover existing scenes, or save a new one." })]));
+  }
+  const read = button("Read from devices", async () => { await api("/api/scenes/refresh", scope()); });
+  const removeAll = button("Delete all", async () => {
+    if (confirm("Delete every scene in the selected device/group scope?")) await send("scene_remove_all", {});
+  }, "danger");
+  const id = el("input", { type: "number", min: 0, max: 255, step: 1, value: "1", required: true });
+  const name = el("input", { type: "text", placeholder: "e.g. Normal", maxLength: 64 });
+  const entry = () => { if (!id.reportValidity()) throw new Error("Choose a scene ID from 0 to 255"); return { ID: Number(id.value), ...(name.value.trim() ? { name: name.value.trim() } : {}) }; };
+  const overwrite = v => !rows.some(s => s.id === v.ID) || confirm(`Replace scene ${v.ID}?`);
+  const label = (text, input) => el("label", {}, el("div", { className: "label", textContent: text }), input);
+  const store = button("Store current state", async () => { const v = entry(); if (overwrite(v)) await send("scene_store", v); });
+  const state = el("select", {}, el("option", { value: "", textContent: "Unchanged" }), el("option", { value: "ON", textContent: "On" }), el("option", { value: "OFF", textContent: "Off" }));
+  const brightness = el("input", { type: "number", min: 0, max: 254, step: 1, placeholder: "Unchanged" });
+  const ct = el("input", { type: "number", min: 0, max: 65534, step: 1, placeholder: "Unchanged" });
+  const color = el("input", { type: "text", placeholder: "#RRGGBB", pattern: "#[0-9a-fA-F]{6}" });
+  const transition = el("input", { type: "number", min: 0, max: 65534, step: 0.1, value: "0" });
+  const add = button("Save specified values", async () => {
+    const v = entry();
+    if (![brightness, ct, color, transition].every(i => i.reportValidity())) throw new Error("Check the scene values");
+    if (ct.value && color.value) throw new Error("Choose color temperature or color, not both");
+    v.transition = Number(transition.value || 0);
+    if (state.value) v.state = state.value;
+    if (brightness.value !== "") v.brightness = Number(brightness.value);
+    if (ct.value !== "") v.color_temp = Number(ct.value);
+    if (color.value) v.color = color.value;
+    if (overwrite(v)) await send("scene_add", v);
+  });
+  const specific = el("details", {}, el("summary", { textContent: "Specify values and transition" }),
+    el("p", { className: "desc", textContent: "Only specified attributes are changed when recalled. Temperature is in mireds (250 = 4000 K). Fractional transitions use tenths of a second, up to 6553.4 s." }),
+    el("div", { className: "scene-form" }, label("State", state), label("Brightness (0–254)", brightness), label("Color temperature", ct), label("Color (optional)", color), label("Transition (seconds)", transition)), add);
+  node.append(note);
+  if (ep != null) { groupSelect.onchange = () => run(refresh()); node.append(label("Scene scope", groupSelect)); }
+  node.append(el("div", { className: "actions" }, read, removeAll), status, list,
+    el("div", { className: "scene-form" }, label("Scene ID (0–255)", id), label("Scene name", name)), store, specific,
+    el("p", { className: "desc", textContent: "Device scene 0 is reserved. Scene names and per-device installation status are kept by zhub. A failed group operation may have succeeded on some members; read the devices or retry." }));
+  const panel = { node, refresh }; scenePanels.add(panel); run(refresh()); return panel;
+}
+function scenesTab(d) {
+  const endpoints = d.endpoints.filter(e => e.in_clusters.includes(5));
+  const node = el("div");
+  if (!endpoints.length) { node.textContent = "This device does not support Zigbee Scenes."; return { node, update() {} }; }
+  const select = el("select", {}, ...endpoints.map(e => el("option", { value: String(e.id), textContent: `Endpoint ${e.id}` })));
+  const content = el("div");
+  const show = () => content.replaceChildren(scenePanel(d.ieee, Number(select.value)).node);
+  select.onchange = show; node.append(select, content); show(); return { node, update() {} };
+}
+$("#scenesClose").onclick = () => $("#scenesDlg").close();
+function openGroupScenes(g) {
+  $("#scenesTitle").textContent = `${g.name} · Scenes`;
+  $("#scenesPanel").replaceChildren(scenePanel(`group:${g.id}`).node);
+  $("#scenesDlg").showModal();
+}
+
 // ---- Groups ----
 
 // Group state follows the members: on if any is on, the brightest level, the first
@@ -1281,6 +1385,10 @@ function buildGroupCard(g) {
   const ctRow = el("label", { className: "slider" }, "Color temp", ct, ctText);
   card.append(levelRow, ctRow);
 
+  const sceneButton = el("button", { textContent: "Scenes" });
+  sceneButton.onclick = () => openGroupScenes(current);
+  card.append(el("div", { className: "actions" }, sceneButton));
+
   // Members and management
   const memberList = el("div");
   const add = el("select");
@@ -1321,6 +1429,7 @@ function buildGroupCard(g) {
     card,
     update(g) {
       current = g;
+      sceneButton.hidden = !g.members.length || !g.members.every(m => devices.get(m.ieee)?.endpoints.some(ep => ep.id === m.ep && ep.in_clusters.includes(5)));
       const v = groupView(g);
       name.textContent = g.name;
       sub.textContent = `${g.members.length} member${g.members.length === 1 ? "" : "s"}`;
@@ -1820,6 +1929,8 @@ function connect() {
     } else if (event.type === "groups") {
       groups = event.groups;
       render();
+    } else if (event.type === "scenes") {
+      scenePanels.forEach(panel => { if (panel.node.isConnected) run(panel.refresh()); else scenePanels.delete(panel); });
     } else if (event.type === "settings") {
       run(load());
     }

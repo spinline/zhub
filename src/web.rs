@@ -23,6 +23,8 @@ pub fn router(hub: Arc<Hub>) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/api/state", get(state))
+        .route("/api/scenes", get(scene_list).post(scene_command))
+        .route("/api/scenes/refresh", post(scene_refresh))
         .route("/api/events", get(events))
         .route("/api/permit_join", post(permit_join))
         .route("/api/hue_reset", post(hue_reset))
@@ -152,6 +154,33 @@ impl<E: Into<anyhow::Error>> From<E> for ApiError {
 }
 
 type ApiResult = Result<Json<serde_json::Value>, ApiError>;
+
+#[derive(Deserialize)]
+struct SceneTarget {
+    target: String,
+    ep: Option<u8>,
+    group_id: Option<u16>,
+}
+
+async fn scene_list(State(hub): State<Arc<Hub>>, Query(q): Query<SceneTarget>) -> ApiResult {
+    Ok(Json(json!({"scenes":hub.scene_list(&q.target,q.ep,q.group_id)?})))
+}
+
+async fn scene_refresh(State(hub): State<Arc<Hub>>, Json(q): Json<SceneTarget>) -> ApiResult {
+    Ok(Json(json!({"scenes":hub.scene_refresh(&q.target,q.ep,q.group_id).await?})))
+}
+
+#[derive(Deserialize)]
+struct SceneCommand {
+    target: String,
+    command: String,
+    value: serde_json::Value,
+}
+
+async fn scene_command(State(hub): State<Arc<Hub>>, Json(q): Json<SceneCommand>) -> ApiResult {
+    hub.scene_apply(&q.target,&q.command,&q.value).await?;
+    ok()
+}
 
 fn ok() -> ApiResult {
     Ok(Json(json!({ "ok": true })))

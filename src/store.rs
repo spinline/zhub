@@ -390,6 +390,9 @@ impl Device {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Persisted {
+    /// Confirmed device-side Scenes table entries, keyed by endpoint/group/id.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scenes: Vec<crate::scenes::StoredScene>,
     pub network: Option<NetworkData>,
     #[serde(default)]
     pub settings: Settings,
