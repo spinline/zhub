@@ -9,7 +9,17 @@ PIDFILE=/opt/var/run/zhub.pid
 MAX_LOG=1048576
 
 running() {
-    [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null
+    [ -f "$PIDFILE" ] || return 1
+    supervisor_pid=$(cat "$PIDFILE")
+    case "$supervisor_pid" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    kill -0 "$supervisor_pid" 2>/dev/null || return 1
+    # /opt is persistent: after a power loss the old PID may belong to
+    # an unrelated process. Only accept our own supervisor's command line.
+    [ -r "/proc/$supervisor_pid/cmdline" ] || return 1
+    tr '\000' '\n' < "/proc/$supervisor_pid/cmdline" |
+        grep -Fx '/opt/etc/init.d/S99zhub' > /dev/null
 }
 
 start() {
