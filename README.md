@@ -49,7 +49,7 @@ Assistant or Zigbee2MQTT needed.
 |---|---|
 | ![Devices: thermostats and radiator valves](docs/screenshots/devices.jpg) | ![Lights with brightness and color temperature](docs/screenshots/lights.jpg) |
 | **Device details** | **Groups** |
-| ![A light's features, as Zigbee2MQTT's Exposes tab](docs/screenshots/device-details.jpg) | ![A group with its members](docs/screenshots/groups.jpg) |
+| ![A light's Scenes tab with stored scenes and recall controls](docs/screenshots/device-details.jpg) | ![A group with its members](docs/screenshots/groups.jpg) |
 
 <img src="docs/screenshots/mobile.jpg" alt="The device list on a phone" width="280">
 
