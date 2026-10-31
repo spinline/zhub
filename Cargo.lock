@@ -2027,7 +2027,7 @@ dependencies = [
 [[package]]
 name = "rs-matter"
 version = "0.4.1"
-source = "git+https://github.com/project-chip/rs-matter?rev=c69916a5a78957d46500145486df375acf4ab490#c69916a5a78957d46500145486df375acf4ab490"
+source = "git+https://github.com/project-chip/rs-matter?rev=14baec0955483b794680bb0c56bb7f4faa2741dc#14baec0955483b794680bb0c56bb7f4faa2741dc"
 dependencies = [
  "aes",
  "async-io",
@@ -2082,7 +2082,7 @@ dependencies = [
 [[package]]
 name = "rs-matter-codegen"
 version = "0.4.1"
-source = "git+https://github.com/project-chip/rs-matter?rev=c69916a5a78957d46500145486df375acf4ab490#c69916a5a78957d46500145486df375acf4ab490"
+source = "git+https://github.com/project-chip/rs-matter?rev=14baec0955483b794680bb0c56bb7f4faa2741dc#14baec0955483b794680bb0c56bb7f4faa2741dc"
 dependencies = [
  "convert_case",
  "miette",
@@ -2101,7 +2101,7 @@ dependencies = [
 [[package]]
 name = "rs-matter-macros"
 version = "0.4.1"
-source = "git+https://github.com/project-chip/rs-matter?rev=c69916a5a78957d46500145486df375acf4ab490#c69916a5a78957d46500145486df375acf4ab490"
+source = "git+https://github.com/project-chip/rs-matter?rev=14baec0955483b794680bb0c56bb7f4faa2741dc#14baec0955483b794680bb0c56bb7f4faa2741dc"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -3096,7 +3096,7 @@ dependencies = [
 [[package]]
 name = "ziggurat-driver"
 version = "0.1.0"
-source = "git+https://github.com/zigpy/ziggurat?rev=913a5c247b611ac1ffa0bb7f9feaa9e59d656336#913a5c247b611ac1ffa0bb7f9feaa9e59d656336"
+source = "git+https://github.com/zigpy/ziggurat?rev=b82229ade28bf9b077a19afaec7d85166f721cdd#b82229ade28bf9b077a19afaec7d85166f721cdd"
 dependencies = [
  "abstract-bits",
  "arbitrary-int",
@@ -3114,7 +3114,7 @@ dependencies = [
 [[package]]
 name = "ziggurat-ieee-802154"
 version = "0.1.0"
-source = "git+https://github.com/zigpy/ziggurat?rev=913a5c247b611ac1ffa0bb7f9feaa9e59d656336#913a5c247b611ac1ffa0bb7f9feaa9e59d656336"
+source = "git+https://github.com/zigpy/ziggurat?rev=b82229ade28bf9b077a19afaec7d85166f721cdd#b82229ade28bf9b077a19afaec7d85166f721cdd"
 dependencies = [
  "abstract-bits",
  "educe",
@@ -3127,7 +3127,7 @@ dependencies = [
 [[package]]
 name = "ziggurat-phy"
 version = "0.1.0"
-source = "git+https://github.com/zigpy/ziggurat?rev=913a5c247b611ac1ffa0bb7f9feaa9e59d656336#913a5c247b611ac1ffa0bb7f9feaa9e59d656336"
+source = "git+https://github.com/zigpy/ziggurat?rev=b82229ade28bf9b077a19afaec7d85166f721cdd#b82229ade28bf9b077a19afaec7d85166f721cdd"
 dependencies = [
  "thiserror 2.0.21",
  "ziggurat-ieee-802154",
@@ -3136,7 +3136,7 @@ dependencies = [
 [[package]]
 name = "ziggurat-phy-spinel"
 version = "0.1.0"
-source = "git+https://github.com/zigpy/ziggurat?rev=913a5c247b611ac1ffa0bb7f9feaa9e59d656336#913a5c247b611ac1ffa0bb7f9feaa9e59d656336"
+source = "git+https://github.com/zigpy/ziggurat?rev=b82229ade28bf9b077a19afaec7d85166f721cdd#b82229ade28bf9b077a19afaec7d85166f721cdd"
 dependencies = [
  "parking_lot",
  "tokio",
@@ -3148,7 +3148,7 @@ dependencies = [
 [[package]]
 name = "ziggurat-protocol"
 version = "0.1.0"
-source = "git+https://github.com/zigpy/ziggurat?rev=913a5c247b611ac1ffa0bb7f9feaa9e59d656336#913a5c247b611ac1ffa0bb7f9feaa9e59d656336"
+source = "git+https://github.com/zigpy/ziggurat?rev=b82229ade28bf9b077a19afaec7d85166f721cdd#b82229ade28bf9b077a19afaec7d85166f721cdd"
 dependencies = [
  "abstract-bits",
  "arbitrary-int",
@@ -3176,7 +3176,7 @@ dependencies = [
 [[package]]
 name = "ziggurat-zigbee"
 version = "0.1.0"
-source = "git+https://github.com/zigpy/ziggurat?rev=913a5c247b611ac1ffa0bb7f9feaa9e59d656336#913a5c247b611ac1ffa0bb7f9feaa9e59d656336"
+source = "git+https://github.com/zigpy/ziggurat?rev=b82229ade28bf9b077a19afaec7d85166f721cdd#b82229ade28bf9b077a19afaec7d85166f721cdd"
 dependencies = [
  "abstract-bits",
  "aes",

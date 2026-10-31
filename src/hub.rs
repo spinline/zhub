@@ -1136,6 +1136,9 @@ impl Hub {
                 );
             }
             ZigbeeNotification::RouteRecord { .. } => {}
+            // Green Power commissioning/security and device decoding are not
+            // implemented by zhub yet; these are not normal APS device reports.
+            ZigbeeNotification::ReceivedGpdf { .. } => {}
         }
     }
 
