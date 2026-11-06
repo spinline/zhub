@@ -418,6 +418,7 @@ impl Bridge {
             if let Some(light) = light {
                 let mut config = light;
                 config.insert("name".into(), Json::Null);
+                config.insert("command_topic".into(), json!(format!("{topic}/set")));
                 config.insert("unique_id".into(), json!(format!("zhub_group_{}_light", group.id)));
                 config.insert(
                     "device".into(),
@@ -614,13 +615,19 @@ fn device_discovery(view: &DeviceView, cfg: &MqttSettings, state_topic: &str) ->
     let mut configs = BTreeMap::new();
     let ieee = view.device.ieee.replace(':', "");
     let command_topic = format!("{state_topic}/set");
-    let device = json!({
+    let mut device = json!({
         "identifiers": [format!("zhub_{ieee}")],
         "name": view.device.name,
-        "model": view.device.model,
         "manufacturer": view.definition.map_or(view.device.manufacturer.as_deref().unwrap_or_default(), |d| d.vendor),
-        "sw_version": view.device.firmware,
     });
+    // Home Assistant requires strings for optional device metadata; null rejects
+    // every entity and trigger using this device, including the primary light.
+    if let Some(model) = &view.device.model {
+        device["model"] = json!(model);
+    }
+    if let Some(firmware) = &view.device.firmware {
+        device["sw_version"] = json!(firmware);
+    }
     let feature = |key: &str| view.features.iter().find(|f| f.key == key);
     let mut covered: &[&str] = &[];
     let mut triggers = Vec::new();
@@ -1309,6 +1316,31 @@ mod tests {
         assert_eq!(power_on["options"], json!(["off", "on", "toggle", "previous"]));
         assert_eq!(power_on["command_template"], r#"{"power_on_behavior": "{{ value }}"}"#);
         assert!(configs.keys().any(|k| k.starts_with("homeassistant/button/") && k.contains("/identify/")));
+    }
+
+    #[test]
+    fn discovery_omits_unknown_device_metadata_for_all_entities() {
+        for model in ["LTA009", "RDM001"] {
+            let mut v = view(model, json!({}));
+            v.device.model = None;
+            let configs = device_discovery(&v, &cfg(), "zigbee2mqtt/Living room");
+            assert!(!configs.is_empty());
+            for (topic, config) in configs {
+                let device = config["device"].as_object().unwrap();
+                assert!(!device.contains_key("sw_version"), "{topic}");
+                assert!(!device.contains_key("model"), "{topic}");
+            }
+        }
+    }
+
+    #[test]
+    fn discovery_preserves_known_device_metadata() {
+        let mut v = view("LTA009", json!({}));
+        v.device.firmware = Some("1.2.3".into());
+        for config in device_discovery(&v, &cfg(), "zigbee2mqtt/Living room").values() {
+            assert_eq!(config["device"]["model"], "LTA009");
+            assert_eq!(config["device"]["sw_version"], "1.2.3");
+        }
     }
 
     #[test]
