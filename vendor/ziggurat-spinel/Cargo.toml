@@ -8,7 +8,7 @@ license = "Apache-2.0"
 repository = "https://github.com/zigpy/ziggurat"
 
 [dependencies]
-ziggurat-ieee-802154 = { git = "https://github.com/zigpy/ziggurat", rev = "b82229ade28bf9b077a19afaec7d85166f721cdd" }
+ziggurat-ieee-802154 = { git = "https://github.com/zigpy/ziggurat", rev = "f917f9898a1c7da2e5e5aa9add7c6d9d6a48ee76" }
 
 crc_all = "0.2.2"
 tracing = "0.1"

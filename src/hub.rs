@@ -1548,6 +1548,7 @@ impl Hub {
                 src_ep,
                 dst_ep,
                 if aps_ack { ApsAck::Request } else { ApsAck::None },
+                None, // allocate a fresh APS counter
                 RADIUS,
                 data,
                 None,

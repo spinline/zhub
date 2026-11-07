@@ -173,12 +173,12 @@ fn qr_svg(text: &str) -> Result<String, Error> {
 }
 
 /// The data model: root endpoint, the aggregator and the bridged devices (see `bridge`)
-fn data_model<'a>(bridge: &'a bridge::Bridge, mut rand: impl rand::Rng + Copy) -> impl DataModel + 'a {
+fn data_model<'a>(bridge: &'a bridge::Bridge, matter: &'a Matter<'a>, mut rand: impl rand::Rng + Copy) -> impl DataModel + 'a {
     (
         bridge::BridgeNode(bridge),
         endpoints::EthSysHandlerBuilder::new()
             .netif_diag(&SysNetifs)
-            .build(rand)
+            .build(matter, rand)
             .chain(
                 |e, c| e == bridge::AGGREGATOR_ENDPOINT && c == desc::DescHandler::CLUSTER.id,
                 Async(desc::DescHandler::new_aggregator(Dataver::new_rand(&mut rand)).adapt()),
@@ -189,7 +189,7 @@ fn data_model<'a>(bridge: &'a bridge::Bridge, mut rand: impl rand::Rng + Copy) -
             )
             .chain(
                 |e, c| e > bridge::AGGREGATOR_ENDPOINT && c == groups::GroupsHandler::CLUSTER.id,
-                Async(groups::GroupsHandler::new(Dataver::new_rand(&mut rand)).adapt()),
+                Async(groups::GroupsHandler::new(Dataver::new_rand(&mut rand), matter).adapt()),
             )
             .chain(bridge::BridgedHandler::handles, bridge::BridgedHandler(bridge)),
     )
@@ -260,7 +260,7 @@ async fn run(
     let rand = crypto.rand()?;
     let bridge = bridge::Bridge::new(hub.clone(), rt.clone());
     bridge.sync(&NoNotify);
-    let im = InteractionModel::new(&matter, &crypto, &buffers, data_model(&bridge, rand), &kv, &state);
+    let im = InteractionModel::new(&matter, &crypto, &buffers, data_model(&bridge, &matter, rand), &kv, &state);
     im.startup().await?;
 
     let responder = DefaultResponder::new(&im);
@@ -277,7 +277,15 @@ async fn run(
     // Pairing codes, computed once
     let mut buf = [0u8; 128];
     let payload: QrPayload<'_, NoOptionalData> =
-        QrPayload::new_from_basic_info(DiscoveryCapabilities::IP, CommFlowType::Standard, comm.clone(), dev_det, no_optional_data as _);
+        QrPayload::new(
+            DiscoveryCapabilities::IP,
+            CommFlowType::Standard,
+            comm.clone(),
+            dev_det.vid,
+            dev_det.pid,
+            dev_det.serial_no,
+            no_optional_data as _,
+        );
     let qr = payload.as_str(&mut buf)?.0.to_owned();
     let qr_svg = qr_svg(&qr)?;
     let manual_code = group_code(&comm.compute_pairing_code());
