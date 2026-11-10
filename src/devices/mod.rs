@@ -530,6 +530,7 @@ const DEFINITIONS: &[&Definition] = &[
     &sonoff::SNZB_02P,
     &sonoff::TRVZB,
     &tuya::ZWT07,
+    &tuya::TS011F,
 ];
 
 pub fn definition(device: &Device) -> Option<&'static Definition> {
@@ -562,7 +563,9 @@ pub fn card(device: &Device) -> Card {
     }
     let features = common::from_clusters(device);
     let has = |key: &str| features.iter().any(|f| f.key == key);
-    if has("on") && device.router {
+    if has("power") {
+        Card::Generic
+    } else if has("on") && device.router {
         Card::Light
     } else if ["temperature", "humidity", "occupancy", "alarm"].iter().any(|k| has(k)) {
         Card::Sensor

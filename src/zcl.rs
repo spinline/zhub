@@ -33,6 +33,8 @@ pub mod cluster {
     pub const HUMIDITY: u16 = 0x0405;
     pub const OCCUPANCY: u16 = 0x0406;
     pub const IAS_ZONE: u16 = 0x0500;
+    pub const METERING: u16 = 0x0702;
+    pub const ELECTRICAL_MEASUREMENT: u16 = 0x0B04;
 }
 
 pub mod types {
@@ -42,6 +44,7 @@ pub mod types {
     pub const UINT8: u8 = 0x20;
     pub const UINT16: u8 = 0x21;
     pub const UINT32: u8 = 0x23;
+    pub const UINT48: u8 = 0x25;
     pub const INT8: u8 = 0x28;
     pub const INT16: u8 = 0x29;
     pub const INT32: u8 = 0x2B;

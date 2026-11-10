@@ -773,7 +773,7 @@ const CONSUMED = {
   light: ["on", "level", "color_temp"],
   thermostat: ["temperature", "setpoint", "heating"],
   sensor: [],
-  generic: [],
+  generic: ["on"],
 };
 const CHIP_KEYS = ["battery", "battery_low", "fault"];
 
@@ -786,7 +786,7 @@ function buildCard(d) {
   const top = el("div", { className: "top" }, el("div", { className: "names" }, name, sub));
   card.append(top);
 
-  if (d.card === "light" && writable(feature(d, "on"))) {
+  if ((d.card === "light" || d.card === "generic") && writable(feature(d, "on"))) {
     const toggle = el("input", { type: "checkbox" });
     toggle.onchange = () => run(setValue(ieee, "on", toggle.checked).catch(e => { toggle.checked = !toggle.checked; throw e; }));
     top.append(el("label", { className: "switch" }, toggle, el("span")));

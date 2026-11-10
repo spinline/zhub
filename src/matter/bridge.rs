@@ -199,7 +199,7 @@ impl Kind {
         let has = |key: &str| view.features.iter().any(|f| f.key == key);
         let battery = has("battery");
         match view.card {
-            Card::Light if writable("on") => Some(match (writable("level"), writable("color_temp")) {
+            Card::Light | Card::Generic if writable("on") => Some(match (writable("level"), writable("color_temp")) {
                 (true, true) => Self::ColorTemperatureLight,
                 (true, false) => Self::DimmableLight,
                 _ => Self::OnOffLight,

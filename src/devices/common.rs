@@ -6,7 +6,7 @@ use super::{Action, Command, CommandFrame, Conv, Feature, Kind, Place, Preset, R
 use crate::store::Device;
 use crate::zcl::{cluster, types};
 
-const fn attr(cluster: u16, attr: u16, ty: u8, conv: Conv, write: Write, report: Option<Report>) -> Source {
+pub const fn attr(cluster: u16, attr: u16, ty: u8, conv: Conv, write: Write, report: Option<Report>) -> Source {
     Source::Attr {
         cluster,
         attr,
@@ -18,11 +18,11 @@ const fn attr(cluster: u16, attr: u16, ty: u8, conv: Conv, write: Write, report:
     }
 }
 
-const fn report(min: u16, max: u16, change: u64) -> Option<Report> {
+pub const fn report(min: u16, max: u16, change: u64) -> Option<Report> {
     Some(Report { min, max, change })
 }
 
-const fn number(divisor: f64, invalid: Option<i64>) -> Conv {
+pub const fn number(divisor: f64, invalid: Option<i64>) -> Conv {
     Conv::Number { divisor, invalid }
 }
 
@@ -317,6 +317,44 @@ pub const VOLTAGE: Feature = Feature::new(
 )
 .describe("Voltage of the battery");
 
+// ---- Electrical Measurement (0x0B04) & Metering (0x0702) ----
+
+pub const POWER: Feature = Feature::new(
+    "power",
+    "Power",
+    numeric("W", None, None, None),
+    Place::Card,
+    attr(cluster::ELECTRICAL_MEASUREMENT, 0x050B, types::INT16, number(1.0, None), Write::No, report(5, 3600, 1)),
+)
+.describe("Instantaneous measured active power in Watts");
+
+pub const VOLTAGE_AC: Feature = Feature::new(
+    "voltage",
+    "Voltage",
+    numeric("V", None, None, None),
+    Place::Card,
+    attr(cluster::ELECTRICAL_MEASUREMENT, 0x0505, types::UINT16, number(1.0, None), Write::No, report(5, 3600, 1)),
+)
+.describe("Measured electrical potential value in Volts");
+
+pub const CURRENT: Feature = Feature::new(
+    "current",
+    "Current",
+    numeric("A", None, None, None),
+    Place::Card,
+    attr(cluster::ELECTRICAL_MEASUREMENT, 0x0508, types::UINT16, number(1000.0, None), Write::No, report(5, 3600, 10)),
+)
+.describe("Instantaneous measured electrical current in Amperes");
+
+pub const ENERGY: Feature = Feature::new(
+    "energy",
+    "Energy",
+    numeric("kWh", None, None, None),
+    Place::Card,
+    attr(cluster::METERING, 0x0000, types::UINT48, number(100.0, None), Write::No, report(10, 3600, 1)),
+)
+.describe("Sum of delivered energy in kWh");
+
 // ---- IAS zone (contact, motion, water leak…) ----
 
 pub const ALARM: Feature = Feature::new(
@@ -430,6 +468,12 @@ pub fn from_clusters(device: &Device) -> Vec<&'static Feature> {
     if has(cluster::IAS_ZONE) {
         features.extend([&ALARM, &BATTERY_LOW, &ZONE_TYPE]);
     }
+    if has(cluster::ELECTRICAL_MEASUREMENT) {
+        features.extend([&POWER, &VOLTAGE_AC, &CURRENT]);
+    }
+    if has(cluster::METERING) {
+        features.push(&ENERGY);
+    }
     if has(cluster::POWER_CONFIG) && !device.router {
         features.extend([&BATTERY, &VOLTAGE]);
     }
@@ -476,5 +520,11 @@ mod tests {
     fn mains_powered_devices_have_no_battery() {
         let device = device_with(&[0x0001, 0x0006], true);
         assert_eq!(keys(&from_clusters(&device)), ["on"]);
+    }
+
+    #[test]
+    fn electrical_measurement_and_metering_features() {
+        let device = device_with(&[0x0000, 0x0006, 0x0702, 0x0B04], true);
+        assert_eq!(keys(&from_clusters(&device)), ["on", "power", "voltage", "current", "energy"]);
     }
 }

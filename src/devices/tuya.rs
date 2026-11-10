@@ -1,9 +1,10 @@
 //! Tuya devices. Datapoint maps come from zigbee-herdsman-converters `tuya.ts`, and from
 //! tuya-local where it has more detail.
 
-use super::common::numeric;
-use super::{Card, Conv, Definition, Feature, Fingerprint, Kind, Place, Source, TimeBase};
+use super::common::{self, numeric};
+use super::{Card, Conv, Definition, Feature, Fingerprint, Kind, Place, Source, TimeBase, Write};
 use crate::tuya::dp_type;
+use crate::zcl::{cluster, types};
 
 const fn dp(dp: u8, dp_type: u8, conv: Conv) -> Source {
     Source::Tuya { dp, dp_type, conv }
@@ -146,6 +147,80 @@ pub static ZWT07: Definition = Definition {
     tuya_time_since_2000: true,
 };
 
+// ---- Tuya TS011F Smart Plug with Energy Monitoring ----
+// zigbee-herdsman-converters: tuya.ts `TS011F_plug_1`
+
+const POWER_ON_BEHAVIOR_TUYA: &[(i64, &str)] = &[(0, "off"), (1, "on"), (2, "previous")];
+const INDICATOR_MODE_TUYA: &[(i64, &str)] = &[
+    (0, "off"),
+    (1, "off_when_on"),
+    (2, "on_when_on"),
+    (3, "relay"),
+];
+
+pub static TS011F: Definition = Definition {
+    fingerprint: &[
+        Fingerprint::Model("TS011F"),
+        Fingerprint::Manufacturer("_TZ3210_yjm8rn3i"),
+    ],
+    vendor: "Tuya",
+    description: "Smart plug (with power monitoring)",
+    name: Some("Smart Plug"),
+    card: Card::Generic,
+    features: &[
+        common::ON_OFF,
+        common::POWER,
+        common::VOLTAGE_AC,
+        common::CURRENT,
+        common::ENERGY,
+        Feature::new(
+            "power_on_behavior",
+            "Power-on behavior",
+            Kind::Enum {
+                values: &["off", "on", "previous"],
+            },
+            Place::Config,
+            common::attr(
+                cluster::ON_OFF,
+                0x8002,
+                types::ENUM8,
+                Conv::Enum(POWER_ON_BEHAVIOR_TUYA),
+                Write::Attribute,
+                None,
+            ),
+        )
+        .describe("Controls the behavior when the device is powered on after power loss"),
+        Feature::new(
+            "indicator_mode",
+            "Indicator mode",
+            Kind::Enum {
+                values: &["off", "off_when_on", "on_when_on", "relay"],
+            },
+            Place::Config,
+            common::attr(
+                cluster::ON_OFF,
+                0x8001,
+                types::ENUM8,
+                Conv::Enum(INDICATOR_MODE_TUYA),
+                Write::Attribute,
+                None,
+            ),
+        )
+        .describe("LED indicator mode"),
+        Feature::new(
+            "child_lock",
+            "Child lock",
+            Kind::Binary,
+            Place::Config,
+            common::attr(cluster::ON_OFF, 0x8000, types::BOOL, BOOL, Write::Attribute, None),
+        )
+        .describe("Enables/disables physical switch button"),
+    ],
+    binds: &[cluster::ELECTRICAL_MEASUREMENT, cluster::METERING],
+    time_base: TimeBase::Zigbee2000,
+    tuya_time_since_2000: false,
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,6 +233,26 @@ mod tests {
         let mut device = Device::new("a4:c1:38:dd:3d:d3:35:0b".into(), 0x254a);
         device.manufacturer = Some("_TZE200_g9a3awaj".into());
         device
+    }
+
+    fn plug() -> Device {
+        let mut device = Device::new("a4:c1:38:0b:b5:a1:e5:c1".into(), 0xafc0);
+        device.model = Some("TS011F".into());
+        device.manufacturer = Some("_TZ3210_yjm8rn3i".into());
+        device
+    }
+
+    #[test]
+    fn ts011f_is_found_and_has_plug_features() {
+        let device = plug();
+        let def = crate::devices::definition(&device).unwrap();
+        assert_eq!(def.vendor, "Tuya");
+        assert_eq!(def.card, Card::Generic);
+        let keys: Vec<_> = features(&device).iter().map(|f| f.key).collect();
+        assert_eq!(
+            keys,
+            ["on", "power", "voltage", "current", "energy", "power_on_behavior", "indicator_mode", "child_lock"]
+        );
     }
 
     fn decode(dp: &Datapoint) -> Option<(&'static str, serde_json::Value)> {

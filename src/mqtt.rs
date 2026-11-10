@@ -784,11 +784,19 @@ fn device_discovery(view: &DeviceView, cfg: &MqttSettings, state_topic: &str) ->
                     "humidity" => Some("humidity"),
                     "battery" => Some("battery"),
                     "voltage" => Some("voltage"),
+                    "power" => Some("power"),
+                    "current" => Some("current"),
+                    "energy" => Some("energy"),
                     _ => None,
                 };
                 if let Some(class) = class {
                     config.insert("device_class".into(), json!(class));
-                    config.insert("state_class".into(), json!("measurement"));
+                    let state_class = if f.key == "energy" {
+                        "total_increasing"
+                    } else {
+                        "measurement"
+                    };
+                    config.insert("state_class".into(), json!(state_class));
                 }
                 add("sensor", f.key, config);
             }
@@ -1438,6 +1446,22 @@ mod tests {
         assert_eq!((lock["value_on"].clone(), lock["value_off"].clone()), (json!("LOCK"), json!("UNLOCK")));
     }
 
+
+    #[test]
+    fn plug_discovery_is_a_switch_plus_measurements_and_config() {
+        let v = view("TS011F", json!({"on": true, "power": 45.0, "energy": 1.2}));
+        let configs = device_discovery(&v, &cfg(), "zigbee2mqtt/Smart Plug");
+        let switch = configs.iter().find(|(k, _)| k.contains("/switch/") && k.contains("/on/")).unwrap().1;
+        assert_eq!(switch["payload_on"], r#"{"on": true}"#);
+        assert_eq!(switch["payload_off"], r#"{"on": false}"#);
+        let power = configs.iter().find(|(k, _)| k.contains("/sensor/") && k.contains("/power/")).unwrap().1;
+        assert_eq!(power["device_class"], "power");
+        assert_eq!(power["unit_of_measurement"], "W");
+        let energy = configs.iter().find(|(k, _)| k.contains("/sensor/") && k.contains("/energy/")).unwrap().1;
+        assert_eq!(energy["device_class"], "energy");
+        assert_eq!(energy["state_class"], "total_increasing");
+        assert_eq!(energy["unit_of_measurement"], "kWh");
+    }
 
     #[test]
     fn stale_topics_are_only_zhubs_shapes_without_an_owner() {
