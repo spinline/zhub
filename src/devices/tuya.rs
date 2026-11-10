@@ -165,6 +165,7 @@ pub static TS011F: Definition = Definition {
     fingerprint: &[
         Fingerprint::Model("TS011F"),
         Fingerprint::Manufacturer("_TZ3210_yjm8rn3i"),
+        Fingerprint::Manufacturer("_TZ3210_5ct6e7ye"),
     ],
     vendor: "Tuya",
     description: "Smart plug (with power monitoring)",
@@ -176,6 +177,7 @@ pub static TS011F: Definition = Definition {
         common::VOLTAGE_AC,
         common::CURRENT,
         common::ENERGY,
+        common::COUNTDOWN,
         Feature::new(
             "power_on_behavior",
             "Power-on behavior",
@@ -218,6 +220,7 @@ pub static TS011F: Definition = Definition {
             common::attr(cluster::ON_OFF, 0x8000, types::BOOL, BOOL, Write::Attribute, None),
         )
         .describe("Enables/disables physical switch button"),
+        common::IDENTIFY,
     ],
     binds: &[cluster::ELECTRICAL_MEASUREMENT, cluster::METERING],
     time_base: TimeBase::Zigbee2000,
@@ -254,7 +257,7 @@ mod tests {
         let keys: Vec<_> = features(&device).iter().map(|f| f.key).collect();
         assert_eq!(
             keys,
-            ["on", "power", "voltage", "current", "energy", "power_on_behavior", "indicator_mode", "child_lock"]
+            ["on", "power", "voltage", "current", "energy", "countdown", "power_on_behavior", "indicator_mode", "child_lock", "identify"]
         );
     }
 

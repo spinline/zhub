@@ -553,7 +553,7 @@ function control(ieee, f) {
       },
     };
   }
-  if (f.access !== "read_write") {
+  if (f.access !== "read_write" && !(f.access === "write" && f.kind.type === "numeric")) {
     const out = el("span", { className: "ro" });
     return { node: row(out), update(d) { setTitle(d); out.textContent = formatValue(f, d.state[f.key], d); } };
   }

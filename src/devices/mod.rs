@@ -182,6 +182,8 @@ pub enum Command {
     Identify,
     /// The Hue effect list: ZCL Trigger Effect or Signify's effect command
     HueEffect,
+    /// Tuya On with Timed Off countdown
+    TuyaCountdown,
 }
 
 /// One ZCL cluster command to send
@@ -198,6 +200,25 @@ impl Command {
         match self {
             Self::Identify => Ok(vec![common::identify_frame()]),
             Self::HueEffect => philips::effect_frames(value.as_str().unwrap_or_default()),
+            Self::TuyaCountdown => {
+                let seconds = if let Some(n) = value.as_f64() {
+                    n.round() as u64
+                } else if let Some(n) = value.as_u64() {
+                    n
+                } else {
+                    anyhow::bail!("countdown must be a number");
+                };
+                let seconds = u16::try_from(seconds).map_err(|_| anyhow::anyhow!("countdown must be between 0 and 43200"))?;
+                let mut payload = vec![0u8];
+                payload.extend_from_slice(&seconds.to_le_bytes());
+                payload.extend_from_slice(&seconds.to_le_bytes());
+                Ok(vec![CommandFrame {
+                    cluster: crate::zcl::cluster::ON_OFF,
+                    manufacturer: None,
+                    command: 0x42, // OnWithTimedOff
+                    payload,
+                }])
+            }
         }
     }
 
@@ -206,6 +227,7 @@ impl Command {
         match self {
             Self::Identify => None,
             Self::HueEffect => philips::effect_state(value.as_str().unwrap_or_default()).map(|s| json!(s)),
+            Self::TuyaCountdown => Some(value.clone()),
         }
     }
 }

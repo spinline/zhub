@@ -760,7 +760,7 @@ fn device_discovery(view: &DeviceView, cfg: &MqttSettings, state_topic: &str) ->
                 }
                 continue;
             }
-            (Kind::Numeric { unit, min, max, step, .. }, Access::ReadWrite, _) => {
+            (Kind::Numeric { unit, min, max, step, .. }, Access::ReadWrite | Access::Write, _) => {
                 let (lo, hi) = f.range(&view.device);
                 config.insert("value_template".into(), json!(format!("{{{{ {value} }}}}")));
                 config.insert("command_topic".into(), json!(command_topic));

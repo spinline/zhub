@@ -236,6 +236,15 @@ pub const IDENTIFY: Feature = Feature::new(
 )
 .describe("Initiate device identification");
 
+pub const COUNTDOWN: Feature = Feature::new(
+    "countdown",
+    "Countdown",
+    numeric("s", Some(0.0), Some(43200.0), Some(1.0)),
+    Place::Config,
+    Source::Command(Command::TuyaCountdown),
+)
+.describe("Countdown to toggle device state (in seconds, 0 to cancel)");
+
 /// Identify for 3 seconds (Zigbee2MQTT's default identify_timeout)
 pub fn identify_frame() -> CommandFrame {
     CommandFrame {
