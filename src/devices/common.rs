@@ -340,7 +340,7 @@ pub const VOLTAGE_AC: Feature = Feature::new(
 pub const CURRENT: Feature = Feature::new(
     "current",
     "Current",
-    numeric("A", None, None, None),
+    numeric("A", None, None, Some(0.01)),
     Place::Card,
     attr(cluster::ELECTRICAL_MEASUREMENT, 0x0508, types::UINT16, number(1000.0, None), Write::No, report(5, 3600, 10)),
 )
@@ -349,7 +349,7 @@ pub const CURRENT: Feature = Feature::new(
 pub const ENERGY: Feature = Feature::new(
     "energy",
     "Energy",
-    numeric("kWh", None, None, None),
+    numeric("kWh", None, None, Some(0.01)),
     Place::Card,
     attr(cluster::METERING, 0x0000, types::UINT48, number(100.0, None), Write::No, report(10, 3600, 1)),
 )

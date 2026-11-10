@@ -473,7 +473,8 @@ function formatValue(f, v, d) {
     // A special value such as "previous"
     if (typeof v === "string") return label(v);
     const n = Number(v);
-    const text = Number.isInteger(n) ? String(n) : n.toFixed(1);
+    const decimals = f.key === "energy" || f.key === "current" ? 2 : 1;
+    const text = Number.isInteger(n) && decimals === 1 ? String(n) : n.toFixed(decimals);
     return k.unit ? `${text} ${k.unit}` : text;
   }
   return String(v);
