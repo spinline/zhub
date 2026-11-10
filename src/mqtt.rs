@@ -1461,6 +1461,8 @@ mod tests {
         assert_eq!(energy["device_class"], "energy");
         assert_eq!(energy["state_class"], "total_increasing");
         assert_eq!(energy["unit_of_measurement"], "kWh");
+        let switch_type = configs.iter().find(|(k, _)| k.contains("/select/") && k.contains("/switch_type_button/")).unwrap().1;
+        assert_eq!(switch_type["options"], json!(["release", "press"]));
     }
 
     #[test]

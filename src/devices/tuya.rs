@@ -161,6 +161,8 @@ const INDICATOR_MODE_TUYA: &[(i64, &str)] = &[
     (3, "on"),
 ];
 
+const SWITCH_TYPE_BUTTON_TUYA: &[(i64, &str)] = &[(0, "release"), (1, "press")];
+
 pub static TS011F: Definition = Definition {
     fingerprint: &[
         Fingerprint::Model("TS011F"),
@@ -220,6 +222,23 @@ pub static TS011F: Definition = Definition {
             common::attr(cluster::ON_OFF, 0x8000, types::BOOL, BOOL, Write::Attribute, None),
         )
         .describe("Enables/disables physical switch button"),
+        Feature::new(
+            "switch_type_button",
+            "Switch type button",
+            Kind::Enum {
+                values: &["release", "press"],
+            },
+            Place::Config,
+            common::attr(
+                cluster::TUYA_SWITCH,
+                0xD030,
+                types::ENUM8,
+                Conv::Enum(SWITCH_TYPE_BUTTON_TUYA),
+                Write::Attribute,
+                None,
+            ),
+        )
+        .describe("Determines when the physical button actuates (on press or on release)"),
         common::IDENTIFY,
     ],
     binds: &[cluster::ELECTRICAL_MEASUREMENT, cluster::METERING],
@@ -257,7 +276,7 @@ mod tests {
         let keys: Vec<_> = features(&device).iter().map(|f| f.key).collect();
         assert_eq!(
             keys,
-            ["on", "power", "voltage", "current", "energy", "countdown", "power_on_behavior", "indicator_mode", "child_lock", "identify"]
+            ["on", "power", "voltage", "current", "energy", "countdown", "power_on_behavior", "indicator_mode", "child_lock", "switch_type_button", "identify"]
         );
     }
 

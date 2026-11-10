@@ -867,7 +867,7 @@ const CLUSTERS = {
   0x0006: "On/Off", 0x0008: "Level Control", 0x000A: "Time", 0x0019: "OTA Upgrade", 0x0020: "Poll Control",
   0x0201: "Thermostat", 0x0204: "Thermostat UI Config", 0x0300: "Color Control", 0x0402: "Temperature Measurement",
   0x0405: "Relative Humidity", 0x0406: "Occupancy Sensing", 0x0500: "IAS Zone", 0x0B05: "Diagnostics",
-  0x1000: "Touchlink", 0xEF00: "Tuya", 0xFC11: "SONOFF", 0xFC57: "SONOFF (private)", 0xFC03: "Philips", 0xFC04: "Philips",
+  0x1000: "Touchlink", 0xEF00: "Tuya", 0xE000: "Tuya (private 0xE000)", 0xE001: "Tuya (private 0xE001)", 0xFC11: "SONOFF", 0xFC57: "SONOFF (private)", 0xFC03: "Philips", 0xFC04: "Philips",
 };
 const hex = (n, width = 4) => "0x" + n.toString(16).padStart(width, "0");
 

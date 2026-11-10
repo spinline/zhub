@@ -35,6 +35,7 @@ pub mod cluster {
     pub const IAS_ZONE: u16 = 0x0500;
     pub const METERING: u16 = 0x0702;
     pub const ELECTRICAL_MEASUREMENT: u16 = 0x0B04;
+    pub const TUYA_SWITCH: u16 = 0xE001;
 }
 
 pub mod types {
