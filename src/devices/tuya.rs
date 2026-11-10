@@ -153,9 +153,12 @@ pub static ZWT07: Definition = Definition {
 const POWER_ON_BEHAVIOR_TUYA: &[(i64, &str)] = &[(0, "off"), (1, "on"), (2, "previous")];
 const INDICATOR_MODE_TUYA: &[(i64, &str)] = &[
     (0, "off"),
-    (1, "off_when_on"),
-    (2, "on_when_on"),
+    (1, "on_when_on"),
+    (2, "off_when_on"),
     (3, "relay"),
+    (1, "off/on"),
+    (2, "on/off"),
+    (3, "on"),
 ];
 
 pub static TS011F: Definition = Definition {
@@ -194,7 +197,7 @@ pub static TS011F: Definition = Definition {
             "indicator_mode",
             "Indicator mode",
             Kind::Enum {
-                values: &["off", "off_when_on", "on_when_on", "relay"],
+                values: &["off", "on_when_on", "off_when_on", "relay"],
             },
             Place::Config,
             common::attr(
