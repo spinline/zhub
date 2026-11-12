@@ -2091,6 +2091,10 @@ impl Hub {
         let number = || value.as_f64().unwrap_or_default().round();
         let (command, payload): (u8, Vec<u8>) = match write {
             Write::OnOff => (u8::from(value.as_bool() == Some(true)), vec![]),
+            Write::TuyaCountdown => {
+                let seconds = (number() as u16).to_le_bytes();
+                (0x42, vec![0, seconds[0], seconds[1], seconds[0], seconds[1]])
+            }
             Write::Level => {
                 let level = number().clamp(0.0, 254.0) as u8;
                 let mut payload = vec![level];
@@ -2143,6 +2147,10 @@ impl Hub {
             && status != zcl::STATUS_SUCCESS
         {
             bail!("the device rejected the command (status 0x{status:02x})");
+        }
+        // A regular On, Off or Toggle cancels a Tuya countdown.
+        if frame.cluster == cluster::ON_OFF && frame.command <= 0x02 && device.state.contains_key("countdown") {
+            self.set_state_values(&device.ieee, vec![("countdown", json!(0))]);
         }
         Ok(())
     }
@@ -3110,6 +3118,17 @@ mod tests {
         assert_eq!(device.state["battery"], json!(100));
         assert_eq!(device.state["alarm"], json!(true));
         assert_eq!(device.state["battery_low"], json!(true));
+    }
+
+    #[test]
+    fn tuya_countdown_reports_replace_the_requested_duration() {
+        let mut device = device_with(&[cluster::ON_OFF]);
+        device.model = Some("TS011F".into());
+        device.state.insert("countdown".into(), json!(90.0));
+        apply_zcl_records(&mut device, cluster::ON_OFF, None, &[record(0x4001, Value::Uint(60))]);
+        assert_eq!(device.state["countdown"], json!(60.0));
+        apply_zcl_records(&mut device, cluster::ON_OFF, None, &[record(0x4001, Value::Uint(0))]);
+        assert_eq!(device.state["countdown"], json!(0.0));
     }
 
     #[test]

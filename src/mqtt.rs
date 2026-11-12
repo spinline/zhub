@@ -1093,7 +1093,7 @@ fn light_target(views: &[&DeviceView]) -> Option<z2m_light::Target> {
 
 /// A command from MQTT: the device or group by name (or IEEE address). Light keys run as
 /// Zigbee2MQTT's light converters do, the other keys set the hub's features.
-pub async fn apply(hub: &Arc<Hub>, name: &str, command: Map<String, Json>) -> anyhow::Result<()> {
+pub async fn apply(hub: &Arc<Hub>, name: &str, mut command: Map<String, Json>) -> anyhow::Result<()> {
     let scene_keys:Vec<_>=command.keys().filter(|k|crate::scenes::KEYS.contains(&k.as_str())).collect();
     if !scene_keys.is_empty() {
         anyhow::ensure!(command.len()==1, "send one scene operation per MQTT message, without other light commands");
@@ -1109,6 +1109,17 @@ pub async fn apply(hub: &Arc<Hub>, name: &str, command: Map<String, Json>) -> an
             g.members.iter().filter_map(|m| devices.iter().find(|d| d.device.ieee == m.ieee)).collect(),
         ),
         (None, None) => anyhow::bail!("no device or group named {name}"),
+    };
+    // A Tuya countdown must follow the requested relay state, even for OFF.
+    // Validate it before sending either command.
+    let countdown = if command.get("state").is_some_and(|state| !state.is_null())
+        && let Some(device) = target
+        && let Some(feature) = device.features.iter().find(|f| f.key == "countdown")
+        && let Some(value) = command.remove("countdown")
+    {
+        Some((device, feature.validate(&device.device, value)?))
+    } else {
+        None
     };
     let light = light_target(&members).filter(|_| command.keys().any(|k| z2m_light::KEYS.contains(&k.as_str())));
     let (parts, rest, rest_first) = match &light {
@@ -1144,6 +1155,7 @@ pub async fn apply(hub: &Arc<Hub>, name: &str, command: Map<String, Json>) -> an
         run_rest(&mut done_any, &mut last_error).await;
     }
     // Zigbee2MQTT runs every converter, logging the ones that fail
+    let mut state_sent = !parts.is_empty();
     for part in parts {
         let result = match part {
             Ok(part) => run_light(hub, &target, &group, &members, part).await,
@@ -1152,6 +1164,7 @@ pub async fn apply(hub: &Arc<Hub>, name: &str, command: Map<String, Json>) -> an
         match result {
             Ok(()) => done_any = true,
             Err(e) => {
+                state_sent = false;
                 warn!("MQTT {name}/set: {e:#}");
                 last_error = Some(e);
             }
@@ -1159,6 +1172,14 @@ pub async fn apply(hub: &Arc<Hub>, name: &str, command: Map<String, Json>) -> an
     }
     if !rest_first {
         run_rest(&mut done_any, &mut last_error).await;
+    }
+    if let Some((device, value)) = countdown
+        && state_sent
+    {
+        match hub.set(&device.device.ieee, "countdown", value).await {
+            Ok(_) => done_any = true,
+            Err(e) => last_error = Some(e),
+        }
     }
     // Zigbee2MQTT publishes the state after a command, changed or not: a client that lost
     // track (it thought a light off that was on) is corrected by its next command

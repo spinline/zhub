@@ -241,7 +241,7 @@ pub const COUNTDOWN: Feature = Feature::new(
     "Countdown",
     numeric("s", Some(0.0), Some(43200.0), Some(1.0)),
     Place::Config,
-    Source::Command(Command::TuyaCountdown),
+    attr(cluster::ON_OFF, 0x4001, types::UINT16, number(1.0, None), Write::TuyaCountdown, None),
 )
 .describe("Countdown to toggle device state (in seconds, 0 to cancel)");
 
