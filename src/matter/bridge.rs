@@ -46,6 +46,7 @@ const HUMIDITY_ID: ClusterId = humidity::FULL_CLUSTER.id;
 const POWER_ID: ClusterId = power_source::FULL_CLUSTER.id;
 const THERMOSTAT_ID: ClusterId = thermostat::FULL_CLUSTER.id;
 
+const DEV_TYPE_ON_OFF_OUTLET: DeviceType = DeviceType { dtype: 0x010A, drev: 4 };
 const DEV_TYPE_COLOR_TEMPERATURE_LIGHT: DeviceType = DeviceType { dtype: 0x010C, drev: 4 };
 const DEV_TYPE_TEMPERATURE_SENSOR: DeviceType = DeviceType { dtype: 0x0302, drev: 2 };
 const DEV_TYPE_HUMIDITY_SENSOR: DeviceType = DeviceType { dtype: 0x0307, drev: 2 };
@@ -177,6 +178,7 @@ const THERMOSTAT_CLUSTER: Cluster<'static> = thermostat::FULL_CLUSTER
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     OnOffLight,
+    OnOffOutlet,
     DimmableLight,
     ColorTemperatureLight,
     TemperatureSensor { humidity: bool, battery: bool },
@@ -199,6 +201,7 @@ impl Kind {
         let has = |key: &str| view.features.iter().any(|f| f.key == key);
         let battery = has("battery");
         match view.card {
+            Card::Outlet if writable("on") => Some(Self::OnOffOutlet),
             Card::Light | Card::Generic if writable("on") => Some(match (writable("level"), writable("color_temp")) {
                 (true, true) => Self::ColorTemperatureLight,
                 (true, false) => Self::DimmableLight,
@@ -216,6 +219,7 @@ impl Kind {
     fn device_types(self) -> &'static [DeviceType] {
         match self {
             Self::OnOffLight => devices!(DEV_TYPE_ON_OFF_LIGHT, DEV_TYPE_BRIDGED_NODE),
+            Self::OnOffOutlet => devices!(DEV_TYPE_ON_OFF_OUTLET, DEV_TYPE_BRIDGED_NODE),
             Self::DimmableLight => devices!(DEV_TYPE_DIMMABLE_LIGHT, DEV_TYPE_BRIDGED_NODE),
             Self::ColorTemperatureLight => devices!(DEV_TYPE_COLOR_TEMPERATURE_LIGHT, DEV_TYPE_BRIDGED_NODE),
             Self::TemperatureSensor { humidity: false, battery: false } => devices!(DEV_TYPE_TEMPERATURE_SENSOR, DEV_TYPE_BRIDGED_NODE),
@@ -238,7 +242,7 @@ impl Kind {
 
     fn clusters(self) -> &'static [Cluster<'static>] {
         match self {
-            Self::OnOffLight => clusters!(desc::DescHandler::CLUSTER, groups::GroupsHandler::CLUSTER, BRIDGED_CLUSTER, ON_OFF_CLUSTER),
+            Self::OnOffLight | Self::OnOffOutlet => clusters!(desc::DescHandler::CLUSTER, groups::GroupsHandler::CLUSTER, BRIDGED_CLUSTER, ON_OFF_CLUSTER),
             Self::DimmableLight => clusters!(
                 desc::DescHandler::CLUSTER,
                 groups::GroupsHandler::CLUSTER,

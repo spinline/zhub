@@ -403,8 +403,15 @@ impl Bridge {
         let availability = json!({"state": if view.offline { "offline" } else { "online" }});
         self.publish(&format!("{topic}/availability"), availability.to_string(), true).await;
         if self.cfg.discovery {
+            let ieee = &view.device.ieee;
+            if view.card == Card::Outlet && !self.discovery.contains_key(ieee) {
+                // Older zhub versions advertised outlets as lights. The retained
+                // light config can outlive the bridge's in-memory discovery cache.
+                let old_light = device_config_topic(&self.cfg, "light", &ieee.replace(':', ""), "light");
+                self.publish(&old_light, String::new(), true).await;
+            }
             let configs = device_discovery(view, &self.cfg, &topic);
-            self.update_discovery(view.device.ieee.clone(), configs).await;
+            self.update_discovery(ieee.clone(), configs).await;
         }
     }
 
@@ -425,7 +432,7 @@ impl Bridge {
                     json!({"identifiers": [format!("zhub_group_{}", group.id)], "name": group.name, "model": "Group", "manufacturer": "zhub"}),
                 );
                 self.common(&mut config, &topic);
-                configs.insert(format!("{}/light/zhub_group_{}/light/config", self.cfg.discovery_prefix, group.id), Json::Object(config));
+                configs.insert(group_config_topic(&self.cfg, group.id), Json::Object(config));
             }
             self.update_discovery(key, configs).await;
         }
@@ -609,6 +616,14 @@ fn group_payload(group: &Group, devices: &[DeviceView]) -> (Json, Option<Map<Str
     (Json::Object(out), Some(light))
 }
 
+fn device_config_topic(cfg: &MqttSettings, component: &str, ieee: &str, object: &str) -> String {
+    format!("{}/{component}/zhub_{ieee}/{object}/config", cfg.discovery_prefix)
+}
+
+fn group_config_topic(cfg: &MqttSettings, id: u16) -> String {
+    format!("{}/light/zhub_group_{id}/light/config", cfg.discovery_prefix)
+}
+
 /// Home Assistant entities for a device: a light or climate entity for its card, the
 /// other features one entity each, and a trigger per action
 fn device_discovery(view: &DeviceView, cfg: &MqttSettings, state_topic: &str) -> BTreeMap<String, Json> {
@@ -646,7 +661,7 @@ fn device_discovery(view: &DeviceView, cfg: &MqttSettings, state_topic: &str) ->
                 {"topic": format!("{state_topic}/availability"), "value_template": "{{ value_json.state }}"},
             ]),
         );
-        configs.insert(format!("{}/{component}/zhub_{ieee}/{object}/config", cfg.discovery_prefix), Json::Object(config));
+        configs.insert(device_config_topic(cfg, component, &ieee, object), Json::Object(config));
     };
 
     if view.card == Card::Light && feature("on").is_some_and(writable) {
@@ -801,6 +816,9 @@ fn device_discovery(view: &DeviceView, cfg: &MqttSettings, state_topic: &str) ->
                 add("sensor", f.key, config);
             }
             (Kind::Binary, Access::ReadWrite, _) => {
+                if view.card == Card::Outlet && f.key == "on" {
+                    config.insert("device_class".into(), json!("outlet"));
+                }
                 config.insert("value_template".into(), json!(format!("{{{{ 'ON' if {truthy} else 'OFF' }}}}")));
                 config.insert("command_topic".into(), json!(command_topic));
                 config.insert("payload_on".into(), json!(format!(r#"{{"{}": true}}"#, f.key)));
@@ -967,10 +985,8 @@ fn writable(f: &Feature) -> bool {
     f.access != Access::Read
 }
 
-/// Which retained topics nobody owns any more: the state and availability of names no
-/// device or group has, and discovery configs of devices and groups that are gone (all of
-/// them when discovery is off). Only zhub's own topic shapes count.
-fn stale_topics(retained: &[String], cfg: &MqttSettings, names: &HashSet<String>, nodes: &HashSet<String>) -> Vec<String> {
+/// Removes obsolete state and discovery topics that follow zhub's topic shapes.
+fn stale_topics(retained: &[String], cfg: &MqttSettings, names: &HashSet<String>, configs: &HashSet<String>) -> Vec<String> {
     let base = format!("{}/", cfg.base_topic);
     let prefix = format!("{}/", cfg.discovery_prefix);
     let mut stale: Vec<String> = retained
@@ -986,7 +1002,7 @@ fn stale_topics(retained: &[String], cfg: &MqttSettings, names: &HashSet<String>
                 return parts.len() == 4
                     && parts[3] == "config"
                     && parts[1].starts_with("zhub_")
-                    && (!cfg.discovery || !nodes.contains(parts[1]));
+                    && !configs.contains(topic.as_str());
             }
             false
         })
@@ -1029,26 +1045,40 @@ pub async fn clean_stale(hub: &Arc<Hub>) -> anyhow::Result<Vec<String>> {
     let devices = hub.devices();
     let groups = hub.groups();
     let names: HashSet<String> = devices.iter().map(|d| topic_name(&d.device.name)).chain(groups.iter().map(|g| topic_name(&g.name))).collect();
-    let nodes: HashSet<String> = devices
-        .iter()
-        .map(|d| format!("zhub_{}", d.device.ieee.replace(':', "")))
-        .chain(groups.iter().map(|g| format!("zhub_group_{}", g.id)))
-        .collect();
-    let stale = stale_topics(&retained, &cfg, &names, &nodes);
-    for topic in &stale {
-        client.publish(topic.clone(), QoS::AtLeastOnce, true, Vec::new()).await?;
-        info!("MQTT: removed the stale retained topic {topic}");
-    }
-    // Let the removals go out before the connection closes
-    let _ = client.disconnect().await;
-    let _ = tokio::time::timeout(Duration::from_secs(5), async {
-        while let Ok(event) = eventloop.poll().await {
-            if matches!(event, MqttEvent::Outgoing(rumqttc::Outgoing::Disconnect)) {
-                break;
+    let mut configs = HashSet::new();
+    if cfg.discovery {
+        for device in &devices {
+            let topic = format!("{}/{}", cfg.base_topic, topic_name(&device.device.name));
+            configs.extend(device_discovery(device, &cfg, &topic).into_keys());
+        }
+        for group in &groups {
+            if group_payload(group, &devices).1.is_some() {
+                configs.insert(group_config_topic(&cfg, group.id));
             }
         }
+    }
+    let stale = stale_topics(&retained, &cfg, &names, &configs);
+    // Poll while enqueuing so large cleanups can exceed the client queue capacity.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::try_join!(
+            async {
+                for topic in &stale {
+                    client.publish(topic.clone(), QoS::AtLeastOnce, true, Vec::new()).await?;
+                }
+                Ok::<_, anyhow::Error>(())
+            },
+            async {
+                for _ in &stale {
+                    while !matches!(eventloop.poll().await?, MqttEvent::Incoming(Incoming::PubAck(_))) {}
+                }
+                Ok::<_, anyhow::Error>(())
+            },
+        )
     })
-    .await;
+    .await??;
+    for topic in &stale {
+        info!("MQTT: removed the stale retained topic {topic}");
+    }
     Ok(stale)
 }
 
@@ -1296,9 +1326,14 @@ mod tests {
     use crate::store::Device;
 
     fn view(model: &str, state: Json) -> DeviceView {
+        view_with_manufacturer(model, None, state)
+    }
+
+    fn view_with_manufacturer(model: &str, manufacturer: Option<&str>, state: Json) -> DeviceView {
         let mut device = Device::new("00:17:88:01:0b:1d:bc:29".into(), 0x1234);
         device.name = "Living room".into();
         device.model = Some(model.into());
+        device.manufacturer = manufacturer.map(str::to_owned);
         device.state = serde_json::from_value(state).unwrap();
         DeviceView {
             card: devices::card(&device),
@@ -1470,9 +1505,11 @@ mod tests {
 
     #[test]
     fn plug_discovery_is_a_switch_plus_measurements_and_config() {
-        let v = view("TS011F", json!({"on": true, "power": 45.0, "energy": 1.2}));
+        let v = view_with_manufacturer("TS011F", Some("_TZ3210_yjm8rn3i"), json!({"on": true, "power": 45.0, "energy": 1.2}));
         let configs = device_discovery(&v, &cfg(), "zigbee2mqtt/Smart Plug");
         let switch = configs.iter().find(|(k, _)| k.contains("/switch/") && k.contains("/on/")).unwrap().1;
+        assert_eq!(switch["device_class"], "outlet");
+        assert!(!configs.keys().any(|k| k.starts_with("homeassistant/light/")));
         assert_eq!(switch["payload_on"], r#"{"on": true}"#);
         assert_eq!(switch["payload_off"], r#"{"on": false}"#);
         let power = configs.iter().find(|(k, _)| k.contains("/sensor/") && k.contains("/power/")).unwrap().1;
@@ -1490,7 +1527,7 @@ mod tests {
     fn stale_topics_are_only_zhubs_shapes_without_an_owner() {
         let cfg = cfg();
         let names: HashSet<String> = ["Living room".to_owned()].into();
-        let nodes: HashSet<String> = ["zhub_00178801".to_owned()].into();
+        let configs: HashSet<String> = ["homeassistant/switch/zhub_00178801/on/config".to_owned()].into();
         let retained: Vec<String> = [
             "zigbee2mqtt/Living room",
             "zigbee2mqtt/Living room/availability",
@@ -1498,6 +1535,7 @@ mod tests {
             "zigbee2mqtt/LTA009 80a6/availability",
             "zigbee2mqtt/bridge/info",
             "zigbee2mqtt/Old/deeper/topic",
+            "homeassistant/switch/zhub_00178801/on/config",
             "homeassistant/light/zhub_00178801/light/config",
             "homeassistant/light/zhub_gone/light/config",
             "homeassistant/light/other_tool/light/config",
@@ -1505,8 +1543,13 @@ mod tests {
         .map(str::to_owned)
         .into();
         assert_eq!(
-            stale_topics(&retained, &cfg, &names, &nodes),
-            ["homeassistant/light/zhub_gone/light/config", "zigbee2mqtt/LTA009 80a6", "zigbee2mqtt/LTA009 80a6/availability"]
+            stale_topics(&retained, &cfg, &names, &configs),
+            [
+                "homeassistant/light/zhub_00178801/light/config",
+                "homeassistant/light/zhub_gone/light/config",
+                "zigbee2mqtt/LTA009 80a6",
+                "zigbee2mqtt/LTA009 80a6/availability",
+            ]
         );
     }
 }

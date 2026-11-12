@@ -477,12 +477,6 @@ pub fn from_clusters(device: &Device) -> Vec<&'static Feature> {
     if has(cluster::IAS_ZONE) {
         features.extend([&ALARM, &BATTERY_LOW, &ZONE_TYPE]);
     }
-    if has(cluster::ELECTRICAL_MEASUREMENT) {
-        features.extend([&POWER, &VOLTAGE_AC, &CURRENT]);
-    }
-    if has(cluster::METERING) {
-        features.push(&ENERGY);
-    }
     if has(cluster::POWER_CONFIG) && !device.router {
         features.extend([&BATTERY, &VOLTAGE]);
     }
@@ -532,8 +526,12 @@ mod tests {
     }
 
     #[test]
-    fn electrical_measurement_and_metering_features() {
-        let device = device_with(&[0x0000, 0x0006, 0x0702, 0x0B04], true);
-        assert_eq!(keys(&from_clusters(&device)), ["on", "power", "voltage", "current", "energy"]);
+    fn generic_outlet_uses_standard_relay_without_assuming_metering_scale() {
+        let mut device = device_with(&[0x0000, 0x0006, 0x0702, 0x0B04], true);
+        device.endpoints[0].device_id = 0x010A;
+        device.model = Some("TS011F".into());
+        device.manufacturer = Some("_TZ3000_unknown".into());
+        assert_eq!(keys(&super::super::features(&device)), ["on"]);
+        assert_eq!(super::super::card(&device), super::super::Card::Outlet);
     }
 }

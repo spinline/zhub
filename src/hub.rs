@@ -3124,6 +3124,7 @@ mod tests {
     fn tuya_countdown_reports_replace_the_requested_duration() {
         let mut device = device_with(&[cluster::ON_OFF]);
         device.model = Some("TS011F".into());
+        device.manufacturer = Some("_TZ3210_yjm8rn3i".into());
         device.state.insert("countdown".into(), json!(90.0));
         apply_zcl_records(&mut device, cluster::ON_OFF, None, &[record(0x4001, Value::Uint(60))]);
         assert_eq!(device.state["countdown"], json!(60.0));

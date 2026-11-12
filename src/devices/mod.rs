@@ -478,6 +478,7 @@ impl Feature {
 pub enum Fingerprint {
     Model(&'static str),
     Manufacturer(&'static str),
+    ModelManufacturer(&'static str, &'static str),
 }
 
 /// The card layout in the UI
@@ -485,6 +486,7 @@ pub enum Fingerprint {
 #[serde(rename_all = "snake_case")]
 pub enum Card {
     Light,
+    Outlet,
     Thermostat,
     Sensor,
     Generic,
@@ -540,6 +542,9 @@ pub fn definition(device: &Device) -> Option<&'static Definition> {
         def.fingerprint.iter().any(|fp| match fp {
             Fingerprint::Model(model) => device.model.as_deref() == Some(model),
             Fingerprint::Manufacturer(name) => device.manufacturer.as_deref() == Some(name),
+            Fingerprint::ModelManufacturer(model, name) => {
+                device.model.as_deref() == Some(model) && device.manufacturer.as_deref() == Some(name)
+            }
         })
     })
 }
@@ -565,8 +570,10 @@ pub fn card(device: &Device) -> Card {
     }
     let features = common::from_clusters(device);
     let has = |key: &str| features.iter().any(|f| f.key == key);
-    if has("power") {
-        Card::Generic
+    if device.endpoints.iter().any(|ep| {
+        ep.profile == 0x0104 && ep.device_id == 0x010A && ep.in_clusters.contains(&cluster::ON_OFF)
+    }) {
+        Card::Outlet
     } else if has("on") && device.router {
         Card::Light
     } else if ["temperature", "humidity", "occupancy", "alarm"].iter().any(|k| has(k)) {

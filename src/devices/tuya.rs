@@ -165,14 +165,13 @@ const SWITCH_TYPE_BUTTON_TUYA: &[(i64, &str)] = &[(0, "release"), (1, "press")];
 
 pub static TS011F: Definition = Definition {
     fingerprint: &[
-        Fingerprint::Model("TS011F"),
-        Fingerprint::Manufacturer("_TZ3210_yjm8rn3i"),
-        Fingerprint::Manufacturer("_TZ3210_5ct6e7ye"),
+        Fingerprint::ModelManufacturer("TS011F", "_TZ3210_yjm8rn3i"),
+        Fingerprint::ModelManufacturer("TS011F", "_TZ3210_5ct6e7ye"),
     ],
     vendor: "Tuya",
     description: "Smart plug (with power monitoring)",
     name: Some("Smart Plug"),
-    card: Card::Generic,
+    card: Card::Outlet,
     features: &[
         common::ON_OFF,
         common::POWER,
@@ -272,12 +271,23 @@ mod tests {
         let device = plug();
         let def = crate::devices::definition(&device).unwrap();
         assert_eq!(def.vendor, "Tuya");
-        assert_eq!(def.card, Card::Generic);
+        assert_eq!(def.card, Card::Outlet);
         let keys: Vec<_> = features(&device).iter().map(|f| f.key).collect();
         assert_eq!(
             keys,
             ["on", "power", "voltage", "current", "energy", "countdown", "power_on_behavior", "indicator_mode", "child_lock", "switch_type_button", "identify"]
         );
+    }
+
+    #[test]
+    fn ts011f_requires_matching_model_and_manufacturer() {
+        let mut device = plug();
+        device.manufacturer = None;
+        assert!(crate::devices::definition(&device).is_none());
+        device.manufacturer = Some("_TZ3210_5ct6e7ye".into());
+        assert!(crate::devices::definition(&device).is_some());
+        device.model = Some("Other".into());
+        assert!(crate::devices::definition(&device).is_none());
     }
 
     fn decode(dp: &Datapoint) -> Option<(&'static str, serde_json::Value)> {
