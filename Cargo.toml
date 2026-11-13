@@ -6,11 +6,11 @@ description = "A lightweight Zigbee hub on the Ziggurat stack"
 license = "Apache-2.0"
 
 [dependencies]
-ziggurat-driver = { git = "https://github.com/zigpy/ziggurat", rev = "f917f9898a1c7da2e5e5aa9add7c6d9d6a48ee76" }
-ziggurat-phy = { git = "https://github.com/zigpy/ziggurat", rev = "f917f9898a1c7da2e5e5aa9add7c6d9d6a48ee76" }
-ziggurat-phy-spinel = { git = "https://github.com/zigpy/ziggurat", rev = "f917f9898a1c7da2e5e5aa9add7c6d9d6a48ee76" }
-ziggurat-spinel = { git = "https://github.com/zigpy/ziggurat", rev = "f917f9898a1c7da2e5e5aa9add7c6d9d6a48ee76" }
-ziggurat-protocol = { git = "https://github.com/zigpy/ziggurat", rev = "f917f9898a1c7da2e5e5aa9add7c6d9d6a48ee76" }
+ziggurat-driver = { git = "https://github.com/zigpy/ziggurat", rev = "08f89eafa0cb5606aa2d49e7f7c9b72da2695aaa" }
+ziggurat-phy = { git = "https://github.com/zigpy/ziggurat", rev = "08f89eafa0cb5606aa2d49e7f7c9b72da2695aaa" }
+ziggurat-phy-spinel = { git = "https://github.com/zigpy/ziggurat", rev = "08f89eafa0cb5606aa2d49e7f7c9b72da2695aaa" }
+ziggurat-spinel = { git = "https://github.com/zigpy/ziggurat", rev = "08f89eafa0cb5606aa2d49e7f7c9b72da2695aaa" }
+ziggurat-protocol = { git = "https://github.com/zigpy/ziggurat", rev = "08f89eafa0cb5606aa2d49e7f7c9b72da2695aaa" }
 
 anyhow = "1"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
@@ -20,7 +20,7 @@ getrandom = "0.3"
 sha2 = "0.11"
 rumqttc = { version = "0.24", default-features = false }
 # Matter bridge (feature "matter"); a pinned commit, the crate is not released often
-rs-matter = { git = "https://github.com/project-chip/rs-matter", rev = "bf3fe6b94f6428d12611c67fcf698883c269507d", features = ["groups"], optional = true }
+rs-matter = { git = "https://github.com/project-chip/rs-matter", rev = "15b5ee55dbe9dbfaad2465490c58e86e86994ecc", features = ["groups"], optional = true }
 embassy-futures = { version = "0.1", optional = true }
 embassy-time = { version = "0.5", features = ["std"], optional = true }
 embassy-time-queue-utils = { version = "0.3", features = ["generic-queue-64"], optional = true }

@@ -1,6 +1,6 @@
 # Changes in zhub's copy
 
-Copied from https://github.com/zigpy/ziggurat at f917f9898a1c7da2e5e5aa9add7c6d9d6a48ee76
+Copied from https://github.com/zigpy/ziggurat at 08f89eafa0cb5606aa2d49e7f7c9b72da2695aaa
 (`crates/ziggurat-spinel`, Apache-2.0, see LICENSE.md) and used through `[patch]` in
 zhub's Cargo.toml.
 

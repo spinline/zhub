@@ -36,7 +36,7 @@ use rs_matter::sc::pase::{CommWindowState, Spake2pVerifierPassword, Spake2pVerif
 use rs_matter::transport::MATTER_SOCKET_BIND_ADDR;
 use rs_matter::transport::exchange::MatterBuffers;
 use rs_matter::utils::futures::Coalesce;
-use rs_matter::{BasicCommData, MATTER_PORT, Matter};
+use rs_matter::{BasicCommData, DevCommData, MATTER_PORT, Matter};
 use serde::Serialize;
 use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{info, warn};
@@ -250,7 +250,7 @@ async fn run(
         discriminator: cfg.discriminator,
     };
 
-    let matter = Matter::new(dev_det, comm.clone(), &TEST_DEV_ATT, MATTER_PORT);
+    let matter = Matter::new(dev_det, DevCommData::Passcode(comm.clone()), &TEST_DEV_ATT, MATTER_PORT);
     std::fs::create_dir_all(data_dir).map_err(|_| rs_matter::error::ErrorCode::StdIoError)?;
     let kv = matter.kv(DirKvBlobStore::new(data_dir.to_path_buf()));
     matter.startup(&kv)?;

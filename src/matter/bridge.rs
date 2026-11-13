@@ -20,7 +20,8 @@ use rs_matter::dm::clusters::decl::thermostat;
 use rs_matter::dm::clusters::desc::{self, ClusterHandler as _};
 use rs_matter::dm::clusters::groups::{self, ClusterHandler as _};
 use rs_matter::dm::devices::{
-    DEV_TYPE_AGGREGATOR, DEV_TYPE_BRIDGED_NODE, DEV_TYPE_DIMMABLE_LIGHT, DEV_TYPE_ON_OFF_LIGHT, DEV_TYPE_THERMOSTAT,
+    DEV_TYPE_AGGREGATOR, DEV_TYPE_BRIDGED_NODE, DEV_TYPE_COLOR_TEMPERATURE_LIGHT, DEV_TYPE_DIMMABLE_LIGHT,
+    DEV_TYPE_ON_OFF_LIGHT, DEV_TYPE_ON_OFF_PLUG_IN_UNIT, DEV_TYPE_POWER_SOURCE, DEV_TYPE_THERMOSTAT,
 };
 use rs_matter::dm::{
     ArrayAttributeRead, AsyncHandler, Cluster, ClusterId, Dataver, DeviceType, EndptId, Endpoint, InvokeContext, InvokeReply,
@@ -46,11 +47,8 @@ const HUMIDITY_ID: ClusterId = humidity::FULL_CLUSTER.id;
 const POWER_ID: ClusterId = power_source::FULL_CLUSTER.id;
 const THERMOSTAT_ID: ClusterId = thermostat::FULL_CLUSTER.id;
 
-const DEV_TYPE_ON_OFF_OUTLET: DeviceType = DeviceType { dtype: 0x010A, drev: 4 };
-const DEV_TYPE_COLOR_TEMPERATURE_LIGHT: DeviceType = DeviceType { dtype: 0x010C, drev: 4 };
 const DEV_TYPE_TEMPERATURE_SENSOR: DeviceType = DeviceType { dtype: 0x0302, drev: 2 };
 const DEV_TYPE_HUMIDITY_SENSOR: DeviceType = DeviceType { dtype: 0x0307, drev: 2 };
-const DEV_TYPE_POWER_SOURCE: DeviceType = DeviceType { dtype: 0x0011, drev: 1 };
 
 const ON_OFF_CLUSTER: Cluster<'static> = on_off::FULL_CLUSTER
     .with_revision(6)
@@ -219,7 +217,7 @@ impl Kind {
     fn device_types(self) -> &'static [DeviceType] {
         match self {
             Self::OnOffLight => devices!(DEV_TYPE_ON_OFF_LIGHT, DEV_TYPE_BRIDGED_NODE),
-            Self::OnOffOutlet => devices!(DEV_TYPE_ON_OFF_OUTLET, DEV_TYPE_BRIDGED_NODE),
+            Self::OnOffOutlet => devices!(DEV_TYPE_ON_OFF_PLUG_IN_UNIT, DEV_TYPE_BRIDGED_NODE),
             Self::DimmableLight => devices!(DEV_TYPE_DIMMABLE_LIGHT, DEV_TYPE_BRIDGED_NODE),
             Self::ColorTemperatureLight => devices!(DEV_TYPE_COLOR_TEMPERATURE_LIGHT, DEV_TYPE_BRIDGED_NODE),
             Self::TemperatureSensor { humidity: false, battery: false } => devices!(DEV_TYPE_TEMPERATURE_SENSOR, DEV_TYPE_BRIDGED_NODE),
