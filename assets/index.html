@@ -239,14 +239,25 @@
   <button id="permitBadge" class="primary" hidden></button>
 </div>
 <main id="pageDevices">
-  <h2 id="climateTitle" hidden>Climate</h2>
-  <div id="climate" class="grid"></div>
-  <h2>Lights</h2>
-  <div id="lights" class="grid"></div>
-  <h2>Sensors</h2>
-  <div id="sensors" class="grid"></div>
-  <h2 id="otherTitle" hidden>Other</h2>
-  <div id="other" class="grid"></div>
+  <div id="deviceList" hidden>
+    <section id="climateSection" aria-labelledby="climateTitle" hidden>
+      <h2 id="climateTitle">Climate</h2>
+      <div id="climate" class="grid"></div>
+    </section>
+    <section id="lightsSection" aria-labelledby="lightsTitle" hidden>
+      <h2 id="lightsTitle">Lights</h2>
+      <div id="lights" class="grid"></div>
+    </section>
+    <section id="sensorsSection" aria-labelledby="sensorsTitle" hidden>
+      <h2 id="sensorsTitle">Sensors</h2>
+      <div id="sensors" class="grid"></div>
+    </section>
+    <section id="otherSection" aria-labelledby="otherTitle" hidden>
+      <h2 id="otherTitle">Other</h2>
+      <div id="other" class="grid"></div>
+    </section>
+    <div id="noDevices" class="empty" hidden>No devices yet.</div>
+  </div>
 </main>
 <main id="pageGroups" hidden>
   <div class="card" style="margin-bottom:12px">
@@ -406,6 +417,7 @@ async function api(path, body, method = "POST") {
 
 // Zigbee2MQTT's frontend.auth_token: one password, kept by the browser in a cookie
 function showLogin() {
+  $("#deviceList").hidden = true;
   const dlg = $("#loginDlg");
   if (!dlg.open) dlg.showModal();
   $("#loginPassword").focus();
@@ -1189,15 +1201,10 @@ function render() {
     groups[GROUPS[d.card] || "other"].push(entry.card);
   }
   for (const [id, list] of Object.entries(groups)) {
-    const container = $("#" + id);
-    if (list.length === 0 && (id === "lights" || id === "sensors")) {
-      container.replaceChildren(el("div", { className: "empty", textContent: id === "lights" ? "No lights yet." : "No sensors yet." }));
-    } else {
-      container.replaceChildren(...list);
-    }
+    $(`#${id}`).replaceChildren(...list);
+    $(`#${id}Section`).hidden = list.length === 0;
   }
-  $("#otherTitle").hidden = groups.other.length === 0;
-  $("#climateTitle").hidden = groups.climate.length === 0;
+  $("#noDevices").hidden = sorted.length > 0;
   renderGroups();
   if (detail.ieee) renderDetail();
 }
@@ -1898,6 +1905,7 @@ async function load() {
   if (state.settings) hubSettings = state.settings;
   groups = state.groups || [];
   render();
+  $("#deviceList").hidden = $("#loginDlg").open;
   if (page === "settings" || page === "logs") run(loadSettings());
   renderPermit();
 }
