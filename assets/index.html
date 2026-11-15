@@ -1721,7 +1721,7 @@ function passwordForm(enabled) {
 }
 
 function saveSettings(patch) {
-  return api("/api/hub/settings", { ...hubSettings, ...patch }).then(() => toast("Settings saved"));
+  return api("/api/hub/settings", patch).then(() => toast("Settings saved"));
 }
 
 async function loadSettings() {
