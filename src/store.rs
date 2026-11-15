@@ -297,6 +297,8 @@ pub struct Device {
     pub firmware: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ota_file_version: Option<u32>,
+    #[serde(skip)]
+    pub health: DeviceHealth,
     /// Fields older versions kept separately; moved into `state` on load
     #[serde(default, skip_serializing)]
     settings: BTreeMap<String, f64>,
@@ -322,6 +324,14 @@ fn default_true() -> bool {
     true
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct DeviceHealth {
+    pub first_message: Option<std::time::Instant>,
+    pub messages: u64,
+    pub leave_count: u64,
+    pub network_address_changes: u64,
+}
+
 impl Device {
     pub fn new(ieee: String, nwk: u16) -> Self {
         let suffix = ieee.replace(':', "");
@@ -339,6 +349,7 @@ impl Device {
             state: BTreeMap::new(),
             firmware: None,
             ota_file_version: None,
+            health: DeviceHealth::default(),
             zone_type: None,
             color_temp_min: None,
             color_temp_max: None,

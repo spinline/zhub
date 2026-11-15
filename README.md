@@ -211,6 +211,10 @@ umask 077; echo "zhub:<password>" > /opt/etc/mosquitto/passwd; chown nobody:nobo
 
 Then Settings → MQTT in zhub: broker 127.0.0.1, user zhub.
 
+The bridge publishes a retained health snapshot on `<base_topic>/bridge/health`
+when it connects and every 10 minutes. It includes Zigbee2MQTT-style system,
+process, MQTT and device metrics, plus zhub's radio timeouts and offline counts.
+
 Log: `/opt/var/log/zhub.log`. `--sniff` logs MAC command frames for diagnostics (the
 radio does not acknowledge frames while sniffing; use it only briefly).
 

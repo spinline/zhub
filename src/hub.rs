@@ -667,7 +667,7 @@ impl Hub {
         let network = data.network.as_ref();
         HubInfo {
             version: env!("CARGO_PKG_VERSION"),
-            uptime_seconds: self.started.elapsed().as_secs(),
+            uptime_seconds: self.uptime_seconds(),
             radio_firmware: self.ncp_version.clone(),
             ieee: eui64_to_string(&self.ieee),
             devices: data.devices.len(),
@@ -1009,6 +1009,28 @@ impl Hub {
         })
     }
 
+    pub fn uptime_seconds(&self) -> u64 {
+        self.started.elapsed().as_secs()
+    }
+
+    pub fn mqtt_device_health(&self) -> Json {
+        let data = self.data.lock().unwrap();
+        let devices = data.devices.values().map(|device| {
+            let stats = &device.health;
+            let rate = stats.first_message
+                .map(|first| first.elapsed().as_secs_f64())
+                .filter(|&seconds| seconds > 0.0)
+                .map_or(0.0, |seconds| (stats.messages as f64 / seconds * 10_000.0).round() / 10_000.0);
+            (crate::networkmap::eui64_hex(&device.ieee), json!({
+                "messages": stats.messages,
+                "messages_per_sec": rate,
+                "leave_count": stats.leave_count,
+                "network_address_changes": stats.network_address_changes,
+            }))
+        }).collect::<serde_json::Map<String, Json>>();
+        Json::Object(devices)
+    }
+
     pub fn log_lines(&self, after: u64) -> Vec<crate::logging::Line> {
         self.logging.buffer.since(after, 500)
     }
@@ -1166,6 +1188,12 @@ impl Hub {
             ZigbeeNotification::DeviceLeft { nwk, ieee, reason } => {
                 let ieee = ieee.map_or_else(|| self.ieee_for_nwk(nwk.0), |e| Some(eui64_to_string(&e)));
                 info!("Device left: {ieee:?} ({reason:?})");
+                if let Some(ieee) = &ieee
+                    && matches!(reason, DeviceLeaveReason::Announced { .. })
+                    && let Some(device) = self.data.lock().unwrap().devices.get_mut(ieee)
+                {
+                    device.health.leave_count += 1;
+                }
                 // Forget a device that left without announcing a rejoin; sleepy children
                 // that timed out rejoin by themselves
                 if let (Some(ieee), DeviceLeaveReason::Announced { rejoin: false }) = (ieee, reason) {
@@ -1191,6 +1219,8 @@ impl Hub {
             device.last_seen = Some(now_unix());
             device.lqi = Some(lqi);
             device.rssi = Some(rssi);
+            device.health.first_message.get_or_insert_with(Instant::now);
+            device.health.messages += 1;
         }
     }
 
@@ -1202,7 +1232,11 @@ impl Hub {
                 .devices
                 .entry(ieee.clone())
                 .or_insert_with(|| Device::new(ieee.clone(), nwk));
-            let changed = is_new || device.nwk != nwk;
+            let address_changed = device.nwk != nwk;
+            if address_changed {
+                device.health.network_address_changes += 1;
+            }
+            let changed = is_new || address_changed;
             device.nwk = nwk;
             device.rx_on_when_idle = rx_on_when_idle;
             device.router |= router;

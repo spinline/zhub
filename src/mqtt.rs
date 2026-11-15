@@ -6,6 +6,7 @@
 //! - `<base>/<name>/availability`: `{"state":"online"}` or `offline` (retained)
 //! - `<base>/bridge/state`, `<base>/bridge/info`, `<base>/bridge/devices` (with
 //!   Zigbee2MQTT's `exposes`), `<base>/bridge/groups`
+//! - `<base>/bridge/health`: periodic health snapshot (retained)
 //! - `<base>/bridge/request/permit_join` and `restart`
 //! - Home Assistant discovery under `<prefix>/…/config`
 //!
@@ -17,6 +18,7 @@ use std::time::Duration;
 
 use rumqttc::{AsyncClient, Event as MqttEvent, Incoming, LastWill, MqttOptions, QoS};
 use anyhow::Context as _;
+use serde::Serialize;
 use serde_json::{Map, Value as Json, json};
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, info, warn};
@@ -38,14 +40,25 @@ fn binary_words(key: &str) -> Option<(&'static str, &'static str)> {
 
 const HA_MODES: &[&str] = &["off", "heat", "auto", "cool", "heat_cool", "dry", "fan_only"];
 
+const HEALTH_INTERVAL: Duration = Duration::from_secs(10 * 60);
+
+#[derive(Clone, Copy, Default, Serialize)]
+struct MqttHealth {
+    connected: bool,
+    queued: usize,
+    published: u64,
+    received: u64,
+}
+
 pub async fn run(hub: Arc<Hub>) {
+    let health = Arc::new(Mutex::new(MqttHealth::default()));
     let mut settings = hub.mqtt_settings();
     loop {
         let current = settings.borrow_and_update().clone();
         if current.enabled {
             hub.set_mqtt_status("connecting");
             tokio::select! {
-                () = session(hub.clone(), current) => {}
+                () = session(hub.clone(), current, health.clone()) => {}
                 _ = settings.changed() => info!("MQTT settings changed, reconnecting"),
             }
         } else {
@@ -72,9 +85,15 @@ struct Bridge {
     /// A device or group got a new topic: bridge/info lists the names too
     renamed: bool,
     scene_payload: Option<String>,
+    health: Arc<Mutex<MqttHealth>>,
 }
 
-async fn session(hub: Arc<Hub>, cfg: MqttSettings) {
+async fn session(hub: Arc<Hub>, cfg: MqttSettings, health: Arc<Mutex<MqttHealth>>) {
+    {
+        let mut stats = health.lock().unwrap();
+        stats.connected = false;
+        stats.queued = 0;
+    }
     let id = hub.hub_ieee().replace(':', "");
     let mut options = MqttOptions::new(format!("zhub-{id}"), cfg.host.trim(), cfg.port);
     options.set_keep_alive(Duration::from_secs(30));
@@ -89,9 +108,22 @@ async fn session(hub: Arc<Hub>, cfg: MqttSettings) {
     // The event loop runs on its own so publishing never waits on it
     let (incoming_tx, mut incoming) = mpsc::unbounded_channel();
     let poller_hub = hub.clone();
+    let poller_health = health.clone();
     let _poller = AbortOnDrop(tokio::spawn(async move {
         loop {
-            match eventloop.poll().await {
+            let event = eventloop.poll().await;
+            {
+                let mut stats = poller_health.lock().unwrap();
+                stats.queued = eventloop.pending.len();
+                match &event {
+                    Ok(MqttEvent::Incoming(Incoming::ConnAck(_))) => stats.connected = true,
+                    Ok(MqttEvent::Incoming(Incoming::Publish(_))) => stats.received += 1,
+                    Ok(MqttEvent::Incoming(Incoming::PubAck(_))) => stats.published += 1,
+                    Err(_) => stats.connected = false,
+                    _ => {}
+                }
+            }
+            match event {
                 Ok(MqttEvent::Incoming(Incoming::ConnAck(_))) => {
                     poller_hub.set_mqtt_status("connected");
                     let _ = incoming_tx.send(None);
@@ -117,8 +149,12 @@ async fn session(hub: Arc<Hub>, cfg: MqttSettings) {
         discovery: HashMap::new(),
         renamed: false,
         scene_payload: None,
+        health,
     };
     let mut events = hub.subscribe();
+    let mut health_timer = tokio::time::interval(HEALTH_INTERVAL);
+    health_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    health_timer.reset();
     loop {
         tokio::select! {
             message = incoming.recv() => match message {
@@ -129,10 +165,13 @@ async fn session(hub: Arc<Hub>, cfg: MqttSettings) {
                     bridge.discovery.clear();
                     bridge.scene_payload = None;
                     bridge.connected().await;
+                    bridge.publish_health().await;
+                    health_timer.reset();
                 }
                 Some(Some((topic, payload))) => bridge.incoming(&topic, &payload).await,
                 None => break,
             },
+            _ = health_timer.tick() => bridge.publish_health().await,
             event = events.recv() => match event {
                 Ok(event) => {
                     bridge.hub_event(event).await;
@@ -184,6 +223,23 @@ impl Bridge {
         }
         self.publish(&format!("{base}/bridge/state"), r#"{"state":"online"}"#.into(), true).await;
         self.publish_all().await;
+    }
+
+    async fn publish_health(&self) {
+        let mqtt = *self.health.lock().unwrap();
+        if !mqtt.connected {
+            return;
+        }
+        let (os, process) = system_health(self.hub.uptime_seconds());
+        let payload = json!({
+            "response_time": crate::networkmap::now_ms(),
+            "os": os,
+            "process": process,
+            "mqtt": mqtt,
+            "devices": self.hub.mqtt_device_health(),
+            "zhub": self.hub.network_health(),
+        });
+        self.publish(&format!("{}/bridge/health", self.base()), payload.to_string(), true).await;
     }
 
     async fn publish_all(&mut self) {
@@ -1080,6 +1136,39 @@ pub async fn clean_stale(hub: &Arc<Hub>) -> anyhow::Result<Vec<String>> {
         info!("MQTT: removed the stale retained topic {topic}");
     }
     Ok(stale)
+}
+
+/// Read the analogous OS and process metrics on Linux. Other hosts can still
+/// publish uptime and Zigbee metrics when procfs is unavailable.
+fn system_health(uptime: u64) -> (Json, Json) {
+    let mut os = json!({});
+    let mut process = json!({"uptime_sec": uptime});
+    if let Ok(loadavg) = std::fs::read_to_string("/proc/loadavg") {
+        let load: Vec<f64> = loadavg.split_whitespace().take(3).filter_map(|value| value.parse().ok()).collect();
+        if load.len() == 3 {
+            os["load_average"] = json!(load);
+        }
+    }
+    let kib = |text: &str, key: &str| -> Option<f64> {
+        text.lines().find_map(|line| line.strip_prefix(key))?.split_whitespace().next()?.parse().ok()
+    };
+    let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
+    let total = kib(&meminfo, "MemTotal:").filter(|&value| value > 0.0);
+    let add_memory = |metrics: &mut Json, used: f64| {
+        metrics["memory_used_mb"] = json!((used / 1024.0 * 100.0).round() / 100.0);
+        if let Some(total) = total {
+            metrics["memory_percent"] = json!((used / total * 1_000_000.0).round() / 10_000.0);
+        }
+    };
+    if let (Some(total), Some(free)) = (total, kib(&meminfo, "MemFree:")) {
+        add_memory(&mut os, (total - free).max(0.0));
+    }
+    if let Ok(status) = std::fs::read_to_string("/proc/self/status")
+        && let Some(rss) = kib(&status, "VmRSS:")
+    {
+        add_memory(&mut process, rss);
+    }
+    (os, process)
 }
 
 fn z2m_networkmap_format(kind: &str) -> bool {
