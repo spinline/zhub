@@ -214,7 +214,7 @@
   .map-health h3 { margin: 0; font-size: 15px; }
   .map-health .info { margin: 0; }
   .map-health a { color: var(--muted); font-size: 13px; }
-  .map-connections summary { cursor: pointer; }
+  .map-connections h3 { margin: 0; font-size: 15px; }
   .map-connections select { display: block; max-width: 100%; margin: 10px 0; }
   .map-neighbor { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 12px; padding: 8px 0; border-top: 1px solid var(--line); font-size: 13px; }
   .map-neighbor span { overflow-wrap: anywhere; }
@@ -290,12 +290,12 @@
     <div class="map-legend"><span><i style="background:#e04e5d"></i>Coordinator</span><span><i style="background:#4ea3e0"></i>Router</span><span><i style="background:#fff8ce"></i>End device</span><span><i style="background:var(--ok)"></i>LQI ≥ 150</span><span><i style="background:#d9a400"></i>80–149</span><span><i style="background:var(--warn)"></i>&lt; 80</span></div>
   </div>
   <p class="sub" id="mapFailed" hidden></p>
-  <details class="card map-connections" id="mapConnections" hidden style="margin-top:12px">
-    <summary id="mapConnectionSummary">Connections</summary>
+  <section class="card map-connections" id="mapConnections" aria-labelledby="mapConnectionTitle" hidden style="margin-top:12px">
+    <h3 id="mapConnectionTitle">Connections</h3>
     <label for="mapDevice" class="sub">Device</label>
     <select id="mapDevice"></select>
     <div id="mapRows"></div>
-  </details>
+  </section>
 </main>
 <main id="pageSettings" hidden>
   <div class="settings">
@@ -1560,8 +1560,8 @@ function drawMap(map) {
 
   // Radial layout: the hub in the middle, routers on the inner ring, end devices on the
   // outer ring next to their parent
-  $("#mapGraphCard").hidden = false;
-  const width = svg.clientWidth || 800;
+  // Keep the original drawing space on narrow screens, including after a rescan.
+  const width = Math.max(svg.clientWidth, 800);
   // Room for the outer ring's labels beside it (about 6 px a letter); names that would
   // take more than a third of the width are shortened
   const longest = Math.max(0, ...map.nodes.filter(n => n.type === "EndDevice").map(n => n.friendlyName.length));
@@ -1636,6 +1636,7 @@ function drawMap(map) {
     dots.push(g);
   }
   svg.replaceChildren(...lines, ...labels, ...dots);
+  $("#mapGraphCard").hidden = false;
 
   const connections = new Map();
   for (const link of map.links) {
@@ -1664,7 +1665,7 @@ function drawMap(map) {
   };
   select.onchange = showConnections;
   showConnections();
-  $("#mapConnectionSummary").textContent = `Connections (${map.links.length})`;
+  $("#mapConnectionTitle").textContent = `Connections (${map.links.length})`;
   $("#mapConnections").hidden = map.links.length === 0;
   const failed = map.nodes.filter(n => n.failed.length).map(n => n.friendlyName);
   $("#mapFailed").textContent = failed.length ? `No answer from: ${failed.join(", ")}` : "";
