@@ -25,6 +25,7 @@ pub mod cluster {
     pub const SCENES: u16 = 0x0005;
     pub const POLL_CONTROL: u16 = 0x0020;
     pub const TIME: u16 = 0x000A;
+    pub const OTA: u16 = 0x0019;
     pub const THERMOSTAT: u16 = 0x0201;
     pub const ON_OFF: u16 = 0x0006;
     pub const LEVEL: u16 = 0x0008;

@@ -295,6 +295,8 @@ pub struct Device {
     pub state: BTreeMap<String, Json>,
     #[serde(default)]
     pub firmware: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ota_file_version: Option<u32>,
     /// Fields older versions kept separately; moved into `state` on load
     #[serde(default, skip_serializing)]
     settings: BTreeMap<String, f64>,
@@ -336,6 +338,7 @@ impl Device {
             interviewed: false,
             state: BTreeMap::new(),
             firmware: None,
+            ota_file_version: None,
             zone_type: None,
             color_temp_min: None,
             color_temp_max: None,

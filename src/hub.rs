@@ -150,6 +150,7 @@ pub struct DeviceView {
 enum PendingKey {
     Zdo { cluster: u16, tsn: u8 },
     Zcl { nwk: u16, seq: u8 },
+    OtaVersion { nwk: u16, ep: u8 },
 }
 
 pub struct Hub {
@@ -359,6 +360,20 @@ fn apply_default_names(data: &mut Persisted) {
     }
 }
 
+fn ota_file_version(payload: &[u8]) -> Option<u32> {
+    // Field control, manufacturer code, image type, file version, optional hardware version.
+    let (&control, _) = payload.split_first()?;
+    let expected_len = match control {
+        0 => 9,
+        1 => 11,
+        _ => return None,
+    };
+    if payload.len() != expected_len {
+        return None;
+    }
+    Some(u32::from_le_bytes(payload[5..9].try_into().ok()?))
+}
+
 /// Applies ZCL attribute records to the device state through its definition's features
 fn apply_zcl_records(device: &mut Device, cluster_id: u16, manufacturer: Option<u16>, records: &[zcl::AttributeRecord]) {
     if cluster_id == cluster::BASIC {
@@ -367,7 +382,11 @@ fn apply_zcl_records(device: &mut Device, cluster_id: u16, manufacturer: Option<
             match record.id {
                 0x0004 => device.manufacturer = text.map(str::to_owned),
                 0x0005 => device.model = text.map(str::to_owned),
-                0x4000 => device.firmware = text.map(str::to_owned),
+                0x4000 if manufacturer.is_none() => {
+                    if let Some(version) = text {
+                        device.firmware = Some(version.to_owned());
+                    }
+                }
                 _ => {}
             }
         }
@@ -692,6 +711,48 @@ impl Hub {
             bail!("Matter is disabled");
         }
         self.matter_commands.send(command).map_err(|_| anyhow!("the Matter bridge is not running"))
+    }
+
+    /// Reads the installed version without reconfiguring the device or offering an image.
+    pub async fn read_firmware(&self, ieee: &str) -> Result<()> {
+        let device = self.device(ieee).context("unknown device")?;
+        if let Some(ep) = device.endpoint_with(cluster::BASIC)
+            && let Ok(records) = self
+                .read_attributes(device.nwk, ep, cluster::BASIC, None, &[0x4000])
+                .await
+            && records.iter().any(|record| {
+                record.id == 0x4000 && record.value.as_ref().and_then(Value::as_str).is_some_and(|s| !s.is_empty())
+            })
+        {
+            return Ok(());
+        }
+
+        let ep = device
+            .endpoints
+            .iter()
+            .find(|ep| ep.out_clusters.contains(&cluster::OTA))
+            .context("The device did not report a firmware version")?;
+        let notify = zcl::frame(
+            zcl::FC_CLUSTER_SPECIFIC | zcl::FC_SERVER_TO_CLIENT | zcl::FC_DISABLE_DEFAULT_RESPONSE,
+            self.next_seq(),
+            0x00, // Image Notify with only a query jitter, set to 100%
+            &[0x00, 100],
+        );
+        let result = self.request(
+            PendingKey::OtaVersion { nwk: device.nwk, ep: ep.id },
+            device.nwk,
+            ep.profile,
+            cluster::OTA,
+            HUB_ENDPOINT,
+            ep.id,
+            notify,
+            None,
+        ).await;
+        if result.as_ref().is_err_and(|e| e.is::<NoReply>()) && !device.rx_on_when_idle {
+            bail!("No firmware reply. Wake the device and try again.");
+        }
+        result?;
+        Ok(())
     }
 
     // ---- For the Matter bridge ----
@@ -1294,6 +1355,29 @@ impl Hub {
             return;
         }
 
+        if cluster_id == cluster::OTA && !header.server_to_client() && header.manufacturer.is_none()
+            && header.command == 0x01 && dst_ep == HUB_ENDPOINT
+        {
+            // Query Next Image carries a device-generated sequence, so match by endpoint.
+            if let (Some(ieee), Some(version)) = (&ieee, ota_file_version(payload)) {
+                self.update_device(ieee, |device| device.ota_file_version = Some(version));
+                self.complete(PendingKey::OtaVersion { nwk: source, ep: src_ep }, Vec::new());
+            }
+            let reply = zcl::frame(
+                zcl::FC_CLUSTER_SPECIFIC | zcl::FC_SERVER_TO_CLIENT | zcl::FC_DISABLE_DEFAULT_RESPONSE,
+                header.seq,
+                0x02, // Query Next Image Response
+                &[0x98], // NO_IMAGE_AVAILABLE
+            );
+            let profile = ieee.as_ref().and_then(|ieee| self.device(ieee)).and_then(|d| {
+                d.endpoints.iter().find(|ep| ep.id == src_ep).map(|ep| ep.profile)
+            }).unwrap_or(HA_PROFILE);
+            if let Err(e) = self.send(source, profile, cluster::OTA, dst_ep, src_ep, reply, false) {
+                debug!("cannot send OTA query response: {e:#}");
+            }
+            return;
+        }
+
         // A cluster-specific response (e.g. Add Group Response) answers a request of ours;
         // a frame nobody waits for passes through unchanged
         if header.server_to_client() {
@@ -1573,7 +1657,15 @@ impl Hub {
         wait: Option<Duration>,
     ) -> Result<Vec<u8>> {
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().unwrap().insert(key, tx);
+        {
+            let mut pending = self.pending.lock().unwrap();
+            if matches!(key, PendingKey::OtaVersion { .. })
+                && pending.get(&key).is_some_and(|waiter| !waiter.is_closed())
+            {
+                bail!("A firmware version read is already in progress");
+            }
+            pending.insert(key, tx);
+        }
         if let Err(e) = self.send(nwk, profile, cluster_id, src_ep, dst_ep, data, true) {
             self.pending.lock().unwrap().remove(&key);
             return Err(e);
@@ -3085,6 +3177,18 @@ fn restore_tables(stack: &ZigbeeStack<SpinelPhy>, data: &Persisted) {
 mod tests {
     use super::*;
     use crate::store::Endpoint;
+
+    #[test]
+    fn reads_current_version_from_ota_query() {
+        let query = [0, 0x0b, 0x10, 0x14, 0x01, 0x00, 0x2b, 0x00, 0x01];
+        assert_eq!(ota_file_version(&query), Some(0x01002b00));
+        assert_eq!(ota_file_version(&query[..8]), None);
+        let mut with_hardware = query.to_vec();
+        with_hardware[0] = 1;
+        assert_eq!(ota_file_version(&with_hardware), None);
+        with_hardware.extend_from_slice(&[1, 0]);
+        assert_eq!(ota_file_version(&with_hardware), Some(0x01002b00));
+    }
 
     fn device_with(clusters: &[u16]) -> Device {
         let mut device = Device::new("00:17:88:01:02:03:04:05".into(), 0x1234);
