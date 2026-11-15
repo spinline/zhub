@@ -37,6 +37,7 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .route("/api/matter/reset", post(matter_reset))
         .route("/api/logs", get(logs))
         .route("/api/networkmap", get(network_map))
+        .route("/api/health", get(network_health))
         .route("/api/devices/{ieee}", axum::routing::delete(remove))
         .route("/api/devices/{ieee}/set", post(set))
         .route("/api/devices/{ieee}/rename", post(rename))
@@ -313,6 +314,10 @@ async fn network_map(State(hub): State<Arc<Hub>>, Query(q): Query<MapQuery>) -> 
     }
     let map = hub.network_map(q.routes).await;
     Ok(Json(crate::networkmap::render(&map, &q.kind, q.routes, crate::networkmap::now_ms())?))
+}
+
+async fn network_health(State(hub): State<Arc<Hub>>) -> ApiResult {
+    Ok(Json(hub.network_health()))
 }
 
 async fn restart(State(hub): State<Arc<Hub>>) -> ApiResult {

@@ -211,9 +211,14 @@
   #mapGraph.focus .edge.hi { stroke-opacity: 1; display: inline; }
   .map-legend { display: flex; flex-wrap: wrap; gap: 6px 14px; padding: 10px 14px; border-top: 1px solid var(--line); font-size: 12px; color: var(--muted); }
   .map-legend i { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 5px; border: 1px solid #0003; vertical-align: -1px; }
-  .map-table { width: 100%; border-collapse: collapse; font-size: 13px; }
-  .map-table th, .map-table td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
-  .map-table th { color: var(--muted); font-weight: 500; }
+  .map-health h3 { margin: 0; font-size: 15px; }
+  .map-health .info { margin: 0; }
+  .map-health a { color: var(--muted); font-size: 13px; }
+  .map-connections summary { cursor: pointer; }
+  .map-connections select { display: block; max-width: 100%; margin: 10px 0; }
+  .map-neighbor { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 12px; padding: 8px 0; border-top: 1px solid var(--line); font-size: 13px; }
+  .map-neighbor span { overflow-wrap: anywhere; }
+  .map-neighbor small { grid-column: 1 / -1; color: var(--muted); overflow-wrap: anywhere; }
   label.check { display: inline-flex; align-items: center; gap: 6px; font-size: 14px; }
 </style>
 </head>
@@ -270,6 +275,11 @@
   <div id="groups" class="grid"></div>
 </main>
 <main id="pageMap" hidden>
+  <div class="card map-health" id="mapHealth" hidden style="margin-bottom:12px">
+    <h3>Health</h3>
+    <dl class="info" id="mapHealthRows"></dl>
+    <a href="#logs">View logs</a>
+  </div>
   <div class="card" style="margin-bottom:12px">
     <div class="ctl" style="border:0;padding:0">
       <div class="row"><button id="mapScan" class="primary">Scan</button><label class="check"><input id="mapRoutes" type="checkbox"> Include routes</label></div>
@@ -279,7 +289,13 @@
   <div class="card map-card" id="mapGraphCard" hidden><svg id="mapGraph"></svg>
     <div class="map-legend"><span><i style="background:#e04e5d"></i>Coordinator</span><span><i style="background:#4ea3e0"></i>Router</span><span><i style="background:#fff8ce"></i>End device</span><span><i style="background:var(--ok)"></i>LQI ≥ 150</span><span><i style="background:#d9a400"></i>80–149</span><span><i style="background:var(--warn)"></i>&lt; 80</span></div>
   </div>
-  <div class="card" id="mapTableCard" hidden style="margin-top:12px;overflow-x:auto"><table class="map-table"><thead><tr><th>Device</th><th>Neighbor</th><th>Relationship</th><th>LQI</th><th>Depth</th><th>Routes</th></tr></thead><tbody id="mapRows"></tbody></table><div class="desc" id="mapFailed"></div></div>
+  <p class="sub" id="mapFailed" hidden></p>
+  <details class="card map-connections" id="mapConnections" hidden style="margin-top:12px">
+    <summary id="mapConnectionSummary">Connections</summary>
+    <label for="mapDevice" class="sub">Device</label>
+    <select id="mapDevice"></select>
+    <div id="mapRows"></div>
+  </details>
 </main>
 <main id="pageSettings" hidden>
   <div class="settings">
@@ -418,6 +434,7 @@ async function api(path, body, method = "POST") {
 // Zigbee2MQTT's frontend.auth_token: one password, kept by the browser in a cookie
 function showLogin() {
   $("#deviceList").hidden = true;
+  $("#mapHealth").hidden = true;
   const dlg = $("#loginDlg");
   if (!dlg.open) dlg.showModal();
   $("#loginPassword").focus();
@@ -1543,6 +1560,7 @@ function drawMap(map) {
 
   // Radial layout: the hub in the middle, routers on the inner ring, end devices on the
   // outer ring next to their parent
+  $("#mapGraphCard").hidden = false;
   const width = svg.clientWidth || 800;
   // Room for the outer ring's labels beside it (about 6 px a letter); names that would
   // take more than a third of the width are shortened
@@ -1618,22 +1636,49 @@ function drawMap(map) {
     dots.push(g);
   }
   svg.replaceChildren(...lines, ...labels, ...dots);
-  $("#mapGraphCard").hidden = false;
 
-  const rows = map.links
-    .slice()
-    .sort((x, y) => (name.get(x.target.ieeeAddr) || "").localeCompare(name.get(y.target.ieeeAddr) || "") || y.lqi - x.lqi)
-    .map(l => el("tr", {},
-      el("td", { textContent: name.get(l.target.ieeeAddr) || l.target.ieeeAddr }),
-      el("td", { textContent: name.get(l.source.ieeeAddr) || l.source.ieeeAddr }),
-      el("td", { textContent: RELATIONSHIP[l.relationship] || String(l.relationship) }),
-      el("td", {}, el("span", { textContent: l.lqi, style: `color:${lqiColor(l.lqi)};font-weight:600` })),
-      el("td", { textContent: l.depth === 255 ? "–" : l.depth }),
-      el("td", { textContent: l.routes.map(r => "0x" + r.destinationAddress.toString(16).padStart(4, "0")).join(", ") })));
-  $("#mapRows").replaceChildren(...rows);
+  const connections = new Map();
+  for (const link of map.links) {
+    const id = link.target.ieeeAddr;
+    if (!connections.has(id)) connections.set(id, []);
+    connections.get(id).push(link);
+  }
+  const select = $("#mapDevice");
+  const previous = select.value;
+  const ids = [...connections.keys()].sort((a, b) => (name.get(a) || a).localeCompare(name.get(b) || b));
+  select.replaceChildren(...ids.map(id => el("option", { value: id, textContent: name.get(id) || id })));
+  if (connections.has(previous)) select.value = previous;
+
+  const showConnections = () => {
+    const links = connections.get(select.value) || [];
+    const rows = links.sort((a, b) => b.lqi - a.lqi).map(link => {
+      const metadata = [RELATIONSHIP[link.relationship] ?? String(link.relationship)];
+      if (link.depth !== 255) metadata.push(`Depth ${link.depth}`);
+      if (link.routes.length) metadata.push(`Routes ${link.routes.map(r => hex(r.destinationAddress)).join(", ")}`);
+      return el("div", { className: "map-neighbor" },
+        el("span", { textContent: name.get(link.source.ieeeAddr) || link.source.ieeeAddr }),
+        el("span", { textContent: `LQI ${link.lqi}`, style: `color:${lqiColor(link.lqi)}` }),
+        el("small", { textContent: metadata.join(" · ") }));
+    });
+    $("#mapRows").replaceChildren(...rows);
+  };
+  select.onchange = showConnections;
+  showConnections();
+  $("#mapConnectionSummary").textContent = `Connections (${map.links.length})`;
+  $("#mapConnections").hidden = map.links.length === 0;
   const failed = map.nodes.filter(n => n.failed.length).map(n => n.friendlyName);
   $("#mapFailed").textContent = failed.length ? `No answer from: ${failed.join(", ")}` : "";
-  $("#mapTableCard").hidden = false;
+  $("#mapFailed").hidden = failed.length === 0;
+}
+
+async function loadNetworkHealth() {
+  const health = await api("/api/health", null, "GET");
+  infoRows($("#mapHealthRows"), [
+    ["Radio timeouts since startup", String(health.radio_timeouts)],
+    ["Last radio timeout", health.last_radio_timeout == null ? "—" : new Date(health.last_radio_timeout * 1000).toLocaleString()],
+    ["Offline devices", `${health.offline_devices} / ${health.total_devices}`],
+  ]);
+  $("#mapHealth").hidden = $("#loginDlg").open;
 }
 
 // ---- Settings page ----
@@ -1653,6 +1698,7 @@ function showPage() {
   $("#pageTitle").textContent = PAGES[page];
   for (const a of document.querySelectorAll("#menu a")) a.classList.toggle("active", a.dataset.page === page);
   document.body.classList.remove("menu-open");
+  if (page === "map") run(loadNetworkHealth());
   if (page === "settings" || page === "logs") run(loadSettings());
   pollLogs();
 }
@@ -1949,7 +1995,11 @@ function connect() {
   };
 }
 
-setInterval(() => { renderPermit(); render(); }, 1000 * 15);
+setInterval(() => {
+  renderPermit();
+  render();
+  if (page === "map" && !document.hidden && !$("#loginDlg").open) run(loadNetworkHealth());
+}, 1000 * 15);
 setInterval(renderPermit, 1000);
 showPage();
 // With a password set, connect only after logging in (the event stream would just fail)

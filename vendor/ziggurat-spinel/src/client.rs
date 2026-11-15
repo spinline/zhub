@@ -14,6 +14,7 @@ use ziggurat_ieee_802154::types::Eui64;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::mpsc;
@@ -261,6 +262,7 @@ pub struct SpinelClient {
     /// [`Self::lock_radio`].
     exclusive_lock: AsyncMutex<()>,
     consecutive_timeouts: AtomicU32,
+    command_timeouts: Mutex<(u64, Option<u64>)>,
 }
 
 impl SpinelClient {
@@ -278,7 +280,13 @@ impl SpinelClient {
             protocol: Arc::new(Mutex::new(SpinelProtocol::new())),
             exclusive_lock: AsyncMutex::new(()),
             consecutive_timeouts: AtomicU32::new(0),
+            command_timeouts: Mutex::new((0, None)),
         }
+    }
+
+    /// Command timeout count since opening the radio and the last timeout's Unix timestamp.
+    pub fn command_timeouts(&self) -> (u64, Option<u64>) {
+        *self.command_timeouts.lock().unwrap()
     }
 
     pub fn set_property_update_receiver(
@@ -424,6 +432,12 @@ impl SpinelClient {
                     .lock()
                     .expect("Failed to lock Spinel")
                     .cancel_request(frame.header.transaction_id);
+
+                {
+                    let mut stats = self.command_timeouts.lock().unwrap();
+                    stats.0 += 1;
+                    stats.1 = SystemTime::now().duration_since(UNIX_EPOCH).ok().map(|elapsed| elapsed.as_secs());
+                }
 
                 let timeouts = self.consecutive_timeouts.fetch_add(1, Ordering::Relaxed) + 1;
                 if timeouts >= MAX_CONSECUTIVE_TIMEOUTS {

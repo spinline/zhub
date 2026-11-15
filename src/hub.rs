@@ -997,6 +997,18 @@ impl Hub {
         self.restart.notified().await;
     }
 
+    pub fn network_health(&self) -> Json {
+        let (radio_timeouts, last_radio_timeout) = self.spinel.command_timeouts();
+        let data = self.data.lock().unwrap();
+        let offline_devices = data.devices.values().filter(|device| offline(&data.settings, device)).count();
+        json!({
+            "radio_timeouts": radio_timeouts,
+            "last_radio_timeout": last_radio_timeout,
+            "offline_devices": offline_devices,
+            "total_devices": data.devices.len(),
+        })
+    }
+
     pub fn log_lines(&self, after: u64) -> Vec<crate::logging::Line> {
         self.logging.buffer.since(after, 500)
     }

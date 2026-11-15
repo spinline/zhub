@@ -6,6 +6,7 @@ zhub's Cargo.toml.
 
 - `src/client.rs`: a transmit (`STREAM_RAW`) waits `TX_TIMEOUT` (250 ms) for the RCP's
   TX-done status instead of the 2 s command timeout, unless it is a delayed (CSL)
-  transmit. Other commands keep 2 s.
+  transmit. Other commands keep 2 s. The client tracks the count and most recent time
+  of command timeouts for the network health view.
 - `Cargo.toml`: workspace fields made concrete; the one workspace dependency comes from
   the same git revision; dev-dependencies (tests not copied) dropped.
