@@ -956,22 +956,10 @@ function aboutTab(d) {
   interview.onclick = () => run(api(`/api/devices/${ieee}/interview`).then(r => toast(r.waiting_for_wake
     ? "Battery device: press its button briefly to wake it up; the interview starts then."
     : "Interviewing the device.")));
-  const firmware = el("button", { textContent: "Read firmware version" });
-  firmware.onclick = () => {
-    firmware.disabled = true;
-    firmware.textContent = "Reading firmware version…";
-    if (!devices.get(ieee)?.rx_on_when_idle) toast("Press the device button briefly to wake it.");
-    run(api(`/api/devices/${ieee}/firmware`)
-      .then(() => toast("Firmware version read."))
-      .finally(() => {
-        firmware.disabled = false;
-        firmware.textContent = "Read firmware version";
-      }));
-  };
   const remove = el("button", { textContent: "Remove", className: "danger" });
   remove.onclick = () => openRemove(ieee);
   return {
-    node: el("div", {}, info, el("div", { className: "actions" }, rename, firmware, interview, remove)),
+    node: el("div", {}, info, el("div", { className: "actions" }, rename, interview, remove)),
     update(d) {
       const type = d.router ? "Router (mains powered)" : d.rx_on_when_idle ? "End device" : "End device (sleepy, battery)";
       const interview = d.interviewing ? "In progress" : d.waiting_for_wake ? "On next wake-up" : d.interviewed ? "Completed" : "Failed";

@@ -360,6 +360,12 @@ fn apply_default_names(data: &mut Persisted) {
     }
 }
 
+fn has_firmware_version(records: &[zcl::AttributeRecord]) -> bool {
+    records.iter().any(|record| {
+        record.id == 0x4000 && record.value.as_ref().and_then(Value::as_str).is_some_and(|s| !s.is_empty())
+    })
+}
+
 fn ota_file_version(payload: &[u8]) -> Option<u32> {
     // Field control, manufacturer code, image type, file version, optional hardware version.
     let (&control, _) = payload.split_first()?;
@@ -711,48 +717,6 @@ impl Hub {
             bail!("Matter is disabled");
         }
         self.matter_commands.send(command).map_err(|_| anyhow!("the Matter bridge is not running"))
-    }
-
-    /// Reads the installed version without reconfiguring the device or offering an image.
-    pub async fn read_firmware(&self, ieee: &str) -> Result<()> {
-        let device = self.device(ieee).context("unknown device")?;
-        if let Some(ep) = device.endpoint_with(cluster::BASIC)
-            && let Ok(records) = self
-                .read_attributes(device.nwk, ep, cluster::BASIC, None, &[0x4000])
-                .await
-            && records.iter().any(|record| {
-                record.id == 0x4000 && record.value.as_ref().and_then(Value::as_str).is_some_and(|s| !s.is_empty())
-            })
-        {
-            return Ok(());
-        }
-
-        let ep = device
-            .endpoints
-            .iter()
-            .find(|ep| ep.out_clusters.contains(&cluster::OTA))
-            .context("The device did not report a firmware version")?;
-        let notify = zcl::frame(
-            zcl::FC_CLUSTER_SPECIFIC | zcl::FC_SERVER_TO_CLIENT | zcl::FC_DISABLE_DEFAULT_RESPONSE,
-            self.next_seq(),
-            0x00, // Image Notify with only a query jitter, set to 100%
-            &[0x00, 100],
-        );
-        let result = self.request(
-            PendingKey::OtaVersion { nwk: device.nwk, ep: ep.id },
-            device.nwk,
-            ep.profile,
-            cluster::OTA,
-            HUB_ENDPOINT,
-            ep.id,
-            notify,
-            None,
-        ).await;
-        if result.as_ref().is_err_and(|e| e.is::<NoReply>()) && !device.rx_on_when_idle {
-            bail!("No firmware reply. Wake the device and try again.");
-        }
-        result?;
-        Ok(())
     }
 
     // ---- For the Matter bridge ----
@@ -1778,6 +1742,37 @@ impl Hub {
         Ok(zcl::parse_read_response(&body))
     }
 
+    /// Some devices omit the software build from the multi-attribute interview read.
+    async fn read_interview_firmware(&self, device: &Device) -> Result<()> {
+        if let Some(ep) = device.endpoint_with(cluster::BASIC)
+            && let Ok(records) = self.read_attributes(device.nwk, ep, cluster::BASIC, None, &[0x4000]).await
+            && has_firmware_version(&records)
+        {
+            return Ok(());
+        }
+
+        let Some(ep) = device.endpoints.iter().find(|ep| ep.out_clusters.contains(&cluster::OTA)) else {
+            return Ok(());
+        };
+        let notify = zcl::frame(
+            zcl::FC_CLUSTER_SPECIFIC | zcl::FC_SERVER_TO_CLIENT | zcl::FC_DISABLE_DEFAULT_RESPONSE,
+            self.next_seq(),
+            0x00, // Image Notify with only a query jitter, set to 100%
+            &[0x00, 100],
+        );
+        self.request(
+            PendingKey::OtaVersion { nwk: device.nwk, ep: ep.id },
+            device.nwk,
+            ep.profile,
+            cluster::OTA,
+            HUB_ENDPOINT,
+            ep.id,
+            notify,
+            None,
+        ).await?;
+        Ok(())
+    }
+
     // ---- Interview ----
 
     /// A short delay after joining so the device finishes the key exchange
@@ -1857,17 +1852,22 @@ impl Hub {
         self.update_device(ieee, |d| d.endpoints = endpoints);
 
         let device = self.device(ieee).context("device not in the list")?;
+        let mut firmware_read = false;
         if let Some(ep) = device.endpoint_with(cluster::BASIC) {
             // Tuya devices do not send data until these are read in a single request;
             // harmless for other devices
-            if let Err(e) = self
+            match self
                 .read_attributes(nwk, ep, cluster::BASIC, None, &[0x0004, 0x0000, 0x0001, 0x0005, 0x0007, 0xFFFE, 0x4000])
                 .await
             {
-                warn!("{ieee} cannot read basic info: {e:#}");
+                Ok(records) => firmware_read = has_firmware_version(&records),
+                Err(e) => warn!("{ieee} cannot read basic info: {e:#}"),
             }
         }
 
+        if !firmware_read && let Err(e) = self.read_interview_firmware(&device).await {
+            debug!("{ieee} cannot read firmware version: {e:#}");
+        }
         self.configure(ieee).await;
 
         if let Some(ep) = self.device(ieee).and_then(|d| d.endpoint_with(tuya::CLUSTER)) {

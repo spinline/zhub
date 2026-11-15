@@ -42,7 +42,6 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .route("/api/devices/{ieee}/rename", post(rename))
         .route("/api/devices/{ieee}/options", post(device_options))
         .route("/api/devices/{ieee}/interview", post(interview))
-        .route("/api/devices/{ieee}/firmware", post(read_firmware))
         .route("/api/devices/{ieee}/bindings", get(bindings))
         .route("/api/groups", post(create_group))
         .route("/api/groups/{id}", axum::routing::delete(delete_group))
@@ -406,11 +405,6 @@ async fn rename(
     Json(body): Json<Rename>,
 ) -> ApiResult {
     hub.rename(&ieee, &body.name)?;
-    ok()
-}
-
-async fn read_firmware(State(hub): State<Arc<Hub>>, Path(ieee): Path<String>) -> ApiResult {
-    hub.read_firmware(&ieee).await?;
     ok()
 }
 
