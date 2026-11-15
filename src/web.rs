@@ -37,6 +37,8 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .route("/api/matter/reset", post(matter_reset))
         .route("/api/logs", get(logs))
         .route("/api/networkmap", get(network_map))
+        .route("/api/networkmap/scan", post(start_network_scan))
+        .route("/api/networkmap/scan/{id}", get(network_scan_result))
         .route("/api/health", get(network_health))
         .route("/api/devices/{ieee}", axum::routing::delete(remove))
         .route("/api/devices/{ieee}/set", post(set))
@@ -314,6 +316,18 @@ async fn network_map(State(hub): State<Arc<Hub>>, Query(q): Query<MapQuery>) -> 
     }
     let map = hub.network_map(q.routes).await;
     Ok(Json(crate::networkmap::render(&map, &q.kind, q.routes, crate::networkmap::now_ms())?))
+}
+
+async fn start_network_scan(State(hub): State<Arc<Hub>>, Query(q): Query<MapQuery>) -> ApiResult {
+    Ok(Json(json!({ "id": hub.start_web_scan(q.routes)? })))
+}
+
+async fn network_scan_result(State(hub): State<Arc<Hub>>, Path(id): Path<u64>) -> Result<impl IntoResponse, ApiError> {
+    let map = hub.web_scan_result(id)?;
+    Ok((
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(json!({ "pending": map.is_none(), "value": map.as_deref() })),
+    ))
 }
 
 async fn network_health(State(hub): State<Arc<Hub>>) -> ApiResult {

@@ -1525,13 +1525,26 @@ const NODE_COLOR = { Coordinator: "#e04e5d", Router: "#4ea3e0", EndDevice: "#fff
 const lqiColor = (lqi) => lqi >= 150 ? "var(--ok)" : lqi >= 80 ? "#d9a400" : "var(--warn)";
 
 $("#mapScan").onclick = () => {
-  const button = $("#mapScan");
-  button.disabled = true;
+  const button = $("#mapScan"), routes = $("#mapRoutes");
+  button.disabled = routes.disabled = true;
   button.textContent = "Scanning…";
-  run(api(`/api/networkmap?routes=${$("#mapRoutes").checked}`, null, "GET")
-    .then(res => drawMap(res.value))
-    .finally(() => { button.disabled = false; button.textContent = "Scan"; }));
+  run(scanNetwork(routes.checked).finally(() => {
+    button.disabled = routes.disabled = false;
+    button.textContent = "Scan";
+  }));
 };
+
+async function scanNetwork(routes) {
+  const { id } = await api(`/api/networkmap/scan?routes=${routes}`);
+  while (true) {
+    const result = await api(`/api/networkmap/scan/${id}`, null, "GET");
+    if (!result.pending) {
+      drawMap(result.value);
+      return;
+    }
+    await new Promise(resolve => setTimeout(resolve, 2000));
+  }
+}
 
 function drawMap(map) {
   const svgNs = "http://www.w3.org/2000/svg";
@@ -1667,8 +1680,12 @@ function drawMap(map) {
   showConnections();
   $("#mapConnectionTitle").textContent = `Connections (${map.links.length})`;
   $("#mapConnections").hidden = map.links.length === 0;
-  const failed = map.nodes.filter(n => n.failed.length).map(n => n.friendlyName);
-  $("#mapFailed").textContent = failed.length ? `No answer from: ${failed.join(", ")}` : "";
+  const failed = [["lqi", "Neighbor table unavailable"], ["routingTable", "Routing table unavailable"]]
+    .flatMap(([table, label]) => {
+      const names = map.nodes.filter(n => n.failed.includes(table)).map(n => n.friendlyName);
+      return names.length ? [`${label}: ${names.join(", ")}`] : [];
+    });
+  $("#mapFailed").textContent = failed.join(" · ");
   $("#mapFailed").hidden = failed.length === 0;
 }
 

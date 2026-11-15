@@ -199,8 +199,15 @@ pub struct Hub {
     offline: Mutex<HashSet<String>>,
     /// One network scan at a time: a second would only double the traffic
     scanning: tokio::sync::Mutex<()>,
+    web_scan: Mutex<Option<WebScan>>,
     scene_lock: tokio::sync::Mutex<()>,
     mqtt_status: Mutex<String>,
+}
+
+struct WebScan {
+    id: u64,
+    routes: bool,
+    result: Option<Arc<crate::networkmap::NetworkMap>>,
 }
 
 /// Requests from the UI to the Matter bridge
@@ -635,6 +642,7 @@ impl Hub {
             mqtt_status: Mutex::new("disabled".into()),
             offline: Mutex::new(HashSet::new()),
             scanning: tokio::sync::Mutex::new(()),
+            web_scan: Mutex::new(None),
             scene_lock: tokio::sync::Mutex::new(()),
         });
 
@@ -2839,6 +2847,31 @@ impl Hub {
                 answer => return answer,
             }
         }
+    }
+
+    /// Keep the web scan running when a client disconnects or a proxy closes a request.
+    pub fn start_web_scan(self: &Arc<Self>, routes: bool) -> Result<u64> {
+        let mut scan = self.web_scan.lock().unwrap();
+        if let Some(active) = scan.as_ref().filter(|scan| scan.result.is_none()) {
+            anyhow::ensure!(active.routes == routes, "A scan with different route settings is already running");
+            return Ok(active.id);
+        }
+        let id = scan.as_ref().map_or(1, |scan| scan.id + 1);
+        *scan = Some(WebScan { id, routes, result: None });
+        let hub = self.clone();
+        tokio::spawn(async move {
+            let map = Arc::new(hub.network_map(routes).await);
+            if let Some(scan) = hub.web_scan.lock().unwrap().as_mut().filter(|scan| scan.id == id) {
+                scan.result = Some(map);
+            }
+        });
+        Ok(id)
+    }
+
+    pub fn web_scan_result(&self, id: u64) -> Result<Option<Arc<crate::networkmap::NetworkMap>>> {
+        let scan = self.web_scan.lock().unwrap();
+        let scan = scan.as_ref().filter(|scan| scan.id == id).context("Scan result is no longer available; scan again")?;
+        Ok(scan.result.clone())
     }
 
     /// Zigbee2MQTT's network scan: the hub's own tables, then every router's neighbor
