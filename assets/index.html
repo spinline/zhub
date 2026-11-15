@@ -198,8 +198,9 @@
   }
   #toast.show { opacity: 1; }
   .map-card { padding: 0; overflow: hidden; }
-  #mapGraph { display: block; width: 100%; height: 400px; }
-  #mapGraph text { font-size: 11px; fill: var(--text); }
+  #mapGraph { display: block; width: 100%; height: auto; aspect-ratio: 800 / 540; }
+  #mapGraph text { font-size: 14px; fill: var(--text); }
+  #mapGraph .node text { paint-order: stroke; stroke: var(--card); stroke-width: 3px; stroke-linejoin: round; }
   #mapGraph .lqi { font-size: 10px; fill: var(--muted); }
   #mapGraph .node { cursor: default; }
   #mapGraph line.edge { stroke-opacity: .15; }
@@ -283,7 +284,7 @@
   <div class="card" style="margin-bottom:12px">
     <div class="ctl" style="border:0;padding:0">
       <div class="row"><button id="mapScan" class="primary">Scan</button><label class="check"><input id="mapRoutes" type="checkbox"> Include routes</label></div>
-      <div class="desc">Asks the hub and every router for its neighbor table (and with routes, its routing table); this takes a few seconds per router. Lines are labeled with link quality (LQI, 0–255). End devices sit next to their parent; links between routers are faint until you point at a device.</div>
+      <div class="desc">Asks the hub and every router for its neighbor table (and with routes, its routing table); this takes a few seconds per router. Lines are labeled with link quality (LQI, 0–255). Stronger links generally place devices closer together. Positions show network relationships, not physical locations.</div>
     </div>
   </div>
   <div class="card map-card" id="mapGraphCard" hidden><svg id="mapGraph"></svg>
@@ -1546,6 +1547,72 @@ async function scanNetwork(routes) {
   }
 }
 
+const linkKey = (a, b) => a < b ? `${a}/${b}` : `${b}/${a}`;
+
+function layoutNetwork(nodes, edges, width, height) {
+  const cx = width / 2, cy = height / 2;
+  const goldenAngle = Math.PI * (3 - Math.sqrt(5));
+  const ordered = [...nodes].sort((a, b) => a.ieeeAddr.localeCompare(b.ieeeAddr));
+  const points = ordered.map((node, i) => {
+    if (node.type === "Coordinator") return { node, x: cx, y: cy };
+    const radius = 220 * Math.sqrt((i + 1) / ordered.length);
+    return { node, x: cx + Math.cos(i * goldenAngle) * radius, y: cy + Math.sin(i * goldenAngle) * radius * 0.8 };
+  });
+  const pairs = [];
+  for (let i = 0; i < points.length; i++) {
+    for (let j = i + 1; j < points.length; j++) {
+      const a = points[i].node, b = points[j].node;
+      const edge = edges.get(linkKey(a.ieeeAddr, b.ieeeAddr));
+      // The coordinator's own table can report a placeholder rather than measured LQI.
+      const quality = edge?.measured ? edge.lqi / 255 : 0.5;
+      const central = edge?.tree || a.type === "Coordinator" || b.type === "Coordinator";
+      pairs.push({ i, j, length: 85 + (1 - quality) * 185, weight: edge ? (central ? 2 : 0.8) * (0.5 + quality) : 0 });
+    }
+  }
+  for (let step = 0; step < 120; step++) {
+    const forces = points.map(p => ({ x: (cx - p.x) * 0.045, y: (cy - p.y) * 0.045, weight: 1 }));
+    for (const pair of pairs) {
+      const a = points[pair.i], b = points[pair.j];
+      const dx = b.x - a.x, dy = b.y - a.y;
+      const distance = Math.max(1, Math.hypot(dx, dy));
+      const force = ((distance - pair.length) * pair.weight - Math.max(0, 105 - distance) * 1.4) / distance;
+      const f = forces[pair.i], g = forces[pair.j];
+      f.x += dx * force; f.y += dy * force; f.weight += pair.weight;
+      g.x -= dx * force; g.y -= dy * force; g.weight += pair.weight;
+    }
+    for (const [i, p] of points.entries()) {
+      if (p.node.type === "Coordinator") continue;
+      const f = forces[i];
+      p.x = Math.min(width - 115, Math.max(115, p.x + 0.35 * f.x / f.weight));
+      p.y = Math.min(height - 42, Math.max(42, p.y + 0.35 * f.y / f.weight));
+    }
+  }
+  return new Map(points.map(p => [p.node.ieeeAddr, p]));
+}
+
+function networkLabel(name, point, width, height, occupied) {
+  const text = name.length > 23 ? name.slice(0, 22) + "…" : name;
+  const w = text.length * 7.3, h = 17;
+  const right = { x: point.x + 14, y: point.y + 5, anchor: "start", left: point.x + 14 };
+  const left = { x: point.x - 14, y: point.y + 5, anchor: "end", left: point.x - 14 - w };
+  const options = point.x < width / 2 ? [left, right] : [right, left];
+  options.push(
+    { x: point.x, y: point.y - 15, anchor: "middle", left: point.x - w / 2 },
+    { x: point.x, y: point.y + 25, anchor: "middle", left: point.x - w / 2 },
+  );
+  const areas = options.map(option => {
+    const box = { left: option.left, right: option.left + w, top: option.y - h, bottom: option.y + 3 };
+    const overflow = Math.max(0, 6 - box.left, box.right - width + 6, 6 - box.top, box.bottom - height + 6);
+    const overlap = occupied.reduce((sum, other) => sum
+      + Math.max(0, Math.min(box.right, other.right) - Math.max(box.left, other.left))
+        * Math.max(0, Math.min(box.bottom, other.bottom) - Math.max(box.top, other.top)), 0);
+    return { option, box, cost: overlap + overflow * h };
+  });
+  const best = areas.reduce((a, b) => a.cost <= b.cost ? a : b);
+  occupied.push(best.box);
+  return { text, ...best.option };
+}
+
 function drawMap(map) {
   const svgNs = "http://www.w3.org/2000/svg";
   const svg = $("#mapGraph");
@@ -1553,13 +1620,12 @@ function drawMap(map) {
   const kind = new Map(map.nodes.map(n => [n.ieeeAddr, n.type]));
   // One line per device pair. Both ends report the link; the lower reading is the one that
   // limits it. The hub's own table has no measured values (0 or 255), so a router's reading
-  // of the hub wins. A child's parent comes from the child's entry in the parent's table.
-  const edges = new Map(), parent = new Map();
+  // of the hub wins. Parent and child links have more influence on the layout.
+  const edges = new Map();
   for (const l of map.links) {
     const a = l.source.ieeeAddr, b = l.target.ieeeAddr;
     if (!name.has(a) || !name.has(b) || a === b) continue;
-    if (l.relationship === 1) parent.set(a, b);
-    const key = a < b ? a + b : b + a;
+    const key = linkKey(a, b);
     const measured = kind.get(b) !== "Coordinator";
     const e = edges.get(key);
     if (!e) {
@@ -1571,44 +1637,9 @@ function drawMap(map) {
     e.measured ||= measured; e.active ||= l.routes.length > 0; e.tree ||= l.relationship <= 1;
   }
 
-  // Radial layout: the hub in the middle, routers on the inner ring, end devices on the
-  // outer ring next to their parent
-  // Keep the original drawing space on narrow screens, including after a rescan.
-  const width = Math.max(svg.clientWidth, 800);
-  // Room for the outer ring's labels beside it (about 6 px a letter); names that would
-  // take more than a third of the width are shortened
-  const longest = Math.max(0, ...map.nodes.filter(n => n.type === "EndDevice").map(n => n.friendlyName.length));
-  const pad = Math.min(longest * 6 + 24, width / 3);
-  const fits = Math.floor((pad - 24) / 6);
-  const outer = Math.max(Math.min(width / 2 - pad, 260), 60), inner = outer * 0.55;
-  // The drawing is as tall as the rings need
-  const height = 2 * outer + 90;
-  svg.style.height = `${height}px`;
-  svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
-  const cx = width / 2, cy = height / 2;
-  const label = (text) => text.length > fits ? text.slice(0, fits - 1) + "…" : text;
-  const pos = new Map();
-  const routers = map.nodes.filter(n => n.type === "Router").sort((x, y) => x.friendlyName.localeCompare(y.friendlyName));
-  const angleOf = new Map();
-  routers.forEach((n, i) => {
-    const angle = -Math.PI / 2 + 2 * Math.PI * i / Math.max(routers.length, 1);
-    angleOf.set(n.ieeeAddr, angle);
-    pos.set(n.ieeeAddr, { x: cx + Math.cos(angle) * inner, y: cy + Math.sin(angle) * inner, angle });
-  });
-  for (const n of map.nodes) if (n.type === "Coordinator") pos.set(n.ieeeAddr, { x: cx, y: cy, angle: Math.PI / 2 });
-  const children = new Map();
-  for (const n of map.nodes.filter(n => n.type === "EndDevice")) {
-    const p = parent.get(n.ieeeAddr) || "";
-    children.set(p, [...(children.get(p) || []), n]);
-  }
-  const step = 0.2;
-  for (const [p, list] of children) {
-    const base = angleOf.get(p) ?? Math.PI / 2;
-    list.forEach((n, i) => {
-      const angle = base + (i - (list.length - 1) / 2) * step;
-      pos.set(n.ieeeAddr, { x: cx + Math.cos(angle) * outer, y: cy + Math.sin(angle) * outer, angle });
-    });
-  }
+  const width = 800, height = 540;
+  const pos = layoutNetwork(map.nodes, edges, width, height);
+  const occupied = [...pos.values()].map(p => ({ left: p.x - 11, right: p.x + 11, top: p.y - 11, bottom: p.y + 11 }));
 
   const svgEl = (tag, attrs, text) => {
     const node = document.createElementNS(svgNs, tag);
@@ -1634,11 +1665,8 @@ function drawMap(map) {
     const g = svgEl("g", { class: "node", "data-ieee": n.ieeeAddr });
     g.append(svgEl("circle", { cx: p.x, cy: p.y, r: n.type === "Coordinator" ? 11 : 8,
       fill: NODE_COLOR[n.type] || "#ccc", stroke: "#0006" }));
-    // Labels point away from the middle so they do not cover the lines
-    const cos = Math.cos(p.angle), sin = Math.sin(p.angle);
-    const anchor = n.type === "Coordinator" || Math.abs(cos) < 0.3 ? "middle" : cos > 0 ? "start" : "end";
-    g.append(svgEl("text", { x: p.x + cos * 14, y: p.y + sin * 14 + (Math.abs(cos) < 0.3 ? (sin > 0 ? 8 : -2) : 4),
-      "text-anchor": anchor }, label(n.friendlyName)));
+    const label = networkLabel(n.friendlyName, p, width, height, occupied);
+    g.append(svgEl("text", { x: label.x, y: label.y, "text-anchor": label.anchor }, label.text));
     const model = n.definition ? `${n.definition.vendor} ${n.definition.model}` : n.type;
     g.append(svgEl("title", {}, `${n.friendlyName}\n${model}\n${n.ieeeAddr} (0x${n.networkAddress.toString(16).padStart(4, "0")})`));
     g.onmouseenter = () => {
@@ -1648,6 +1676,13 @@ function drawMap(map) {
     g.onmouseleave = () => svg.classList.remove("focus");
     dots.push(g);
   }
+  // Fit the drawing and its labels to the card instead of shrinking an empty canvas.
+  const left = Math.floor(Math.min(260, ...occupied.map(box => box.left)) - 20);
+  const right = Math.ceil(Math.max(width - 260, ...occupied.map(box => box.right)) + 20);
+  const top = Math.floor(Math.min(150, ...occupied.map(box => box.top)) - 20);
+  const bottom = Math.ceil(Math.max(height - 150, ...occupied.map(box => box.bottom)) + 20);
+  svg.setAttribute("viewBox", `${left} ${top} ${right - left} ${bottom - top}`);
+  svg.style.aspectRatio = `${right - left} / ${bottom - top}`;
   svg.replaceChildren(...lines, ...labels, ...dots);
   $("#mapGraphCard").hidden = false;
 
