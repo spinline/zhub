@@ -1,7 +1,7 @@
 //! State kept on disk: network parameters, security counters, stack tables and the
 //! device list. A single JSON file, written atomically via a temporary file + rename.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
@@ -297,6 +297,8 @@ pub struct Device {
     pub firmware: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ota_file_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub application_version: Option<u8>,
     #[serde(skip)]
     pub health: DeviceHealth,
     /// Fields older versions kept separately; moved into `state` on load
@@ -318,6 +320,17 @@ pub struct Device {
     /// How the hub drives the device, as Zigbee2MQTT's device options (transition)
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub options: BTreeMap<String, Json>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub reporting: BTreeMap<String, crate::hub::reporting::ReportingIntervals>,
+    /// Settings read from the device before zhub first configures reporting.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub initial_reporting: BTreeMap<String, crate::hub::reporting::ReportingIntervals>,
+    /// Latest reporting settings read from or acknowledged by the device.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub active_reporting: BTreeMap<String, crate::hub::reporting::ReportingIntervals>,
+    /// Attributes that explicitly rejected a reading of the reporting configuration.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub unavailable_reporting: BTreeSet<String>,
 }
 
 fn default_true() -> bool {
@@ -349,6 +362,7 @@ impl Device {
             state: BTreeMap::new(),
             firmware: None,
             ota_file_version: None,
+            application_version: None,
             health: DeviceHealth::default(),
             zone_type: None,
             color_temp_min: None,
@@ -358,6 +372,10 @@ impl Device {
             lqi: None,
             rssi: None,
             options: BTreeMap::new(),
+            reporting: BTreeMap::new(),
+            initial_reporting: BTreeMap::new(),
+            active_reporting: BTreeMap::new(),
+            unavailable_reporting: BTreeSet::new(),
         }
     }
 

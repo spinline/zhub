@@ -34,6 +34,7 @@ use crate::store::{
 use crate::zcl::{self, ReportConfig, Value, cluster, types};
 use crate::{tuya, zdo};
 
+pub mod reporting;
 mod scenes;
 
 /// The coordinator's own endpoint; bindings and reports arrive here
@@ -142,6 +143,13 @@ pub struct DeviceView {
     /// Features to write when the device wakes up
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub pending: Vec<String>,
+    /// Reporting attributes to read when the device wakes up
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub pending_reporting_reads: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub reporting_fields: Vec<Json>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub measurement_poll_interval: Option<i64>,
     /// No message for longer than the availability limit
     pub offline: bool,
 }
@@ -161,6 +169,7 @@ pub struct Hub {
     state_path: PathBuf,
     data: Mutex<Persisted>,
     dirty: Notify,
+    reporting_write: tokio::sync::Mutex<()>,
     pending: Mutex<HashMap<PendingKey, oneshot::Sender<Vec<u8>>>>,
     seq: AtomicU8,
     events: broadcast::Sender<Event>,
@@ -393,6 +402,7 @@ fn apply_zcl_records(device: &mut Device, cluster_id: u16, manufacturer: Option<
         for record in records {
             let text = record.value.as_ref().and_then(Value::as_str).filter(|s| !s.is_empty());
             match record.id {
+                0x0001 => device.application_version = record.value.as_ref().and_then(Value::as_i64).and_then(|v| v.try_into().ok()),
                 0x0004 => device.manufacturer = text.map(str::to_owned),
                 0x0005 => device.model = text.map(str::to_owned),
                 0x4000 if manufacturer.is_none() => {
@@ -602,10 +612,15 @@ impl Hub {
         let mqtt_settings = data.settings.mqtt.clone();
         let matter_settings = data.settings.matter.clone();
         let (matter_commands, matter_command_rx) = mpsc::unbounded_channel();
-        // Writes the previous run could not deliver yet
-        let pending_writes: HashMap<_, _> = std::mem::take(&mut data.pending_writes).into_iter().collect();
+        // Resume pending requests and discover missing reporting configurations
+        // on the next wake-up of already paired battery devices.
+        let mut pending_writes: HashMap<_, _> = std::mem::take(&mut data.pending_writes).into_iter().collect();
         if !pending_writes.is_empty() {
-            info!("{} device(s) have writes waiting from before the restart", pending_writes.len());
+            info!("{} device(s) have pending requests from before the restart", pending_writes.len());
+        }
+        let mut reporting_reads_added = false;
+        for device in data.devices.values() {
+            reporting_reads_added |= reporting::queue_missing_reporting_reads(device, &mut pending_writes);
         }
 
         let (events, _) = broadcast::channel(256);
@@ -616,6 +631,7 @@ impl Hub {
             state_path: opts.state_path,
             data: Mutex::new(data),
             dirty: Notify::new(),
+            reporting_write: tokio::sync::Mutex::new(()),
             pending: Mutex::new(HashMap::new()),
             seq: AtomicU8::new(store::random_bytes::<1>()[0]),
             events,
@@ -648,8 +664,12 @@ impl Hub {
 
         tokio::spawn(hub.clone().notification_loop());
         tokio::spawn(hub.clone().saver());
+        if reporting_reads_added {
+            hub.dirty.notify_one();
+        }
         tokio::spawn(hub.clone().table_snapshots());
         tokio::spawn(hub.clone().availability());
+        tokio::spawn(hub.clone().poll_electrical_measurements());
 
         // Resume interviews the previous run left unfinished
         let unfinished: Vec<String> = hub
@@ -795,7 +815,7 @@ impl Hub {
 
     /// Zigbee2MQTT's device options the hub takes; null removes one
     pub fn set_device_options(&self, ieee: &str, options: serde_json::Map<String, Json>) -> Result<()> {
-        self.device(ieee).context("device not found")?;
+        let device = self.device(ieee).context("device not found")?;
         for (key, value) in &options {
             match key.as_str() {
                 "transition" if value.is_null() => {}
@@ -804,6 +824,11 @@ impl Hub {
                         .as_f64()
                         .filter(|t| t.is_finite() && (0.0..=6553.4).contains(t))
                         .context("transition: seconds, 0 to 6553.4")?;
+                }
+                "measurement_poll_interval" if reporting::polling_profile(&device) => {
+                    if !value.is_null() && !matches!(value.as_i64(), Some(-1 | 1..=65535)) {
+                        bail!("measurement_poll_interval: -1 to disable, or 1 to 65535 seconds");
+                    }
                 }
                 _ => bail!("unknown option: {key}"),
             }
@@ -1053,20 +1078,34 @@ impl Hub {
     }
 
     fn view(&self, device: &Device, settings: &store::Settings) -> DeviceView {
+        let features: Vec<_> = devices::features(device).into_iter().copied().collect();
+        let mut pending = Vec::new();
+        let mut pending_reporting_reads = Vec::new();
+        let reporting_fields = {
+            let queue = self.pending_writes.lock().unwrap();
+            let entries = queue.get(&device.ieee);
+            if let Some(entries) = entries {
+                for key in entries.keys() {
+                    if let Some(attribute) = key.strip_prefix(reporting::REPORTING_READ_PREFIX) {
+                        pending_reporting_reads.push(attribute.to_owned());
+                    } else {
+                        pending.push(key.clone());
+                    }
+                }
+            }
+            reporting::reporting_fields(device, &features, entries)
+        };
         DeviceView {
             offline: offline(settings, device),
             card: devices::card(device),
             definition: devices::definition_info(device),
-            features: devices::features(device).into_iter().copied().collect(),
+            features,
             interviewing: self.interviews.lock().unwrap().contains(&device.ieee),
             waiting_for_wake: self.wake_interviews.lock().unwrap().contains(&device.ieee),
-            pending: self
-                .pending_writes
-                .lock()
-                .unwrap()
-                .get(&device.ieee)
-                .map(|m| m.keys().cloned().collect())
-                .unwrap_or_default(),
+            pending,
+            pending_reporting_reads,
+            reporting_fields,
+            measurement_poll_interval: reporting::measurement_poll_setting(device),
             device: device.clone(),
         }
     }
@@ -1939,11 +1978,19 @@ impl Hub {
         };
         self.update_device(ieee, |d| {
             d.interviewed = true;
+            d.unavailable_reporting.clear();
             prune_state(d);
             if untouched_name(d) && let Some(base) = devices::default_name(d) {
                 d.name = unique_name(base, &d.ieee, &taken);
             }
         });
+        let reporting_reads_added = self.device(ieee).is_some_and(|device| {
+            reporting::queue_missing_reporting_reads(&device, &mut self.pending_writes.lock().unwrap())
+        });
+        if reporting_reads_added {
+            self.dirty.notify_one();
+            self.emit_device(ieee);
+        }
         Ok(())
     }
 
@@ -1951,6 +1998,7 @@ impl Hub {
     /// configures reporting, enrolls the IAS zone and reads every readable attribute.
     /// Individual failures do not stop the interview: some devices skip some steps.
     async fn configure(self: &Arc<Self>, ieee: &str) {
+        let _guard = self.reporting_write.lock().await;
         let Some(device) = self.device(ieee) else {
             return;
         };
@@ -1961,7 +2009,7 @@ impl Hub {
         let features = devices::features(&device);
 
         // Manufacturer-specific attributes go in requests of their own
-        let mut reports: BTreeMap<(u16, Option<u16>), Vec<ReportConfig>> = BTreeMap::new();
+        let mut reports: BTreeMap<(u16, Option<u16>), Vec<(&str, ReportConfig)>> = BTreeMap::new();
         let mut reads: BTreeMap<(u16, Option<u16>), Vec<u16>> = BTreeMap::new();
         for feature in &features {
             let Source::Attr {
@@ -1979,25 +2027,52 @@ impl Hub {
             if !attrs.contains(&attr) {
                 attrs.push(attr);
             }
-            if let Some(report) = report {
-                reports.entry((cluster, manufacturer)).or_default().push(ReportConfig {
+            if let Some(report) = report
+                && !reporting::uses_polling(&device, cluster)
+            {
+                reports.entry((cluster, manufacturer)).or_default().push((feature.key, ReportConfig {
                     attribute: attr,
                     ty,
-                    min_interval: report.min,
-                    max_interval: report.max,
-                    reportable_change: report.change,
-                });
+                    min_interval: device.reporting.get(feature.key).map_or(report.min, |r| r.minimum_report_interval),
+                    max_interval: device.reporting.get(feature.key).map_or(report.max, |r| r.maximum_report_interval),
+                    reportable_change: device.reporting.get(feature.key).map_or(report.change, |r| r.reportable_change),
+                }));
             }
         }
 
         let mut bound = HashSet::new();
-        for (&(cluster_id, manufacturer), configs) in &reports {
+        for (&(cluster_id, manufacturer), entries) in &reports {
             let Some(ep) = device.endpoint_with(cluster_id) else {
                 continue;
             };
+            if !device.interviewed {
+                let ids: Vec<_> = entries.iter()
+                    .filter(|(key, _)| !device.initial_reporting.contains_key(*key))
+                    .map(|(_, config)| config.attribute)
+                    .collect();
+                for chunk in ids.chunks(READ_CHUNK) {
+                    match self.read_initial_reporting(&device, ep, cluster_id, manufacturer, chunk).await {
+                        Ok(responses) => self.update_device(ieee, |d| {
+                            for response in responses {
+                                if let Some((key, _)) = entries.iter().find(|(_, config)| config.attribute == response.attribute)
+                                    && let Some(config) = reporting::ReportingIntervals::from_response(&response)
+                                {
+                                    d.initial_reporting.entry((*key).to_owned()).or_insert(config);
+                                    d.active_reporting.insert((*key).to_owned(), config);
+                                }
+                            }
+                        }),
+                        Err(e) => {
+                            debug!("{ieee} cluster 0x{cluster_id:04x} initial reporting unavailable: {e:#}");
+                            break;
+                        }
+                    }
+                }
+            }
             if bound.insert(cluster_id) {
                 self.bind(ieee, nwk, device_ieee, ep, cluster_id).await;
             }
+            let configs: Vec<_> = entries.iter().map(|(_, config)| *config).collect();
             match self
                 .zcl_request_with(
                     nwk,
@@ -2006,12 +2081,18 @@ impl Hub {
                     0x00,
                     manufacturer,
                     zcl::cmd::CONFIGURE_REPORTING,
-                    &zcl::configure_reporting_payload(configs),
+                    &zcl::configure_reporting_payload(&configs),
                 )
                 .await
             {
                 Ok((header, body))
-                    if header.command == zcl::cmd::CONFIGURE_REPORTING_RSP && zcl::all_success(&body) => {}
+                    if header.command == zcl::cmd::CONFIGURE_REPORTING_RSP && zcl::all_success(&body) => {
+                        self.update_device(ieee, |d| {
+                            for (key, config) in entries {
+                                d.active_reporting.insert((*key).to_owned(), reporting::ReportingIntervals::from_config(config));
+                            }
+                        });
+                    }
                 Ok((header, body)) => warn!(
                     "{ieee} cluster 0x{cluster_id:04x} rejected the reporting configuration (command 0x{:02x}, {body:02x?})",
                     header.command
@@ -2020,6 +2101,7 @@ impl Hub {
             }
         }
 
+        drop(_guard);
         for &cluster_id in devices::extra_binds(&device) {
             if let Some(ep) = device.endpoint_with_any(cluster_id) {
                 self.bind(ieee, nwk, device_ieee, ep, cluster_id).await;
@@ -2463,17 +2545,20 @@ impl Hub {
         }
         let hub = self.clone();
         tokio::spawn(async move {
-            for (key, error) in hub.write_pending(&device, pending, None).await {
-                warn!("{} {key} not written, retrying at the next wake-up: {error:#}", device.ieee);
+            for (key, error) in hub.process_pending(&device, pending, None).await {
+                if error.is::<reporting::ReportingRejected>() {
+                    warn!("{} {key} rejected: {error:#}", device.ieee);
+                } else {
+                    warn!("{} {key} not completed, retrying at the next wake-up: {error:#}", device.ieee);
+                }
             }
             hub.writing.lock().unwrap().remove(&device.ieee);
             hub.emit_device(&device.ieee);
         });
     }
 
-    /// Writes queued values; a confirmed one leaves the queue. Returns the failures. The
-    /// caller holds the device's `writing` slot.
-    async fn write_pending(
+    /// Processes queued requests while holding the device's `writing` slot.
+    async fn process_pending(
         &self,
         device: &Device,
         pending: BTreeMap<String, Json>,
@@ -2482,15 +2567,25 @@ impl Hub {
         let features = devices::features(device);
         let mut failures = Vec::new();
         for (key, value) in pending {
-            let Some(feature) = features.iter().find(|f| f.key == key) else {
-                continue;
+            let result = if let Some(attribute) = key.strip_prefix(reporting::REPORTING_WRITE_PREFIX) {
+                self.write_pending_reporting(&device.ieee, attribute, &value, wait).await
+            } else if let Some(attribute) = key.strip_prefix(reporting::REPORTING_READ_PREFIX) {
+                self.read_pending_reporting(&device.ieee, attribute, wait).await
+            } else {
+                let Some(feature) = features.iter().find(|f| f.key == key) else {
+                    continue;
+                };
+                self.write_attribute_within(device, feature, &value, wait).await
             };
-            match self.write_attribute_within(device, feature, &value, wait).await {
-                Ok(()) => {
-                    settle_pending(&mut self.pending_writes.lock().unwrap(), &device.ieee, &key, &value);
-                    self.dirty.notify_one();
-                }
-                Err(e) => failures.push((key, e)),
+            // A rejected reporting request is final. An unanswered one keeps
+            // its place in the queue until the device wakes.
+            if result.is_ok() || result.as_ref().is_err_and(|error| error.is::<reporting::ReportingRejected>())
+            {
+                settle_pending(&mut self.pending_writes.lock().unwrap(), &device.ieee, &key, &value);
+                self.dirty.notify_one();
+            }
+            if let Err(e) = result {
+                failures.push((key, e));
             }
         }
         failures
@@ -2535,12 +2630,12 @@ impl Hub {
                     continue;
                 }
                 attempt += 1;
-                let failures = hub.write_pending(&device, pending, Some(EAGER_WRITE_WAIT)).await;
+                let failures = hub.process_pending(&device, pending, Some(EAGER_WRITE_WAIT)).await;
                 hub.writing.lock().unwrap().remove(&ieee);
                 hub.emit_device(&ieee);
                 if failures.is_empty() {
                     info!(
-                        "{ieee} written {:.1} s after the request (attempt {attempt})",
+                        "{ieee} request completed in {:.1} s (attempt {attempt})",
                         started.elapsed().as_secs_f32()
                     );
                     break;
@@ -2554,7 +2649,7 @@ impl Hub {
                 }
             }
             if hub.pending_writes.lock().unwrap().contains_key(&ieee) {
-                info!("{ieee} did not take the write within {} s; waiting for its next wake-up", EAGER_WRITE_WINDOW.as_secs());
+                info!("{ieee} request pending after {} s; waiting for its next wake-up", EAGER_WRITE_WINDOW.as_secs());
             }
             hub.eager_writes.lock().unwrap().remove(&ieee);
         });

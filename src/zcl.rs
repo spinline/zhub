@@ -13,6 +13,8 @@ pub mod cmd {
     pub const WRITE_ATTRIBUTES_RSP: u8 = 0x04;
     pub const CONFIGURE_REPORTING: u8 = 0x06;
     pub const CONFIGURE_REPORTING_RSP: u8 = 0x07;
+    pub const READ_REPORTING: u8 = 0x08;
+    pub const READ_REPORTING_RSP: u8 = 0x09;
     pub const REPORT_ATTRIBUTES: u8 = 0x0A;
     pub const DEFAULT_RSP: u8 = 0x0B;
 }
@@ -322,8 +324,88 @@ pub struct ReportConfig {
     pub reportable_change: u64,
 }
 
-fn is_analog(ty: u8) -> bool {
+pub fn is_analog(ty: u8) -> bool {
     matches!(ty, 0x20..=0x2F | 0x38..=0x3A | 0xE0..=0xE2)
+}
+
+pub fn max_reportable_change(ty: u8) -> u64 {
+    if !is_analog(ty) {
+        return 0;
+    }
+    let bits = fixed_size(ty).unwrap_or(0) * 8 - usize::from(matches!(ty, 0x28..=0x2F));
+    u64::MAX.checked_shr((64 - bits) as u32).unwrap_or(0)
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReportingResponse {
+    pub status: u8,
+    pub direction: u8,
+    #[serde(rename = "attrId")]
+    pub attribute: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data_type: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_rep_intval: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_rep_intval: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rep_change: Option<u64>,
+}
+
+pub fn parse_reporting_response(body: &[u8], attribute: u16) -> anyhow::Result<ReportingResponse> {
+    let (response, _) = parse_reporting_record(body)?;
+    if response.attribute != attribute {
+        anyhow::bail!("unexpected reporting attribute");
+    }
+    Ok(response)
+}
+
+pub fn parse_reporting_responses(mut body: &[u8]) -> anyhow::Result<Vec<ReportingResponse>> {
+    let mut records = Vec::new();
+    while !body.is_empty() {
+        let (record, rest) = parse_reporting_record(body)?;
+        records.push(record);
+        body = rest;
+    }
+    Ok(records)
+}
+
+fn parse_reporting_record(body: &[u8]) -> anyhow::Result<(ReportingResponse, &[u8])> {
+    let [status, direction, lo, hi, rest @ ..] = body else {
+        anyhow::bail!("malformed reporting response");
+    };
+    let mut rest = rest;
+    if *direction != 0 {
+        anyhow::bail!("unexpected reporting attribute");
+    }
+    let mut response = ReportingResponse {
+        status: *status,
+        direction: *direction,
+        attribute: u16::from_le_bytes([*lo, *hi]),
+        data_type: None,
+        min_rep_intval: None,
+        max_rep_intval: None,
+        rep_change: None,
+    };
+    if *status == STATUS_SUCCESS {
+        let [ty, min_lo, min_hi, max_lo, max_hi, change @ ..] = rest else {
+            anyhow::bail!("truncated reporting response");
+        };
+        response.data_type = Some(*ty);
+        response.min_rep_intval = Some(u16::from_le_bytes([*min_lo, *min_hi]));
+        response.max_rep_intval = Some(u16::from_le_bytes([*max_lo, *max_hi]));
+        rest = change;
+        if is_analog(*ty) {
+            let size = fixed_size(*ty).unwrap_or(0);
+            let (bytes, remaining) = change.split_at_checked(size).ok_or_else(|| anyhow::anyhow!("truncated reportable change"))?;
+            let mut raw = [0; 8];
+            raw[..size].copy_from_slice(bytes);
+            response.rep_change = Some(u64::from_le_bytes(raw));
+            rest = remaining;
+        }
+    }
+    Ok((response, rest))
 }
 
 pub fn configure_reporting_payload(configs: &[ReportConfig]) -> Vec<u8> {
@@ -355,6 +437,27 @@ pub fn all_success(payload: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_reporting_intervals_and_attribute_status() {
+        let reply = [0, 0, 0x0b, 0x05, types::INT16, 5, 0, 0x10, 0x0e, 10, 0];
+        let actual = parse_reporting_response(&reply, 0x050b).unwrap();
+        assert_eq!(actual.min_rep_intval, Some(5));
+        assert_eq!(actual.max_rep_intval, Some(3600));
+        assert_eq!(actual.rep_change, Some(10));
+        assert!(parse_reporting_response(&reply[..10], 0x050b).is_err());
+        assert!(parse_reporting_response(&reply, 0x0508).is_err());
+        let unsupported = parse_reporting_response(&[0x8c, 0, 0x0b, 0x05], 0x050b).unwrap();
+        assert_eq!(unsupported.status, 0x8c);
+        assert!(unsupported.min_rep_intval.is_none());
+        let batch = [reply.as_slice(), &[0x8c, 0, 0x08, 0x05]].concat();
+        let records = parse_reporting_responses(&batch).unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].rep_change, Some(10));
+        assert_eq!(records[1].attribute, 0x0508);
+        assert_eq!(records[1].status, 0x8c);
+    }
+
 
     #[test]
     fn encodes_integers_by_attribute_type() {

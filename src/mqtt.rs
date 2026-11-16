@@ -215,6 +215,9 @@ impl Bridge {
             format!("{base}/+/get"),
             format!("{base}/+/get/+"),
             format!("{base}/bridge/request/+"),
+            format!("{base}/bridge/request/device/reporting/+"),
+            format!("{base}/bridge/request/device/configure_reporting"),
+            format!("{base}/bridge/request/device/options"),
             format!("{}/status", self.cfg.discovery_prefix),
         ] {
             if let Err(e) = self.client.subscribe(topic, QoS::AtLeastOnce).await {
@@ -374,6 +377,29 @@ impl Bridge {
                     }
                     if let Err(e) = client.publish(topic, QoS::AtLeastOnce, false, response.to_string()).await {
                         warn!("MQTT networkmap response not sent: {e}");
+                    }
+                });
+            }
+            "device/reporting/read" | "device/reporting/configure" | "device/configure_reporting" | "device/options" => {
+                let operation = match name {
+                    "device/reporting/read" => "read",
+                    "device/options" => "options",
+                    _ => "configure",
+                };
+                let name = if name == "device/configure_reporting" { "device/reporting/configure" } else { name };
+                let topic = format!("{}/bridge/response/{name}", self.base());
+                let (hub, client) = (self.hub.clone(), self.client.clone());
+                tokio::spawn(async move {
+                    let transaction = body.get("transaction").cloned();
+                    let mut response = match hub.mqtt_reporting(operation, body).await {
+                        Ok(data) => json!({"data": data, "status": "ok"}),
+                        Err(e) => json!({"data": {}, "status": "error", "error": format!("{e:#}")}),
+                    };
+                    if let Some(transaction) = transaction {
+                        response["transaction"] = transaction;
+                    }
+                    if let Err(e) = client.publish(topic, QoS::AtLeastOnce, false, response.to_string()).await {
+                        warn!("MQTT reporting response not sent: {e}");
                     }
                 });
             }
@@ -1431,6 +1457,9 @@ mod tests {
             interviewing: false,
             waiting_for_wake: false,
             pending: Vec::new(),
+            pending_reporting_reads: Vec::new(),
+            reporting_fields: Vec::new(),
+            measurement_poll_interval: None,
             offline: false,
             device,
         }

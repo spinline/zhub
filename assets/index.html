@@ -917,7 +917,7 @@ $("#dlgClose").onclick = () => $("#detail").close();
 $("#detail").addEventListener("close", () => { detail.ieee = null; });
 $("#detail").addEventListener("click", (e) => { if (e.target === $("#detail")) $("#detail").close(); });
 
-const TABS = [["about", "About"], ["exposes", "Exposes"], ["bind", "Bind"], ["scenes", "Scenes"], ["settings", "Settings"], ["state", "State"], ["clusters", "Clusters"]];
+const TABS = [["about", "About"], ["exposes", "Exposes"], ["bind", "Bind"], ["reporting", "Reporting"], ["scenes", "Scenes"], ["settings", "Settings"], ["state", "State"], ["clusters", "Clusters"]];
 
 function renderDetail() {
   const d = devices.get(detail.ieee);
@@ -939,9 +939,12 @@ function renderDetail() {
     b.hidden = b.dataset.tab === "scenes" && !d.endpoints.some(ep => ep.in_clusters.includes(5));
   }
   // Rebuild a tab only when its structure changes; otherwise just update its values
-  const sig = detail.tab + "|" + signature(d);
+  const reportFields = detail.tab === "reporting"
+    ? `|${(d.reporting_fields ?? []).map(f => `${f.key}:${f.endpoint}`).join(",")}|${d.measurement_poll_interval != null}`
+    : "";
+  const sig = detail.tab + "|" + signature(d) + reportFields;
   if (detail.signature !== sig) {
-    detail.view = { about: aboutTab, exposes: exposesTab, bind: bindTab, scenes: scenesTab, settings: settingsTab, state: stateTab, clusters: clustersTab }[detail.tab](d);
+    detail.view = { about: aboutTab, exposes: exposesTab, bind: bindTab, reporting: reportingTab, scenes: scenesTab, settings: settingsTab, state: stateTab, clusters: clustersTab }[detail.tab](d);
     detail.signature = sig;
     $("#dlgPanel").replaceChildren(detail.view.node);
   }
@@ -1148,6 +1151,151 @@ function bindTab(d) {
   if (sleepy) list.replaceChildren(el("p", { className: "desc", textContent: "Press Read bindings, then the device's button." }));
   else if (d.endpoints.length) load();
   return { node, update() {} };
+}
+
+function reportingTab(d) {
+  const node = el("div");
+  let current = d, updateStatus = () => {};
+  const path = `/api/devices/${d.ieee}/reporting`;
+  const number = (min, max, step = 1) => el("input", { type: "number", min, max, step, required: true });
+  const row = (text, input) => el("label", { className: "ctl" }, el("span", { className: "label", textContent: text }), input);
+  const load = (interval = current.measurement_poll_interval) => {
+    const fields = current.reporting_fields ?? [];
+    updateStatus = () => {};
+    node.replaceChildren();
+    if (interval != null) {
+      const poll = number(-1, 65535);
+      poll.value = interval;
+      const save = el("button", { type: "submit", textContent: "Save interval" });
+      const form = el("form", {}, row("Measurement polling interval (s)", poll),
+        el("p", { className: "desc", textContent: "Use -1 to disable periodic reads." }),
+        el("div", { className: "actions" }, save));
+      form.onsubmit = event => {
+        event.preventDefault();
+        save.disabled = true;
+        run(api(`/api/devices/${d.ieee}/options`, { measurement_poll_interval: poll.valueAsNumber })
+          .then(() => load(poll.valueAsNumber)).finally(() => { save.disabled = false; }));
+      };
+      node.append(form);
+    }
+    if (!fields.length) {
+      if (interval == null) node.append(el("p", { className: "desc", textContent: "No configurable reports for this device." }));
+      return;
+    }
+    const select = el("select", {}, ...fields.map(f => el("option", { value: f.key, textContent: `${f.label} · EP ${f.endpoint}` })));
+    node.append(row("Attribute", select));
+    const editor = el("div");
+    node.append(editor);
+    const show = () => {
+      const field = { ...fields.find(f => f.key === select.value), ...current.reporting_fields?.find(f => f.key === select.value) };
+      const min = number(0, 65535), max = number(0, 65535);
+      const change = field.scale == null ? null : number(0, Number.MAX_SAFE_INTEGER, 1 / field.scale);
+      const unit = field.kind.unit;
+      const save = el("button", { type: "submit", className: "primary", textContent: "Save" });
+      const reset = el("button", { type: "button", textContent: field.initial ? "Restore initial settings" : "Restore defaults" });
+      const form = el("form", {}, row("Minimum interval (s)", min), row("Maximum interval (s)", max));
+      if (change) form.append(row(unit ? `Change threshold (${unit})` : "Change threshold", change));
+      const status = el("p", { className: "desc", role: "status" });
+      form.append(status, el("div", { className: "actions" }, save, reset));
+      if (!d.rx_on_when_idle) {
+        form.append(el("p", { className: "desc", textContent: "Wake the device by pressing its button while a request is in progress." }));
+      }
+      const setValues = config => {
+        min.value = config.minimum_report_interval;
+        max.value = config.maximum_report_interval;
+        if (change) change.value = config.reportable_change / field.scale;
+      };
+      const pendingText = "Waiting for the device to wake up…";
+      let waitingForRead = false, sawPendingRead = false, edited = false;
+      form.oninput = () => { edited = true; };
+      const stillReading = () => (current.pending_reporting_reads || []).includes(field.key);
+      const stillPending = () => (current.pending || []).includes(`reporting:${field.key}`);
+      const confirmed = () => {
+        const active = current.active_reporting?.[field.key];
+        return active && Object.keys(field.pending).every(key => active[key] === field.pending[key]);
+      };
+      updateStatus = () => {
+        sawPendingRead ||= stillReading();
+        if (waitingForRead && !stillReading()) {
+          const config = current.active_reporting?.[field.key];
+          if (config) {
+            field.configuration = config;
+            if (!edited) setValues(config);
+            status.textContent = "";
+            waitingForRead = false;
+          } else if (sawPendingRead) {
+            status.textContent = "Reporting settings unavailable";
+            waitingForRead = false;
+          }
+        }
+        if (!field.pending || stillPending()) return;
+        const applied = confirmed();
+        field.configuration = current.active_reporting?.[field.key] ?? null;
+        field.pending = null;
+        status.textContent = applied ? "Settings saved" : "Device did not accept the settings";
+      };
+      const perform = async (callback, loading, success, read = false) => {
+        save.disabled = reset.disabled = true;
+        if (!read) waitingForRead = false;
+        status.textContent = loading;
+        try {
+          const { pending, ...config } = await callback();
+          if (read && pending) {
+            waitingForRead = true;
+            status.textContent = pendingText;
+            updateStatus();
+            return;
+          }
+          if (!read || !edited) setValues(config);
+          if (pending) {
+            field.pending = config;
+            status.textContent = pendingText;
+            if (!stillPending() && confirmed()) updateStatus();
+          } else {
+            field.configuration = config;
+            field.pending = null;
+            status.textContent = success;
+          }
+        } catch (error) {
+          status.textContent = error.message;
+        } finally {
+          save.disabled = reset.disabled = false;
+        }
+      };
+      reset.onclick = () => perform(() => api(path, { key: field.key, configuration: null }), "Restoring…", "Settings restored");
+      form.onsubmit = event => {
+        event.preventDefault();
+        const configuration = {
+          minimum_report_interval: min.valueAsNumber,
+          maximum_report_interval: max.valueAsNumber,
+          reportable_change: change ? Math.round(change.valueAsNumber * field.scale) : 0,
+        };
+        perform(() => api(path, { key: field.key, configuration }), "Saving…", "Settings saved");
+      };
+      editor.replaceChildren(form);
+      if (field.pending) {
+        setValues(field.pending);
+        status.textContent = pendingText;
+        if (!stillPending() && confirmed()) updateStatus();
+      } else if (field.configuration) {
+        setValues(field.configuration);
+      } else if (!current.rx_on_when_idle) {
+        if ((current.unavailable_reporting || []).includes(field.key)) {
+          status.textContent = "Reporting settings unavailable";
+        } else {
+          waitingForRead = true;
+          status.textContent = pendingText;
+          updateStatus();
+        }
+      } else {
+        perform(() => api(`${path}/${encodeURIComponent(field.key)}`, null, "GET"), "Reading current settings…", "", true);
+      }
+    };
+    select.onchange = show;
+    show();
+  };
+  load();
+  return { node, update(device) { current = device; updateStatus(); } };
 }
 
 // Zigbee2MQTT's device-specific settings: how the hub drives the device

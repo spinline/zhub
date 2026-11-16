@@ -46,6 +46,8 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .route("/api/devices/{ieee}/options", post(device_options))
         .route("/api/devices/{ieee}/interview", post(interview))
         .route("/api/devices/{ieee}/bindings", get(bindings))
+        .route("/api/devices/{ieee}/reporting", get(reporting_fields).post(configure_reporting))
+        .route("/api/devices/{ieee}/reporting/{key}", get(read_reporting))
         .route("/api/groups", post(create_group))
         .route("/api/groups/{id}", axum::routing::delete(delete_group))
         .route("/api/groups/{id}/rename", post(rename_group))
@@ -157,6 +159,26 @@ impl<E: Into<anyhow::Error>> From<E> for ApiError {
 }
 
 type ApiResult = Result<Json<serde_json::Value>, ApiError>;
+
+async fn reporting_fields(State(hub): State<Arc<Hub>>, Path(ieee): Path<String>) -> ApiResult {
+    let view = hub.device_view(&ieee).ok_or_else(|| anyhow::anyhow!("device not found"))?;
+    Ok(Json(json!({
+        "fields": view.reporting_fields,
+        "measurement_poll_interval": view.measurement_poll_interval,
+    })))
+}
+
+async fn read_reporting(State(hub): State<Arc<Hub>>, Path((ieee, key)): Path<(String, String)>) -> ApiResult {
+    Ok(Json(hub.read_reporting(&ieee, &key).await?))
+}
+
+async fn configure_reporting(
+    State(hub): State<Arc<Hub>>,
+    Path(ieee): Path<String>,
+    Json(request): Json<crate::hub::reporting::ReportingRequest>,
+) -> ApiResult {
+    Ok(Json(json!(hub.configure_reporting(&ieee, request).await?)))
+}
 
 #[derive(Deserialize)]
 struct SceneTarget {

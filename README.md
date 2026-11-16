@@ -22,6 +22,8 @@ Assistant or Zigbee2MQTT needed.
   Live updates, including every button press, also stream over `/api/events`.
 - Bindings: a device's binding table can be read and edited (to the hub, a device or a
   group), so e.g. a switch controls lights directly.
+- View and change [report intervals and thresholds](#reporting) for supported Zigbee
+  attributes. Requests for battery-powered devices can wait in a queue.
 - Thermostats: SONOFF TRVZB (ZCL thermostat cluster) and Tuya thermostats (datapoints),
   both with weekly schedules (the TRVZB takes a schedule but cannot report it, so the UI
   shows what was saved from the hub).
@@ -70,13 +72,37 @@ support; zhub trades that for a footprint that fits on a router.
 | Web UI | Built in | Built in (separate frontend package) |
 | MQTT | Optional; Zigbee2MQTT topics, payloads and Home Assistant discovery | Required; the main interface |
 | Matter | Built-in bridge (optional build feature) | Not built in |
-| Groups, scenes and bindings | Yes | Yes, plus reporting configuration |
+| Groups, scenes and bindings | Yes | Yes |
+| Reporting configuration | Yes, on supported Zigbee attributes | Yes |
 | OTA firmware updates | No | Yes |
 | Network map | Yes (web UI and MQTT: raw, Graphviz, PlantUML) | Yes |
 | Touchlink | Hue factory reset by serial number | Scan, identify and factory reset |
 | UI password | Yes (one password) | Yes (auth token) |
 | Maturity | New; used in one home | Mature, large community |
 | License | Apache-2.0 | GPL-3.0 |
+
+## Reporting
+
+Open a device's **Reporting** tab and select an attribute. The minimum interval limits
+how often reports are sent. The maximum interval controls how long the device can go
+without sending a report. For numeric attributes the change threshold is shown in the
+attribute's unit, such as °C or W. Supported attributes depend on the device and its
+firmware.
+
+During the initial interview, zhub tries to read the device's settings before applying
+its own defaults. **Restore initial settings** uses the values read at that point when
+available. **Restore defaults** uses zhub's device definition. For paired battery devices,
+missing settings are read at the next wake-up. Pending changes also wait for the
+device to respond. Confirmed settings are saved with device state and shown immediately
+when the tab opens.
+
+TS011F variants that use polling expose **Measurement polling interval**. The default
+is 60 seconds and `-1` disables periodic reads.
+
+The MQTT bridge accepts Zigbee2MQTT-style `bridge/request/device/reporting/read` and
+`bridge/request/device/reporting/configure` requests under the configured base topic.
+The configure response includes `data.pending: true` when the change is queued for a
+sleeping device. MQTT change thresholds use raw Zigbee attribute units.
 
 ## Scenes
 
@@ -223,9 +249,6 @@ radio does not acknowledge frames while sniffing; use it only briefly).
 - **OTA firmware updates**: an OTA server (ZCL cluster 0x0019) that serves images from
   Zigbee2MQTT's [zigbee-OTA](https://github.com/Koenkk/zigbee-OTA) index, with a version
   check per device, progress in the UI and Zigbee2MQTT's `ota_update` MQTT requests.
-- **Reporting settings**: like Zigbee2MQTT's Reporting tab, per attribute minimum and
-  maximum report interval and reportable change, read from and written to the device
-  (today the hub configures reporting with fixed values taken from the definitions).
 - **More device definitions**: ported from zigbee-herdsman-converters, starting with
   common sensors, plugs, switches and lights. Devices without a definition already work
   through a generic definition built from their clusters.
