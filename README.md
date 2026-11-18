@@ -1,10 +1,12 @@
 # zhub
 
-A lightweight Zigbee hub built on the [Ziggurat](https://github.com/zigpy/ziggurat) Zigbee
-stack: a single static binary with an embedded web UI, small enough to run on a router. It
-was developed on a Keenetic router (MIPS) and should run on any Linux system with an
-OpenThread RCP dongle (e.g. a Raspberry Pi), though only Keenetic has been tested. No Home
-Assistant or Zigbee2MQTT needed.
+A lightweight Zigbee gateway for Linux, designed to run on routers and other embedded
+systems. It runs as a single Rust binary with a built-in web interface and uses
+[Ziggurat](https://github.com/zigpy/ziggurat) with an OpenThread RCP radio. MQTT with
+Home Assistant discovery and the Matter bridge are optional.
+
+Tested on Keenetic (MIPS). For other Linux hosts, build for your system and configure
+the radio's serial settings. See [Build and install](#build-and-install).
 
 - Forms a network and keeps the network key, frame counters and stack tables in
   `/opt/var/lib/zhub/state.json`.
@@ -14,7 +16,7 @@ Assistant or Zigbee2MQTT needed.
 - Sensors: temperature, humidity, occupancy, IAS zones (contact, motion, water), battery.
 - Remotes and switch modules: button presses become the `action` value.
 - Groups: lights in a Zigbee group take one multicast command (on/off, brightness,
-  color temperature); membership lives on the devices (Groups cluster).
+  color temperature, Identify); membership lives on the devices (Groups cluster).
 - MQTT (optional), laid out like Zigbee2MQTT: `zigbee2mqtt/<name>` state, `…/set`
   commands (also `state: ON/OFF/TOGGLE` and `brightness`), `…/action` button presses,
   `bridge/state|devices|groups`, and Home Assistant discovery (lights and groups as lights,
@@ -62,9 +64,9 @@ support; zhub trades that for a footprint that fits on a router.
 | | zhub | Zigbee2MQTT |
 |---|---|---|
 | Runtime | One static binary (Rust), no runtime to install | Node.js (22 or later) application with npm dependencies |
-| Size | 4.1 MB, or 6.0 MB with the Matter bridge (MIPS build) | npm package 1.6 MB plus 19 dependencies and Node.js; Docker image about 48 MB compressed |
+| Size | 6.88 MB with the Matter bridge (static MIPS build) | npm package 1.6 MB plus 19 dependencies and Node.js; Docker image about 48 MB compressed |
 | Memory | 6.2 MB resident, 15 devices, with Matter (measured on the router) | about 50–60 MB in [one user's report](https://community.home-assistant.io/t/ha-ram-usage-optimization/535105) (Raspberry Pi 4, 21 devices) |
-| Hardware | Router-class devices; developed on a Keenetic (MIPS 1004Kc, 256 MB RAM) | Raspberry Pi, PC, NAS, Docker: anywhere Node.js runs |
+| Hardware | Linux hosts, including embedded systems. Tested on Keenetic (MIPS 1004Kc, 256 MB RAM) | Raspberry Pi, PC, NAS, Docker: anywhere Node.js runs |
 | Zigbee stack | [Ziggurat](https://github.com/zigpy/ziggurat) on the host; the dongle is only a radio | [zigbee-herdsman](https://github.com/Koenkk/zigbee-herdsman); the stack runs on the adapter |
 | Adapter firmware | OpenThread RCP (Spinel) on Silicon Labs EFR32, e.g. SONOFF ZBDongle-E | EmberZNet (Silicon Labs), Z-Stack (Texas Instruments), deCONZ (Dresden Elektronik); ZiGate, ZBOSS |
 | Network data | Kept by the host (`state.json`): reflashing or replacing the dongle needs no re-pairing | Kept on the adapter; backup and restore when changing adapters |
@@ -80,6 +82,29 @@ support; zhub trades that for a footprint that fits on a router.
 | UI password | Yes (one password) | Yes (auth token) |
 | Maturity | New; used in one home | Mature, large community |
 | License | Apache-2.0 | GPL-3.0 |
+
+## Web controls and MQTT bridge
+
+Device details and group scenes use the same mobile dialog controls. The main
+pages show their contents when the data is ready and offer **Retry** if loading
+fails. The light cards show the latest brightness reported to zhub as a percentage.
+**Exposes** shows that level in Zigbee units. Setting a nonzero brightness on a
+light that is off turns it on at the requested level.
+
+**Identify** appears on a group card when a member supports it. A compatible MQTT
+client, such as Homey's Zigbee2MQTT app, can send `{"identify":"identify"}` to
+`<base_topic>/<group-name>/set`. Zhub sends one native Zigbee Identify command for
+three seconds.
+
+The MQTT base topic defaults to `zigbee2mqtt`. Homey's bridge controls use
+`<base_topic>/bridge/request/permit_join` to open or close joining and
+`<base_topic>/bridge/request/restart` to request a Zhub restart. On Keenetic the
+Entware service starts Zhub again. For other Linux hosts, run Zhub under a
+supervisor that restarts it after a clean exit if you use this command.
+
+MQTT uses one topic segment for each device or group name. Zhub replaces `/`,
+`+` and `#` with `_`. New names must be unique after that conversion. Rename any
+existing duplicates so MQTT commands resolve to a single target.
 
 ## Reporting
 
@@ -145,7 +170,9 @@ Add Scene (tenths of a second, rounded down, maximum 6553.4 seconds).
 An unsupported Enhanced Add is reported as an error. Store Scene preserves the
 existing scene's transition. Saving the same ID replaces its previous settings.
 
-**Read from devices** discovers their real scene tables, including scenes set
+Opening the scene list loads Zhub's saved entries. Within the same browser tab,
+reopening shows the last loaded list immediately while Zhub refreshes it. Use
+**Read from devices** to query the lights and discover scenes, including scenes set
 by another controller. Names and confirmed per-endpoint settings are kept in
 zhub's state file; MQTT bridge device/group lists include the known scene names.
 Management commands check each device's response. Partial group installations
@@ -199,16 +226,43 @@ XON/XOFF flow control (`--baudrate 460800 --flow-control software`; both must ma
 firmware build). On Keenetic the "USB to Serial Port Converters" component must be
 installed. The dongle is a USB 2.0 device; a USB 3 port only adds 2.4 GHz noise.
 
-Other Linux systems: build for the target (`cargo build --release`, or `--features matter`)
-and pass the dongle's serial port, baud rate and flow control. The Matter bridge announces
-itself through Avahi static service files in `/tmp/avahi/services`, where Keenetic's Avahi
-reads them; elsewhere that directory has to be one the local Avahi watches.
+The Matter bridge announces itself through Avahi static service files in
+`/tmp/avahi/services`. Configure Avahi to read that directory on the host.
 
 Known issue: some sleepy devices (SONOFF TRVZB) cannot join the dongle directly with a
 MAC association; pair them through a router (e.g. a Hue light). After that they can
 rejoin the dongle directly.
 
+### Install OpenThread RCP from the web UI
+
+If the configured serial port doesn't answer as an OpenThread RCP at startup, open
+Zhub's web URL. The **Dongle firmware** screen identifies the attached USB model
+and asks for an OpenThread RCP `.gbl` file for that model.
+
+| Dongle | Entering the bootloader |
+| --- | --- |
+| SONOFF ZBDongle-E, Dongle-PMG24, Dongle Lite MG21 (LMG21) | Automatic |
+| SMLIGHT SLZB-07, SLZB-07MG24 | Hold FLSH to GND while reconnecting USB, following [SMLIGHT's instructions](https://smlight.tech/support/manuals/books/slzb-07pxmgx/page/device-update) |
+
+Some ZBDongle-E units use a shared USB identifier and may require model confirmation.
+Zhub validates the image for the detected model, shows when the flash completes
+and the dongle restarts, and opens its normal interface after the radio answers
+over Spinel. It saves the image's serial settings for subsequent starts.
+
+The setup page can identify EmberZNet, Z-Stack, Spinel, Silicon Labs CPC and Gecko
+bootloader responses on the configured serial port. Firmware upload requires a
+supported dongle model.
+
 ## Build and install
+
+### Linux
+
+Build with `cargo +nightly build --release`. Add `--features matter` to include the
+Matter bridge. Run `target/release/zhub` with the serial port, baud rate and flow
+control for your OpenThread RCP firmware. Use `--state` to choose a writable location
+for the network state file.
+
+### Keenetic and Entware (MIPS)
 
 `./build.sh` builds in Docker. `./build-native.sh` builds on the host instead (Rust nightly
 via rustup, zig 0.15.2 in `.tools/`); it is faster and is the one that fits the Matter build
@@ -243,6 +297,19 @@ process, MQTT and device metrics, plus zhub's radio timeouts and offline counts.
 
 Log: `/opt/var/log/zhub.log`. `--sniff` logs MAC command frames for diagnostics (the
 radio does not acknowledge frames while sniffing; use it only briefly).
+
+## Backup and restore
+
+In **Settings → Backup & Restore**, use **Download backup** to save a ZIP to your
+computer. It contains the Zigbee network and device state, zhub settings, groups,
+scene records, and Matter controller records when present. Keep this file private
+because it contains network credentials.
+
+To restore, select the ZIP to see its date and contents, then choose **Restore backup**.
+Zhub saves the previous state before applying the backup during restart. The previous
+archive is kept as `.last-restore/before-restore.zip` beside the state file. A Zigbee-only
+ZIP can be restored with Matter disabled. If the destination has Matter disabled, a
+restore leaves it disabled and keeps any Matter records included in the archive.
 
 ## Roadmap
 
