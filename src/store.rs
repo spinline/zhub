@@ -107,7 +107,7 @@ impl UiAuth {
     }
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
@@ -426,6 +426,9 @@ pub struct Persisted {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scenes: Vec<crate::scenes::StoredScene>,
     pub network: Option<NetworkData>,
+    /// UART settings selected by the firmware setup screen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub radio_serial: Option<crate::radio::InstalledFirmwareSerial>,
     #[serde(default)]
     pub settings: Settings,
     #[serde(default)]

@@ -34,6 +34,7 @@ tokio-serial = "5.5"
 tokio-stream = { version = "0.1", features = ["sync"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+zip = { version = "9.6", default-features = false }
 
 [features]
 matter = ["dep:rs-matter", "dep:embassy-futures", "dep:embassy-time", "dep:embassy-time-queue-utils", "dep:futures-lite", "dep:async-io", "dep:rand"]

@@ -4,8 +4,9 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::{Path, Query, State};
-use axum::http::{StatusCode, header};
+use axum::body::Bytes;
+use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -15,9 +16,10 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio_stream::wrappers::BroadcastStream;
 
-use crate::hub::Hub;
+use crate::{firmware, hub::Hub, store::UiAuth};
 
 const INDEX_HTML: &str = include_str!("../assets/index.html");
+const FIRMWARE_HTML: &str = include_str!("../assets/firmware.html");
 
 pub fn router(hub: Arc<Hub>) -> Router {
     Router::new()
@@ -32,6 +34,9 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .route("/api/hub/settings", post(settings))
         .route("/api/hub/tx_power", post(tx_power))
         .route("/api/hub/restart", post(restart))
+        .route("/api/backup", get(download_backup))
+        .route("/api/backup/inspect", post(inspect_backup).layer(DefaultBodyLimit::max(crate::backup::MAX_ARCHIVE_BYTES)))
+        .route("/api/backup/restore", post(restore_backup).layer(DefaultBodyLimit::max(crate::backup::MAX_ARCHIVE_BYTES)))
         .route("/api/mqtt/cleanup", post(mqtt_cleanup))
         .route("/api/matter/open", post(matter_open))
         .route("/api/matter/reset", post(matter_reset))
@@ -62,6 +67,61 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .with_state(hub)
 }
 
+pub fn firmware_router(setup: Arc<firmware::Setup>) -> Router {
+    Router::new()
+        .route("/", get(|| async { html(FIRMWARE_HTML) }))
+        .route("/api/login", post(firmware_login))
+        .route(
+            "/api/firmware",
+            get(firmware_status).post(upload_firmware).layer(DefaultBodyLimit::max(firmware::MAX_IMAGE_SIZE)),
+        )
+        .layer(axum::middleware::from_fn_with_state(setup.clone(), require_firmware_password))
+        .with_state(setup)
+}
+
+async fn require_firmware_password(
+    State(setup): State<Arc<firmware::Setup>>,
+    request: Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let mut response = require_auth(setup.auth.as_ref(), request, next).await;
+    // A polling browser must reconnect when the normal hub replaces the setup server.
+    response.headers_mut().insert(header::CONNECTION, "close".parse().unwrap());
+    response.headers_mut().insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
+    response
+}
+
+async fn firmware_status(State(setup): State<Arc<firmware::Setup>>) -> ApiResult {
+    let discovery = setup.discovery();
+    Ok(Json(json!({
+        "device": setup.device,
+        "startup_error": setup.startup_error,
+        "dongle": discovery.dongle,
+        "firmware": discovery.firmware,
+        "usb_device": discovery.usb_device,
+        "serial_available": discovery.serial_available,
+        "detecting": discovery.detecting,
+        "status": setup.status(),
+    })))
+}
+
+async fn upload_firmware(
+    State(setup): State<Arc<firmware::Setup>>,
+    headers: HeaderMap,
+    data: Bytes,
+) -> ApiResult {
+    if !headers.get(header::CONTENT_TYPE).is_some_and(|value| value == "application/octet-stream") {
+        return Err(anyhow::anyhow!("Send a binary firmware file").into());
+    }
+    let confirmed = headers.get("x-zhub-confirm-dongle").is_some_and(|value| value == "1");
+    setup.submit(data, confirmed)?;
+    ok()
+}
+
+async fn firmware_login(State(setup): State<Arc<firmware::Setup>>, Json(body): Json<Login>) -> Response {
+    password_login(setup.auth.clone(), body).await
+}
+
 // ---- Web UI password (Zigbee2MQTT's frontend.auth_token) ----
 
 const AUTH_COOKIE: &str = "zhub_auth";
@@ -86,13 +146,17 @@ fn auth_cookie(key: Option<&str>) -> String {
 /// loads so it can ask for the password
 async fn require_password(
     State(hub): State<Arc<Hub>>,
-    request: axum::extract::Request,
+    request: Request,
     next: axum::middleware::Next,
 ) -> Response {
+    require_auth(hub.ui_auth().as_ref(), request, next).await
+}
+
+async fn require_auth(auth: Option<&UiAuth>, request: Request, next: axum::middleware::Next) -> Response {
     let path = request.uri().path();
     let open = !path.starts_with("/api/") || path == "/api/login" || path == "/api/logout";
     let allowed = open
-        || match hub.ui_auth() {
+        || match auth {
             None => true,
             Some(auth) => cookie(request.headers(), AUTH_COOKIE).is_some_and(|key| auth.accepts_key(key)),
         };
@@ -109,7 +173,11 @@ struct Login {
 }
 
 async fn login(State(hub): State<Arc<Hub>>, Json(body): Json<Login>) -> Response {
-    let Some(auth) = hub.ui_auth() else {
+    password_login(hub.ui_auth(), body).await
+}
+
+async fn password_login(auth: Option<UiAuth>, body: Login) -> Response {
+    let Some(auth) = auth else {
         return Json(json!({ "ok": true })).into_response();
     };
     let key = auth.key.clone();
@@ -212,13 +280,17 @@ fn ok() -> ApiResult {
 }
 
 async fn index() -> impl IntoResponse {
+    html(INDEX_HTML)
+}
+
+fn html(page: &'static str) -> impl IntoResponse {
     (
         [
             (header::CONTENT_TYPE, "text/html; charset=utf-8"),
             // The page ships with the binary; the browser must not show a stale copy
             (header::CACHE_CONTROL, "no-cache"),
         ],
-        INDEX_HTML,
+        page,
     )
 }
 
@@ -275,9 +347,8 @@ async fn group_member(State(hub): State<Arc<Hub>>, Path(id): Path<u16>, Json(bod
 }
 
 async fn set_group(State(hub): State<Arc<Hub>>, Path(id): Path<u16>, Json(body): Json<SetBody>) -> ApiResult {
-    let name = hub.groups().into_iter().find(|g| g.id == id).map(|g| crate::mqtt::topic_name(&g.name));
-    if let (Some(name), Some(command)) = (name, as_light_command(&body.key, &body.value)) {
-        crate::mqtt::apply(&hub, &name, command).await?;
+    if let Some(command) = as_light_command(&body.key, &body.value) {
+        crate::mqtt::apply_to(&hub, crate::mqtt::ControlTarget::Group(id), command).await?;
         return ok();
     }
     hub.set_group(id, &body.key, &body.value)?;
@@ -356,8 +427,45 @@ async fn network_health(State(hub): State<Arc<Hub>>) -> ApiResult {
     Ok(Json(hub.network_health()))
 }
 
+async fn download_backup(State(hub): State<Arc<Hub>>) -> Result<impl IntoResponse, ApiError> {
+    let zip = tokio::task::spawn_blocking(move || crate::backup::download(hub.backup_state(), &hub.data_dir()))
+        .await??;
+    Ok(([
+        (header::CONTENT_TYPE, "application/zip"),
+        (header::CONTENT_DISPOSITION, "attachment; filename=zhub-backup.zip"),
+        (header::CACHE_CONTROL, "no-store"),
+    ], zip))
+}
+
+fn require_zip(headers: &HeaderMap) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        headers.get(header::CONTENT_TYPE).and_then(|value| value.to_str().ok()) == Some("application/zip"),
+        "expected a zhub backup ZIP"
+    );
+    Ok(())
+}
+
+async fn inspect_backup(headers: HeaderMap, bytes: Bytes) -> ApiResult {
+    require_zip(&headers)?;
+    let summary = tokio::task::spawn_blocking(move || {
+        crate::backup::Backup::from_bytes(&bytes).map(|backup| backup.summary())
+    }).await??;
+    Ok(Json(json!(summary)))
+}
+
+async fn restore_backup(State(hub): State<Arc<Hub>>, headers: HeaderMap, bytes: Bytes) -> ApiResult {
+    require_zip(&headers)?;
+    let path = hub.data_dir();
+    tokio::task::spawn_blocking(move || crate::backup::stage_restore(&path, &bytes)).await??;
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        hub.request_restart("backup restore");
+    });
+    ok()
+}
+
 async fn restart(State(hub): State<Arc<Hub>>) -> ApiResult {
-    hub.request_restart();
+    hub.request_restart("web UI");
     ok()
 }
 
@@ -374,11 +482,12 @@ async fn logs(State(hub): State<Arc<Hub>>, Query(query): Query<LogsQuery>) -> Ap
 async fn events(
     State(hub): State<Arc<Hub>>,
 ) -> Sse<impl Stream<Item = Result<SseEvent, Infallible>>> {
-    let stream = BroadcastStream::new(hub.subscribe()).filter_map(|event| async move {
-        // A lagging client misses events; the UI refreshes its state when it reconnects
-        let event = event.ok()?;
-        SseEvent::default().json_data(event).ok().map(Ok)
-    });
+    let stream = BroadcastStream::new(hub.subscribe())
+        // End this stream on lag so EventSource reconnects and reloads the snapshot.
+        .take_while(|event| std::future::ready(event.is_ok()))
+        .filter_map(|event| async move {
+            SseEvent::default().json_data(event.ok()?).ok().map(Ok)
+        });
     Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(20)))
 }
 
@@ -423,7 +532,7 @@ fn as_light_command(key: &str, value: &serde_json::Value) -> Option<serde_json::
 async fn set(State(hub): State<Arc<Hub>>, Path(ieee): Path<String>, Json(body): Json<SetBody>) -> ApiResult {
     let light = hub.device_view(&ieee).is_some_and(|d| d.features.iter().any(|f| f.key == "on"));
     if light && let Some(command) = as_light_command(&body.key, &body.value) {
-        crate::mqtt::apply(&hub, &ieee, command).await?;
+        crate::mqtt::apply_to(&hub, crate::mqtt::ControlTarget::Device(&ieee), command).await?;
         return Ok(Json(json!({ "ok": true, "pending": false })));
     }
     let pending = hub.set(&ieee, &body.key, body.value).await?;

@@ -325,11 +325,19 @@ fn settle_pending(pending: &mut HashMap<String, BTreeMap<String, Json>>, ieee: &
 
 /// No two devices share a name: the last four IEEE digits are appended if needed
 fn unique_name(base: String, ieee: &str, taken: &[String]) -> String {
-    if !taken.contains(&base) {
+    let available = |name: &str| {
+        let topic = crate::mqtt::topic_name(name);
+        !taken.iter().any(|other| crate::mqtt::topic_name(other) == topic)
+    };
+    if available(&base) {
         return base;
     }
     let suffix = ieee.replace(':', "");
-    format!("{base} {}", &suffix[suffix.len().saturating_sub(4)..])
+    let stem = format!("{base} {}", &suffix[suffix.len().saturating_sub(4)..]);
+    if available(&stem) {
+        return stem;
+    }
+    (2..).map(|n| format!("{stem} {n}")).find(|name| available(name)).unwrap()
 }
 
 /// Whether the user kept the automatic name: "Device xxxx" or a default an earlier
@@ -359,7 +367,8 @@ fn apply_default_names(data: &mut Persisted) {
             .devices
             .values()
             .filter(|d| d.ieee != ieee)
-            .map(|d| d.name.clone())
+            .flat_map(|d| [d.name.clone(), d.ieee.clone()])
+            .chain(data.groups.iter().map(|g| g.name.clone()))
             .collect();
         let Some(device) = data.devices.get_mut(&ieee) else {
             continue;
@@ -430,13 +439,26 @@ fn apply_zcl_records(device: &mut Device, cluster_id: u16, manufacturer: Option<
         if cluster != cluster_id || code.is_some_and(|code| manufacturer != Some(code)) {
             continue;
         }
+        let precision = match (device.model.as_deref(), feature.key) {
+            (Some("SNZB-02P" | "SNZB-02D"), "temperature") => device.options.get("temperature_precision"),
+            (Some("SNZB-02P" | "SNZB-02D"), "humidity") => device.options.get("humidity_precision"),
+            _ => None,
+        }.and_then(Json::as_u64);
         for record in records.iter().filter(|r| r.id == attr) {
             let decoded = match &record.value {
                 Some(Value::Str(text)) => conv.decode_text(text),
                 Some(value) => value.as_i64().and_then(|raw| feature.decode_int(raw)),
                 None => None,
             };
-            if let Some(decoded) = decoded {
+            if let Some(mut decoded) = decoded {
+                if let Some(digits @ 0..=1) = precision
+                    && let Some(value) = decoded.as_f64()
+                {
+                    // The measurements have two decimal places. Match Zigbee2MQTT's
+                    // rounding, including negative values halfway between steps.
+                    let factor = 10_f64.powi(digits as i32);
+                    decoded = json!((value * factor + 0.5).floor() / factor);
+                }
                 device.state.insert(feature.key.to_owned(), decoded);
             }
         }
@@ -526,14 +548,12 @@ where
 }
 
 impl Hub {
-    pub async fn start(opts: Options) -> Result<Arc<Self>> {
-        let mut data = Persisted::load(&opts.state_path)?;
-
-        let (phy, spinel) = crate::radio::open(&opts.device, opts.baudrate, opts.flow_control, opts.sniff).await?;
-        let radio_ieee = phy
-            .hw_address()
-            .await
-            .map_err(|e| anyhow!("cannot read the radio address: {e}"))?;
+    pub async fn start(
+        opts: Options,
+        mut data: Persisted,
+        radio: crate::radio::Radio,
+    ) -> Result<Arc<Self>> {
+        let crate::radio::Radio { phy, spinel, ieee: radio_ieee } = radio;
         info!("Radio ready: {}", eui64_to_string(&radio_ieee));
         let ncp_version = match spinel.prop_value_get(ziggurat_spinel::SpinelPropertyId::NcpVersion).await {
             Ok(bytes) => {
@@ -710,6 +730,7 @@ impl Hub {
             flow_control: match self.flow_control {
                 crate::radio::Flow::None => "None",
                 crate::radio::Flow::Software => "Software (XON/XOFF)",
+                crate::radio::Flow::Hardware => "Hardware (RTS/CTS)",
             },
             log_level: self.logging.level(),
             settings: data.settings.public(),
@@ -825,6 +846,12 @@ impl Hub {
                         .filter(|t| t.is_finite() && (0.0..=6553.4).contains(t))
                         .context("transition: seconds, 0 to 6553.4")?;
                 }
+                "temperature_precision" | "humidity_precision"
+                    if matches!(device.model.as_deref(), Some("SNZB-02P" | "SNZB-02D")) => {
+                    if !value.is_null() && !matches!(value.as_u64(), Some(0..=3)) {
+                        bail!("{key}: expected an integer from 0 to 3");
+                    }
+                }
                 "measurement_poll_interval" if reporting::polling_profile(&device) => {
                     if !value.is_null() && !matches!(value.as_i64(), Some(-1 | 1..=65535)) {
                         bail!("measurement_poll_interval: -1 to disable, or 1 to 65535 seconds");
@@ -910,7 +937,8 @@ impl Hub {
 
     /// Where the hub keeps its files (the state file's directory)
     pub fn data_dir(&self) -> PathBuf {
-        self.state_path.parent().map(PathBuf::from).unwrap_or_default()
+        self.state_path.parent().filter(|dir| !dir.as_os_str().is_empty())
+            .map_or_else(|| PathBuf::from("."), PathBuf::from)
     }
 
     pub fn mqtt_settings(&self) -> watch::Receiver<store::MqttSettings> {
@@ -1021,8 +1049,8 @@ impl Hub {
         Ok(actual)
     }
 
-    pub fn request_restart(&self) {
-        info!("Restart requested from the web UI");
+    pub fn request_restart(&self, source: &str) {
+        info!("Restart requested via {source}");
         self.restart.notify_one();
     }
 
@@ -1973,7 +2001,8 @@ impl Hub {
             data.devices
                 .values()
                 .filter(|d| d.ieee != ieee)
-                .map(|d| d.name.clone())
+                .flat_map(|d| [d.name.clone(), d.ieee.clone()])
+                .chain(data.groups.iter().map(|g| g.name.clone()))
                 .collect()
         };
         self.update_device(ieee, |d| {
@@ -2655,15 +2684,36 @@ impl Hub {
         });
     }
 
-    pub fn rename(&self, ieee: &str, name: &str) -> Result<()> {
-        let name = name.trim();
+    fn check_control_name(data: &Persisted, name: &str, device: Option<&str>, group: Option<u16>) -> Result<()> {
         if name.is_empty() || name.chars().count() > 64 {
             bail!("the name must be 1-64 characters");
         }
-        if self.device(ieee).is_none() {
-            bail!("device not found");
+        let topic = crate::mqtt::topic_name(name);
+        if topic.starts_with("group:") {
+            bail!("names starting with group: are reserved");
         }
-        self.update_device(ieee, |d| d.name = name.to_owned());
+        let device_conflict = data.devices.values().any(|d| {
+            Some(d.ieee.as_str()) != device && (crate::mqtt::topic_name(&d.name) == topic || d.ieee == topic)
+        });
+        let group_conflict = data.groups.iter().any(|g| {
+            Some(g.id) != group && crate::mqtt::topic_name(&g.name) == topic
+        });
+        if device_conflict || group_conflict {
+            bail!("the MQTT name \"{topic}\" is already used by a device or group");
+        }
+        Ok(())
+    }
+
+    pub fn rename(&self, ieee: &str, name: &str) -> Result<()> {
+        let name = name.trim();
+        {
+            let mut data = self.data.lock().unwrap();
+            Self::check_control_name(&data, name, Some(ieee), None)?;
+            let device = data.devices.get_mut(ieee).context("device not found")?;
+            device.name = name.to_owned();
+        }
+        self.emit_device(ieee);
+        self.dirty.notify_one();
         Ok(())
     }
 
@@ -2709,27 +2759,16 @@ impl Hub {
         let _ = self.events.send(Event::Groups { groups: self.groups() });
     }
 
-    fn group_name_check(&self, name: &str, except: Option<u16>) -> Result<String> {
-        let name = name.trim();
-        if name.is_empty() || name.chars().count() > 64 {
-            bail!("the group name must be 1-64 characters");
-        }
-        let data = self.data.lock().unwrap();
-        if data.groups.iter().any(|g| g.name == name && Some(g.id) != except) {
-            bail!("a group named \"{name}\" already exists");
-        }
-        Ok(name.to_owned())
-    }
-
     /// A new, empty group; ids count up from 1 as in Zigbee2MQTT
     pub fn create_group(&self, name: &str) -> Result<u16> {
-        let name = self.group_name_check(name, None)?;
+        let name = name.trim();
         let id = {
             let mut data = self.data.lock().unwrap();
+            Self::check_control_name(&data, name, None, None)?;
             let id = (1..=0xFFF7).find(|id| !data.groups.iter().any(|g| g.id == *id)).context("no free group id")?;
             data.groups.push(store::Group {
                 id,
-                name: name.clone(),
+                name: name.to_owned(),
                 members: Vec::new(),
                 matter: false,
             });
@@ -2741,11 +2780,12 @@ impl Hub {
     }
 
     pub fn rename_group(&self, id: u16, name: &str) -> Result<()> {
-        let name = self.group_name_check(name, Some(id))?;
+        let name = name.trim();
         {
             let mut data = self.data.lock().unwrap();
+            Self::check_control_name(&data, name, None, Some(id))?;
             let group = data.groups.iter_mut().find(|g| g.id == id).context("group not found")?;
-            group.name = name;
+            group.name = name.to_owned();
         }
         self.groups_changed();
         Ok(())
@@ -2840,7 +2880,7 @@ impl Hub {
         Ok(())
     }
 
-    /// One multicast frame for the whole group: on/off, brightness or color temperature.
+    /// One multicast frame for the whole group: light controls or identification.
     /// The members' states are updated at once; their reports confirm shortly.
     pub fn set_group(&self, id: u16, key: &str, value: &Json) -> Result<()> {
         let transition: u16 = 5;
@@ -2864,6 +2904,14 @@ impl Hub {
         };
         let number = || value.as_f64().filter(|v| v.is_finite()).context("expected a number");
         let (cluster_id, command, payload, state): (u16, u8, Vec<u8>, Vec<(&str, Json)>) = match key {
+            "identify" => {
+                let device = member_devices.iter().find(|device| {
+                    devices::features(device).iter().any(|feature| feature.key == "identify")
+                }).context("no group member supports identification")?;
+                devices::common::IDENTIFY.validate(device, value.clone())?;
+                let frame = devices::common::identify_frame();
+                (frame.cluster, frame.command, frame.payload, Vec::new())
+            }
             "on" => {
                 let on = value.as_bool().context("expected true or false")?;
                 (cluster::ON_OFF, u8::from(on), vec![], vec![("on", json!(on))])
@@ -3225,7 +3273,12 @@ impl Hub {
         }
     }
 
-    pub async fn save_now(&self) -> Result<()> {
+    pub fn backup_state(&self) -> Persisted {
+        self.refresh_tables();
+        self.snapshot()
+    }
+
+    fn snapshot(&self) -> Persisted {
         let mut snapshot = self.data.lock().unwrap().clone();
         snapshot.pending_writes = self
             .pending_writes
@@ -3234,6 +3287,16 @@ impl Hub {
             .iter()
             .map(|(ieee, values)| (ieee.clone(), values.clone()))
             .collect();
+        if let Some(network) = &mut snapshot.network {
+            let core = self.stack.state.core.lock();
+            network.nwk_frame_counter = network.nwk_frame_counter.max(core.nib.nwk_security.outgoing_frame_counter());
+            network.aps_frame_counter = network.aps_frame_counter.max(core.aib.aps_security.outgoing_frame_counter());
+        }
+        snapshot
+    }
+
+    pub async fn save_now(&self) -> Result<()> {
+        let snapshot = self.snapshot();
         let path = self.state_path.clone();
         tokio::task::spawn_blocking(move || snapshot.save(&path)).await??;
         Ok(())
@@ -3381,6 +3444,28 @@ mod tests {
             id,
             status: zcl::STATUS_SUCCESS,
             value: Some(value),
+        }
+    }
+
+    #[test]
+    fn sonoff_sensor_precision_rounds_measurements_independently_without_increasing_precision() {
+        for model in ["SNZB-02P", "SNZB-02D"] {
+            let mut device = device_with(&[cluster::TEMPERATURE, cluster::HUMIDITY]);
+            device.model = Some(model.into());
+            device.options.insert("temperature_precision".into(), json!(1));
+            device.options.insert("humidity_precision".into(), json!(0));
+
+            apply_zcl_records(&mut device, cluster::TEMPERATURE, None, &[record(0, Value::Int(-125))]);
+            apply_zcl_records(&mut device, cluster::HUMIDITY, None, &[record(0, Value::Uint(5725))]);
+            assert_eq!(device.state["temperature"], json!(-1.2));
+            assert_eq!(device.state["humidity"], json!(57.0));
+
+            device.options.insert("humidity_precision".into(), json!(3));
+            apply_zcl_records(&mut device, cluster::HUMIDITY, None, &[record(0, Value::Uint(5725))]);
+            assert_eq!(device.state["humidity"], json!(57.25));
+            device.options.remove("temperature_precision");
+            apply_zcl_records(&mut device, cluster::TEMPERATURE, None, &[record(0, Value::Int(-125))]);
+            assert_eq!(device.state["temperature"], json!(-1.25));
         }
     }
 

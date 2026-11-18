@@ -13,11 +13,12 @@ use ziggurat_ieee_802154::types::Eui64;
 
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio::time::{Duration, timeout};
 
 /// A link to the RCP: a serial port or a TCP socket. Boxed so [`SpinelClient`] stays
@@ -254,6 +255,8 @@ struct SpinelWriter {
 pub struct SpinelClient {
     /// The reader half of the port, owned by the task spawned in `spawn_reader`.
     reader: Mutex<Option<ReadHalf<Box<dyn RcpTransport>>>>,
+    reader_task: Mutex<Option<JoinHandle<()>>>,
+    exit_on_serial_failure: Arc<AtomicBool>,
     /// The writer half of the port. The mutex also serializes outbound HDLC writes so
     /// concurrent commands cannot interleave partial frames inside the byte stream.
     writer: AsyncMutex<SpinelWriter>,
@@ -265,12 +268,22 @@ pub struct SpinelClient {
     command_timeouts: Mutex<(u64, Option<u64>)>,
 }
 
+impl Drop for SpinelClient {
+    fn drop(&mut self) {
+        if let Ok(Some(task)) = self.reader_task.get_mut() {
+            task.abort();
+        }
+    }
+}
+
 impl SpinelClient {
     pub fn new(port: Box<dyn RcpTransport>) -> Self {
         let (reader, writer) = tokio::io::split(port);
 
         Self {
             reader: Mutex::new(Some(reader)),
+            reader_task: Mutex::new(None),
+            exit_on_serial_failure: Arc::new(AtomicBool::new(true)),
             writer: AsyncMutex::new(SpinelWriter {
                 port: writer,
                 frame_scratch: Vec::with_capacity(SPINEL_FRAME_MAX_SIZE),
@@ -320,8 +333,9 @@ impl SpinelClient {
             .take()
             .expect("Reader already taken");
         let protocol = Arc::clone(&self.protocol);
+        let exit_on_failure = Arc::clone(&self.exit_on_serial_failure);
 
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let mut buffer = [0u8; 2048];
 
             loop {
@@ -330,17 +344,30 @@ impl SpinelClient {
                         let mut protocol = protocol.lock().expect("Failed to lock Spinel");
                         protocol.handle_inbound_bytes(&buffer[..n])
                     }
-                    Ok(_) => {
-                        tracing::error!("Serial port EOF, exiting");
-                        std::process::exit(1);
-                    }
-                    Err(e) => {
-                        tracing::error!("Serial port read failed ({e}), exiting");
-                        std::process::exit(1);
+                    failure => {
+                        if exit_on_failure.load(Ordering::Acquire) {
+                            tracing::error!("Serial port disconnected ({failure:?}), exiting");
+                            std::process::exit(1);
+                        }
+                        break;
                     }
                 }
             }
         });
+        *self.reader_task.lock().expect("Failed to lock reader task") = Some(task);
+    }
+
+    /// Opening an unknown adapter may fail without taking down the setup server.
+    pub fn set_exit_on_serial_failure(&self, enabled: bool) {
+        self.exit_on_serial_failure.store(enabled, Ordering::Release);
+    }
+
+    pub async fn stop_reader(&self) {
+        let task = self.reader_task.lock().expect("Failed to lock reader task").take();
+        if let Some(task) = task {
+            task.abort();
+            let _ = task.await;
+        }
     }
 
     /// Serialize and HDLC-frame `frame` into the writer's persistent scratch buffers

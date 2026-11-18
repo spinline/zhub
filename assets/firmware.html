@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dongle firmware · Zhub</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f4f5f7; --card: #fff; --text: #1b1d22; --muted: #545c6c;
+    --line: #e3e5ea; --accent: #2f6fed; --error: #a13414;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #121418; --card: #1c1f25; --text: #e8eaee; --muted: #a9afbc;
+      --line: #353a44; --accent: #2f6fed; --error: #ffad8f;
+    }
+  }
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.5 system-ui, sans-serif; }
+  main { max-width: 560px; margin: clamp(24px, 10vh, 96px) auto; padding: 0 16px; }
+  h1 { margin: 0 0 10px; font-size: 25px; }
+  p { margin: 0 0 16px; }
+  .panel { padding: 22px; background: var(--card); border: 1px solid var(--line); border-radius: 14px; }
+  form, fieldset { display: grid; gap: 12px; }
+  fieldset { padding: 0; margin: 0; border: 0; min-width: 0; }
+  label, .model-field { display: grid; gap: 5px; font-weight: 600; }
+  input, button { font: inherit; }
+  input[type=file], input[type=password] { width: 100%; }
+  input[type=password], button, #model { padding: 9px 12px; border: 1px solid var(--line); border-radius: 9px; }
+  input[type=password] { background: var(--card); color: var(--text); }
+  button { background: var(--accent); border-color: var(--accent); color: #fff; cursor: pointer; justify-self: start; width: auto; }
+  button:disabled, fieldset:disabled { opacity: .65; }
+  .muted { color: var(--muted); }
+  #bootloaderHint { margin: 0; }
+  .confirm { display: flex; gap: 8px; align-items: baseline; font-weight: 400; }
+  .confirm input { margin: 0; }
+  #error, #loginError { color: var(--error); overflow-wrap: anywhere; }
+  details { color: var(--muted); margin: 18px 0 0; overflow-wrap: anywhere; }
+  progress { width: 100%; accent-color: var(--accent); }
+  #status { margin: 14px 0 0; }
+</style>
+</head>
+<body>
+<main>
+  <section class="panel">
+    <h1>Dongle firmware</h1>
+    <p id="loading" class="muted" role="status">Checking radio connection…</p>
+    <form id="login" hidden>
+      <label>Zhub password <input id="password" type="password" autocomplete="current-password" required></label>
+      <span id="loginError" role="alert"></span>
+      <button>Sign in</button>
+    </form>
+    <div id="setup" hidden>
+      <p id="firmwareDescription" class="muted"></p>
+      <p id="unknown" class="muted" role="status" hidden></p>
+      <form id="upload" hidden>
+        <fieldset id="controls">
+          <div class="model-field">
+            <span>Dongle model</span>
+            <div id="model"></div>
+          </div>
+          <label id="confirmModel" class="confirm" hidden>
+            <input id="confirm" type="checkbox"> My dongle is a ZBDongle-E (EFR32MG21).
+          </label>
+          <label>OpenThread RCP file <input id="file" type="file" accept=".gbl" required></label>
+          <p id="bootloaderHint" class="muted" hidden></p>
+          <button id="flash">Flash firmware</button>
+        </fieldset>
+      </form>
+      <p id="status" role="status" hidden></p>
+      <progress id="progress" aria-label="Firmware upload progress" max="100" hidden></progress>
+      <div id="error" role="alert"></div>
+      <details><summary>Serial connection</summary><p id="serialError"></p></details>
+    </div>
+  </section>
+</main>
+<script>
+  const byId = id => document.getElementById(id);
+  const file = byId('file');
+  const confirm = byId('confirm');
+  const controls = byId('controls');
+  let submitting = false;
+  let lastModel = '';
+  let successNoticeAt = null;
+
+  function render(data) {
+    const dongle = data.dongle;
+    const model = dongle?.model || '';
+    const needsConfirmation = dongle?.needs_confirmation === true;
+    if (model !== lastModel) {
+      file.value = '';
+      confirm.checked = false;
+      lastModel = model;
+    }
+    byId('model').textContent = needsConfirmation ? 'Confirm the dongle model' : model;
+    const unknown = byId('unknown');
+    unknown.hidden = !!dongle || data.detecting || (!data.firmware && !data.serial_available);
+    unknown.textContent = 'Firmware upload in Zhub requires a supported dongle model.';
+    byId('upload').hidden = !dongle;
+    byId('confirmModel').hidden = !needsConfirmation;
+    confirm.required = needsConfirmation;
+    confirm.disabled = !needsConfirmation;
+    byId('serialError').textContent = data.device + ' · ' + data.startup_error;
+
+    const {phase, sent, total, error} = data.status;
+    const canUpload = ['idle', 'failed'].includes(phase);
+    const description = byId('firmwareDescription');
+    const firmware = data.firmware;
+    const bootloaderHint = byId('bootloaderHint');
+    bootloaderHint.textContent = dongle?.manual_bootloader_hint || '';
+    bootloaderHint.hidden = !bootloaderHint.textContent || !canUpload || firmware?.kind === 'gecko_bootloader';
+    const firmwareName = firmware?.name || dongle?.current_firmware;
+    const firmwareVersion = firmware?.version ? ' ' + firmware.version : '';
+    const serialBaud = firmware?.baudrate ? ' at ' + firmware.baudrate + ' baud' : '';
+    const hardware = model && !needsConfirmation ? model : data.usb_device || 'The serial device on ' + data.device;
+    if (data.detecting) {
+      description.textContent = 'Checking the firmware on ' + data.device + '…';
+    } else if (!canUpload && dongle) {
+      description.textContent = `Installing OpenThread RCP on ${model}.`;
+    } else if (firmwareName) {
+      const found = `${hardware} is running ${firmwareName}${firmwareVersion}${serialBaud}.`;
+      if (firmware?.kind === 'open_thread' || firmware?.kind === 'spinel') {
+        description.textContent = found + ' Check the configured port, baud rate and flow control.';
+      } else if (dongle && !needsConfirmation) {
+        description.textContent = found + ' Upload the OpenThread RCP file for this model to use it with Zhub.';
+      } else if (needsConfirmation) {
+        description.textContent = found + ' Confirm your dongle model and upload its OpenThread RCP file.';
+      } else {
+        description.textContent = found + ' If an OpenThread RCP build is available for this model, install it with the dongle’s flasher.';
+      }
+    } else if (needsConfirmation) {
+      description.textContent = 'Zhub couldn’t identify the firmware. Confirm your dongle model and upload its OpenThread RCP file.';
+    } else if (dongle) {
+      description.textContent = `${model} was detected. Zhub couldn’t identify the current firmware. Upload the OpenThread RCP file for this model.`;
+    } else if (data.serial_available) {
+      description.textContent = `${hardware} was detected. Zhub couldn’t identify the current firmware.`;
+    } else {
+      description.textContent = 'Zhub couldn’t open the configured serial port. Check the dongle connection.';
+    }
+    const percent = phase === 'writing' ? Math.floor(100 * sent / total) : 100;
+    controls.disabled = submitting || !canUpload;
+    const status = byId('status');
+    status.textContent = {
+      queued: 'Waiting for the serial port…',
+      entering_bootloader: 'Opening the dongle bootloader…',
+      writing: 'Writing firmware… ' + percent + '%. Keep the dongle connected.',
+      restarting: 'Restarting the dongle and checking its connection…',
+      succeeded: 'Firmware flashed successfully. The dongle is ready.',
+    }[phase] || '';
+    status.hidden = !status.textContent;
+    if (phase === 'succeeded') successNoticeAt ??= Date.now();
+    else successNoticeAt = null;
+    if (phase === 'failed') byId('error').textContent = error;
+    const progress = byId('progress');
+    progress.hidden = !['writing', 'restarting', 'succeeded'].includes(phase);
+    if (!progress.hidden) progress.value = percent;
+    byId('loading').hidden = true;
+    byId('login').hidden = true;
+    byId('setup').hidden = false;
+  }
+
+  async function refresh() {
+    try {
+      const response = await fetch('/api/firmware', {cache: 'no-store'});
+      if (response.status === 404) {
+        const noticeRemaining = successNoticeAt === null ? 0 : Math.max(0, 2500 - (Date.now() - successNoticeAt));
+        window.setTimeout(() => location.replace('/'), noticeRemaining);
+        return;
+      }
+      if (response.status === 401) {
+        byId('loading').hidden = true;
+        byId('setup').hidden = true;
+        byId('login').hidden = false;
+      } else if (response.ok) {
+        render(await response.json());
+      }
+    } catch {
+      // The port can briefly disappear while Zhub starts the normal web interface.
+    }
+    window.setTimeout(refresh, 1250);
+  }
+
+  byId('login').addEventListener('submit', async event => {
+    event.preventDefault();
+    const error = byId('loginError');
+    error.textContent = '';
+    const button = event.currentTarget.querySelector('button');
+    button.disabled = true;
+    try {
+      const response = await fetch('/api/login', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({password: byId('password').value}),
+      });
+      if (!response.ok) throw new Error('Sign-in failed. Check your password and try again.');
+      byId('password').value = '';
+    } catch (failure) {
+      error.textContent = failure.message;
+    } finally {
+      button.disabled = false;
+    }
+  });
+
+  byId('upload').addEventListener('submit', async event => {
+    event.preventDefault();
+    submitting = true;
+    controls.disabled = true;
+    const error = byId('error');
+    error.textContent = '';
+    try {
+      const response = await fetch('/api/firmware', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/octet-stream',
+          'X-Zhub-Confirm-Dongle': confirm.checked ? '1' : '0',
+        },
+        body: file.files[0],
+      });
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        throw new Error(body.error || 'Could not upload the firmware file.');
+      }
+    } catch (failure) {
+      error.textContent = failure.message;
+      controls.disabled = false;
+    } finally {
+      submitting = false;
+    }
+  });
+
+  refresh();
+</script>
+</body>
+</html>

@@ -113,7 +113,7 @@
   .ctl .label { font-weight: 500; }
   .ctl .label small { color: var(--muted); font-weight: 400; }
   .ctl .desc { grid-column: 1 / -1; color: var(--muted); font-size: 12px; line-height: 1.4; }
-  .ctl .row { display: flex; gap: 6px; align-items: center; }
+  .ctl .row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
   .ctl input[type=number] { width: 96px; }
   .ctl .note { grid-column: 1 / -1; color: var(--warn); font-size: 12px; }
   .ctl .ro { font-weight: 600; }
@@ -127,36 +127,44 @@
   .slot input { width: 100%; }
   .slot span { color: var(--muted); }
 
-  dialog#scenesDlg { width: min(680px, calc(100vw - 32px)); max-height: 85vh; overflow: auto; border: 1px solid var(--line); border-radius: 14px; background: var(--card); color: var(--text); padding: 20px; }
+  html.dialog-open { overflow: hidden; overscroll-behavior: none; }
+  html.dialog-open .layout {
+    position: fixed; top: var(--dialog-page-offset); left: 0; right: 0; overflow: hidden;
+  }
+  dialog {
+    width: min(720px, calc(100% - 24px)); max-height: calc(100% - 24px); padding: 0;
+    border: 1px solid var(--line); border-radius: 16px; background: var(--card); color: var(--text);
+  }
+  dialog[open] {
+    position: fixed; inset: 0;
+    display: flex; flex-direction: column; max-height: calc(100dvh - 24px); overflow: hidden;
+  }
+  dialog::backdrop { background: rgba(0, 0, 0, .45); }
+  .dialog-compact { width: min(440px, calc(100% - 24px)); }
+  .dialog-content { min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 8px 18px 18px; }
+  .dialog-content:focus { outline: none; }
+  .dlg-head { display: flex; flex: none; align-items: center; gap: 12px; padding: 16px 18px 8px; }
+  .dlg-head .names { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+  .dlg-head .name { font-size: 18px; margin: 0; }
   .scene-row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; padding:10px 0; border-bottom:1px solid var(--line); }
   .scene-row .scene-name { flex:1; min-width:140px; }
   .scene-form { display:grid; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); gap:10px; margin:12px 0; }
   .scene-form input, .scene-form select { width:100%; box-sizing:border-box; }
-  dialog#scenesDlg::backdrop { background:rgba(0,0,0,.45); }
-  dialog#detail {
-    width: min(720px, calc(100% - 24px)); max-height: calc(100% - 24px); padding: 0;
-    border: 1px solid var(--line); border-radius: 16px; background: var(--card); color: var(--text);
-  }
-  dialog#detail::backdrop, dialog#removeDlg::backdrop, dialog#loginDlg::backdrop { background: rgba(0, 0, 0, .45); }
-  dialog#removeDlg, dialog#loginDlg {
-    width: min(440px, calc(100% - 24px)); padding: 18px;
-    border: 1px solid var(--line); border-radius: 16px; background: var(--card); color: var(--text);
-  }
-  dialog#removeDlg h3, dialog#loginDlg h3 { margin: 0 0 4px; font-size: 18px; }
   dialog#loginDlg input { width: 100%; margin: 12px 0; box-sizing: border-box; }
   dialog#removeDlg .sub { margin-bottom: 12px; }
-  .option { display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; padding: 10px 0; border-top: 1px solid var(--line); cursor: pointer; }
+  .option { display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; padding: 8px 0; border-top: 1px solid var(--line); cursor: pointer; }
   .option input { margin: 3px 0 0; }
   .option b { font-weight: 500; }
   .option .desc { grid-column: 2; color: var(--muted); font-size: 12px; line-height: 1.4; }
-  dialog#removeDlg .actions { justify-content: flex-end; }
-  .dlg-head { display: flex; align-items: center; gap: 12px; padding: 16px 18px 8px; }
-  .dlg-head .names { flex: 1; }
-  .dlg-head .name { font-size: 18px; }
-  .tabs { display: flex; gap: 4px; padding: 0 14px; border-bottom: 1px solid var(--line); overflow-x: auto; }
+  .dialog-compact .actions { justify-content: flex-end; }
+  .dlg-head > form { flex: none; }
+  .content:not([data-page-ready]) > main { display: none; }
+  #pageStatus { margin: 16px; }
+  #pageStatus button { margin-inline-start: 8px; }
+  html.auth-required #pageStatus, html.auth-required .content > main { display: none; }
+  .tabs { display: flex; flex: none; gap: 4px; padding: 0 14px; border-bottom: 1px solid var(--line); overflow-x: auto; }
   .tabs button { border: 0; border-radius: 0; background: none; padding: 10px 12px; color: var(--muted); border-bottom: 2px solid transparent; }
   .tabs button.active { color: var(--text); border-bottom-color: var(--accent); }
-  .panel { padding: 8px 18px 18px; overflow-y: auto; max-height: calc(100vh - 190px); }
   .panel h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 16px 0 2px; }
   .info { display: grid; grid-template-columns: auto 1fr; gap: 6px 16px; font-size: 14px; margin: 10px 0; }
   .info dt { color: var(--muted); }
@@ -166,7 +174,7 @@
   .cluster-list { font-size: 13px; }
   .cluster-list code { background: var(--chip); border-radius: 6px; padding: 1px 6px; margin: 2px; display: inline-block; }
 
-  .settings { display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); align-items: start; }
+  .settings { display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(min(320px, 100%), 1fr)); align-items: start; }
   .settings .card h3 { margin: 0; font-size: 15px; }
   .settings .wide { grid-column: 1 / -1; }
   details.members summary { cursor: pointer; color: var(--muted); font-size: 13px; }
@@ -197,6 +205,7 @@
     opacity: 0; transition: opacity .2s; pointer-events: none; max-width: calc(100% - 32px);
   }
   #toast.show { opacity: 1; }
+  dialog > #toast { position: absolute; bottom: 12px; width: max-content; }
   .map-card { padding: 0; overflow: hidden; }
   #mapGraph { display: block; width: 100%; height: auto; aspect-ratio: 800 / 540; }
   #mapGraph text { font-size: 14px; fill: var(--text); }
@@ -244,8 +253,11 @@
   <h1 id="pageTitle">Devices</h1>
   <button id="permitBadge" class="primary" hidden></button>
 </div>
+<div id="pageStatus" class="empty" hidden>
+  <span role="status">Could not load this page.</span><button id="pageRetry">Retry</button>
+</div>
 <main id="pageDevices">
-  <div id="deviceList" hidden>
+  <div id="deviceList">
     <section id="climateSection" aria-labelledby="climateTitle" hidden>
       <h2 id="climateTitle">Climate</h2>
       <div id="climate" class="grid"></div>
@@ -305,6 +317,20 @@
     <div class="card"><h3>Network</h3><dl class="info" id="setNetwork"></dl><div id="setTxPower"></div></div>
     <div class="card"><h3>Adapter</h3><dl class="info" id="setAdapter"></dl></div>
     <div class="card"><h3>Availability and joining</h3><div id="setGeneral"></div></div>
+    <div class="card">
+      <h3>Backup &amp; Restore</h3>
+      <div class="ctl">
+        <div class="label">Zhub backup</div>
+        <button id="backupDownload">Download backup</button>
+        <div class="desc">The ZIP includes device settings and network keys. Keep it private.</div>
+      </div>
+      <div class="ctl">
+        <label class="label" for="backupFile">Restore from a backup</label>
+        <input id="backupFile" type="file" accept=".zip,application/zip" style="max-width:100%">
+        <p id="backupStatus" class="desc" role="status" hidden></p>
+        <div class="actions"><button id="backupRestore" class="danger" hidden>Restore backup</button></div>
+      </div>
+    </div>
     <div class="card" id="matterCard" hidden>
       <h3>Matter</h3>
       <div class="desc" style="color:var(--muted);font-size:12px">Shows the Zigbee devices to Matter controllers: Apple Home, Google Home, Alexa, SmartThings, Home Assistant. The bridge is not certified, so the controller warns when adding it ("uncertified accessory"); confirm to continue.</div>
@@ -354,28 +380,37 @@
 </div>
 </div>
 
-<dialog id="detail">
+<dialog id="detail" aria-labelledby="dlgName">
   <div class="dlg-head">
     <div class="names"><div class="name" id="dlgName"></div><div class="sub" id="dlgSub"></div></div>
-    <button id="dlgClose" title="Close">✕</button>
+    <form method="dialog"><button type="submit" id="dlgClose" title="Close" aria-label="Close">✕</button></form>
   </div>
   <nav class="tabs" id="dlgTabs"></nav>
-  <div class="panel" id="dlgPanel"></div>
+  <div class="panel dialog-content" id="dlgPanel" tabindex="-1" autofocus></div>
 </dialog>
 
-<dialog id="scenesDlg"><div class="row" style="justify-content:space-between"><h3 id="scenesTitle" style="margin:0">Scenes</h3><button id="scenesClose">Close</button></div><div id="scenesPanel"></div></dialog>
+<dialog id="scenesDlg" aria-labelledby="scenesTitle">
+  <div class="dlg-head">
+    <div class="names"><h3 class="name" id="scenesTitle">Scenes</h3></div>
+    <form method="dialog">
+      <button id="scenesClose" type="submit" title="Close" aria-label="Close">✕</button>
+    </form>
+  </div>
+  <div id="scenesPanel" class="dialog-content" tabindex="-1" autofocus></div>
+</dialog>
 
-<dialog id="loginDlg">
-  <form id="loginForm" method="dialog">
-    <h3>zhub</h3>
+<dialog id="loginDlg" class="dialog-compact" aria-labelledby="loginTitle">
+  <div class="dlg-head"><div class="names"><h3 class="name" id="loginTitle">Log in</h3></div></div>
+  <form id="loginForm" class="dialog-content" method="dialog">
     <div class="desc">This page is protected. Enter the web UI password.</div>
-    <input id="loginPassword" type="password" autocomplete="current-password" required>
+    <input id="loginPassword" type="password" autocomplete="current-password" required autofocus>
     <div class="desc" id="loginError" style="color:var(--warn)"></div>
     <div class="actions"><button class="primary" type="submit">Log in</button></div>
   </form>
 </dialog>
-<dialog id="removeDlg">
-  <h3>Remove device</h3>
+<dialog id="removeDlg" class="dialog-compact" aria-labelledby="removeTitle">
+  <div class="dlg-head"><div class="names"><h3 class="name" id="removeTitle">Remove device</h3></div></div>
+  <div class="dialog-content" tabindex="-1" autofocus>
   <div class="sub" id="removeName"></div>
   <label class="option">
     <input type="radio" name="removeMode" value="normal" checked>
@@ -391,9 +426,10 @@
     <button id="removeCancel">Cancel</button>
     <button id="removeOk" class="danger">Remove</button>
   </div>
+  </div>
 </dialog>
 
-<div id="toast"></div>
+<div id="toast" role="status"></div>
 <script>
 const devices = new Map();
 const cards = new Map();
@@ -409,7 +445,49 @@ const el = (tag, props = {}, ...children) => {
   return node;
 };
 
+const dialogs = [];
+let dialogPageScroll = 0;
+
+function placeToast() {
+  const toastNode = $("#toast");
+  const host = dialogs.findLast(dialog => dialog.open) ?? document.body;
+  if (toastNode.parentElement !== host) host.append(toastNode);
+}
+
+function openDialog(dialog) {
+  if (dialog.open) return;
+  const root = document.documentElement;
+  if (!root.classList.contains("dialog-open")) {
+    dialogPageScroll = window.scrollY;
+    root.style.setProperty("--dialog-page-offset", `${-dialogPageScroll}px`);
+    root.classList.add("dialog-open");
+  }
+  dialog.showModal();
+  const previous = dialogs.indexOf(dialog);
+  if (previous !== -1) dialogs.splice(previous, 1);
+  dialogs.push(dialog);
+  const content = $(".dialog-content", dialog);
+  if (content) content.scrollTop = 0;
+  placeToast();
+}
+
+for (const dialog of document.querySelectorAll("dialog")) {
+  dialog.addEventListener("close", () => {
+    if (dialog.open) return;
+    const index = dialogs.lastIndexOf(dialog);
+    if (index !== -1) dialogs.splice(index, 1);
+    placeToast();
+    const root = document.documentElement;
+    if (!dialogs.some(item => item.open) && root.classList.contains("dialog-open")) {
+      root.classList.remove("dialog-open");
+      root.style.removeProperty("--dialog-page-offset");
+      window.scrollTo({ top: dialogPageScroll, behavior: "instant" });
+    }
+  });
+}
+
 function toast(text) {
+  placeToast();
   const t = $("#toast");
   t.textContent = text;
   t.classList.add("show");
@@ -434,10 +512,10 @@ async function api(path, body, method = "POST") {
 
 // Zigbee2MQTT's frontend.auth_token: one password, kept by the browser in a cookie
 function showLogin() {
-  $("#deviceList").hidden = true;
   $("#mapHealth").hidden = true;
   const dlg = $("#loginDlg");
-  if (!dlg.open) dlg.showModal();
+  document.documentElement.classList.add("auth-required");
+  openDialog(dlg);
   $("#loginPassword").focus();
 }
 
@@ -531,6 +609,37 @@ function setValue(ieee, key, value) {
 
 const focused = (...nodes) => nodes.includes(document.activeElement);
 
+// Keep the user's choice visible while a power command and its state update cross.
+function powerSwitch(send) {
+  const input = el("input", { type: "checkbox", ariaLabel: "Power" });
+  const node = el("label", { className: "switch" }, input, el("span"));
+  let reported = false, requested = null, timer;
+  const settle = () => {
+    requested = null;
+    input.checked = reported;
+  };
+  input.onchange = () => {
+    clearTimeout(timer);
+    requested = input.checked;
+    input.disabled = true;
+    run(send(requested).then(result => {
+      if (result?.pending) settle();
+      else timer = setTimeout(settle, reported === requested ? 250 : 1200);
+    }, error => {
+      settle();
+      throw error;
+    }).finally(() => { input.disabled = false; }));
+  };
+  return {
+    node,
+    update(on) {
+      if (on == null) return;
+      reported = Boolean(on);
+      input.checked = requested ?? reported;
+    },
+  };
+}
+
 // ---- Controls: each returns {node, update(d)} ----
 
 function valueTile(key) {
@@ -586,6 +695,10 @@ function control(ieee, f) {
   if (f.access !== "read_write" && !(f.access === "write" && f.kind.type === "numeric")) {
     const out = el("span", { className: "ro" });
     return { node: row(out), update(d) { setTitle(d); out.textContent = formatValue(f, d.state[f.key], d); } };
+  }
+  if (f.kind.type === "binary" && f.key === "on") {
+    const power = powerSwitch(value => setValue(ieee, "on", value));
+    return { node: row(power.node), update(d) { setTitle(d); power.update(d.state.on); } };
   }
   if (f.kind.type === "binary") {
     const input = el("input", { type: "checkbox" });
@@ -819,10 +932,9 @@ function buildCard(d) {
   card.append(top);
 
   if (["light", "outlet", "generic"].includes(d.card) && writable(feature(d, "on"))) {
-    const toggle = el("input", { type: "checkbox" });
-    toggle.onchange = () => run(setValue(ieee, "on", toggle.checked).catch(e => { toggle.checked = !toggle.checked; throw e; }));
-    top.append(el("label", { className: "switch" }, toggle, el("span")));
-    updaters.push(d => { if (!focused(toggle)) toggle.checked = !!d.state.on; });
+    const power = powerSwitch(value => setValue(ieee, "on", value));
+    top.append(power.node);
+    updaters.push(d => power.update(d.state.on));
   }
   if (d.card === "light") {
     const c = lightControls(ieee); card.append(c.node); updaters.push(c.update);
@@ -910,12 +1022,19 @@ function openDetail(ieee) {
   detail.ieee = ieee;
   detail.signature = null;
   renderDetail();
-  $("#detail").showModal();
+  openDialog($("#detail"));
 }
 
-$("#dlgClose").onclick = () => $("#detail").close();
 $("#detail").addEventListener("close", () => { detail.ieee = null; });
-$("#detail").addEventListener("click", (e) => { if (e.target === $("#detail")) $("#detail").close(); });
+function closeOnBackdrop(dialog) {
+  dialog.addEventListener("click", e => {
+    if (e.target !== dialog) return;
+    const bounds = dialog.getBoundingClientRect();
+    if (e.clientX < bounds.left || e.clientX >= bounds.right ||
+        e.clientY < bounds.top || e.clientY >= bounds.bottom) dialog.close();
+  });
+}
+closeOnBackdrop($("#detail"));
 
 const TABS = [["about", "About"], ["exposes", "Exposes"], ["bind", "Bind"], ["reporting", "Reporting"], ["scenes", "Scenes"], ["settings", "Settings"], ["state", "State"], ["clusters", "Clusters"]];
 
@@ -971,7 +1090,7 @@ function openRemove(ieee) {
       })
       .finally(() => { ok.disabled = false; ok.textContent = "Remove"; }));
   };
-  $("#removeDlg").showModal();
+  openDialog($("#removeDlg"));
 }
 
 $("#removeCancel").onclick = () => $("#removeDlg").close();
@@ -1301,6 +1420,43 @@ function reportingTab(d) {
 // Zigbee2MQTT's device-specific settings: how the hub drives the device
 function settingsTab(d) {
   const node = el("div");
+  if (d.model === "SNZB-02P" || d.model === "SNZB-02D") {
+    const fields = [
+      ["temperature_precision", "Temperature precision", "Sets the number of decimal places in reported temperature (°C). Applies from the next report."],
+      ["humidity_precision", "Humidity precision", "Sets the number of decimal places in reported relative humidity (%). Applies from the next report."],
+    ].map(([key, label, description]) => ({
+      key, label, description, input: el("input", { type: "number", min: 0, max: 3, step: 1, placeholder: "2" }),
+    }));
+    const save = el("button", { type: "submit", textContent: "Save", className: "primary" });
+    const form = el("form", {},
+      ...fields.map(({ input, label, description }) => el("label", { className: "ctl" },
+        el("span", { className: "label", textContent: label }), input,
+        el("span", { className: "desc", textContent: description }))),
+      el("p", { className: "desc", textContent: "The sensor provides up to two decimal places. Leave a field blank to use the default." }),
+      el("div", { className: "actions" }, save));
+    form.onsubmit = event => {
+      event.preventDefault();
+      const options = Object.fromEntries(fields.map(({ key, input }) =>
+        [key, input.value === "" ? null : input.valueAsNumber]));
+      save.disabled = true;
+      run(api(`/api/devices/${d.ieee}/options`, options)
+        .then(() => toast("Settings saved"))
+        .finally(() => { save.disabled = false; }));
+    };
+    node.append(form);
+    return {
+      node,
+      update(device) {
+        for (const field of fields) {
+          const value = device.options?.[field.key] ?? "";
+          if (field.value !== value) {
+            field.input.value = value;
+            field.value = value;
+          }
+        }
+      },
+    };
+  }
   const light = d.features.some(f => f.key === "level" || f.key === "color_temp");
   if (!light) {
     node.append(el("p", { className: "desc", textContent: "This device has no hub settings." }));
@@ -1412,6 +1568,7 @@ $("#hueReset").onclick = () => {
 // ---- Scenes ----
 
 const scenePanels = new Set();
+const sceneCache = new Map();
 function scenePanel(target, ep = null) {
   const node = el("div");
   const note = el("p", { className: "desc", textContent: "Scenes are stored on the lights. A group recalls each member’s own settings with one command. Saving does not change the current light output." });
@@ -1422,7 +1579,7 @@ function scenePanel(target, ep = null) {
   groupSelect.append(el("option", { value: "0", textContent: "Device scenes" }), ...deviceGroups.map(g => el("option", { value: String(g.id), textContent: `Group: ${g.name}` })));
   const scope = () => ({ target, ...(ep == null ? {} : { ep, group_id: Number(groupSelect.value) }) });
   const options = () => ep == null ? {} : { ep, group_id: Number(groupSelect.value) };
-  let rows = [], busy = false;
+  let rows = [], busy = false, shownScope = null, loadedScope = null, requestNumber = 0;
   const tracked = [];
   const button = (text, fn, className = "") => {
     const b = el("button", { textContent: text, type: "button", className, disabled: busy });
@@ -1430,34 +1587,91 @@ function scenePanel(target, ep = null) {
   };
   async function execute(fn) {
     if (busy) return;
-    busy = true; groupSelect.disabled = true; tracked.forEach(b => b.disabled = true); status.textContent = "Working…";
+    busy = true;
+    groupSelect.disabled = true;
+    updateButtons();
+    status.textContent = "Working…";
     try { await fn(); status.textContent = "Done"; }
     catch (e) { status.textContent = e.message; throw e; }
-    finally { busy = false; groupSelect.disabled = false; tracked.forEach(b => b.disabled = false); await refresh().catch(() => {}); }
+    finally {
+      try { await refresh(); }
+      catch (e) { status.textContent = e.message; }
+      finally { busy = false; groupSelect.disabled = false; updateButtons(); }
+    }
   }
-  async function send(command, value) { return api("/api/scenes", { target, command, value: { ...value, ...options() } }); }
-  async function refresh() {
-    const q = new URLSearchParams(scope());
-    rows = (await api(`/api/scenes?${q}`, null, "GET")).scenes;
-    for (let i=tracked.length-1;i>=0;i--) if (list.contains(tracked[i])) tracked.splice(i,1);
+  function invalidateScope() {
+    sceneCache.delete(new URLSearchParams(scope()).toString());
+    loadedScope = null;
+    ++requestNumber;
+  }
+  async function send(command, value) {
+    invalidateScope();
+    return api("/api/scenes", { target, command, value: { ...value, ...options() } });
+  }
+  function updateButtons() {
+    tracked.forEach(b => b.disabled = busy || b.dataset.incomplete === "true" ||
+      (list.contains(b) && shownScope !== loadedScope));
+  }
+  function renderRows(nextRows) {
+    rows = nextRows ?? [];
+    for (let i = tracked.length - 1; i >= 0; i--) if (list.contains(tracked[i])) tracked.splice(i, 1);
+    if (!nextRows) {
+      list.replaceChildren();
+      return;
+    }
     list.replaceChildren(...(rows.length ? rows.map(s => {
       const name = el("div", { className: "scene-name" }, el("div", { textContent: `${s.id} · ${s.name}` }),
         el("div", { className: "desc", textContent: `${s.installed}/${s.members} devices${s.complete ? "" : " · incomplete"} · ${s.entries.map(e => e.transition).filter((v,i,a) => a.indexOf(v) === i).join(" / ")} s transition` }));
       const recall = button("Recall", () => send("scene_recall", { ID: s.id }).then(() => toast("Scene sent")));
-      recall.disabled = busy || !s.complete;
+      recall.dataset.incomplete = String(!s.complete);
       const rename = button("Rename", async () => { const name = prompt("Scene name", s.name); if (name?.trim()) await send("scene_rename", { ID: s.id, name }); });
       const remove = button("Delete", async () => { if (confirm(`Delete scene “${s.name}” from this device/group?`)) await send("scene_remove", { ID: s.id }); }, "danger");
       return el("div", { className: "scene-row" }, name, recall, rename, remove);
     }) : [el("p", { className: "desc", textContent: "No known scenes. Read from devices to discover existing scenes, or save a new one." })]));
   }
-  const read = button("Read from devices", async () => { await api("/api/scenes/refresh", scope()); });
+  async function refresh() {
+    const request = ++requestNumber;
+    const q = new URLSearchParams(scope()).toString();
+    const cached = sceneCache.get(q)?.rows;
+    const entry = { rows: cached };
+    sceneCache.delete(q);
+    sceneCache.set(q, entry);
+    if (sceneCache.size > 128) sceneCache.delete(sceneCache.keys().next().value);
+    if (shownScope !== q) {
+      shownScope = q;
+      loadedScope = null;
+      renderRows(cached);
+      if (!busy) status.textContent = cached ? "" : "Loading scenes…";
+      updateButtons();
+    }
+    let result;
+    try { result = await api(`/api/scenes?${q}`, null, "GET"); }
+    catch (e) {
+      if (request !== requestNumber) return;
+      status.textContent = e.message;
+      throw e;
+    }
+    if (request !== requestNumber) return;
+    if (!busy && loadedScope === null) status.textContent = "";
+    loadedScope = q;
+    if (sceneCache.get(q) === entry) entry.rows = result.scenes;
+    if (JSON.stringify(rows) !== JSON.stringify(result.scenes) || !list.childElementCount) renderRows(result.scenes);
+    updateButtons();
+  }
+  const read = button("Read from devices", async () => {
+    invalidateScope();
+    await api("/api/scenes/refresh", scope());
+  });
   const removeAll = button("Delete all", async () => {
     if (confirm("Delete every scene in the selected device/group scope?")) await send("scene_remove_all", {});
   }, "danger");
   const id = el("input", { type: "number", min: 0, max: 255, step: 1, value: "1", required: true });
   const name = el("input", { type: "text", placeholder: "e.g. Normal", maxLength: 64 });
   const entry = () => { if (!id.reportValidity()) throw new Error("Choose a scene ID from 0 to 255"); return { ID: Number(id.value), ...(name.value.trim() ? { name: name.value.trim() } : {}) }; };
-  const overwrite = v => !rows.some(s => s.id === v.ID) || confirm(`Replace scene ${v.ID}?`);
+  const overwrite = v => {
+    if (loadedScope !== new URLSearchParams(scope()).toString()) throw new Error("Wait for the selected scenes to load");
+    return !rows.some(s => s.id === v.ID) || confirm(`Replace scene ${v.ID}?`);
+  };
   const label = (text, input) => el("label", {}, el("div", { className: "label", textContent: text }), input);
   const store = button("Store current state", async () => { const v = entry(); if (overwrite(v)) await send("scene_store", v); });
   const state = el("select", {}, el("option", { value: "", textContent: "Unchanged" }), el("option", { value: "ON", textContent: "On" }), el("option", { value: "OFF", textContent: "Off" }));
@@ -1495,11 +1709,13 @@ function scenesTab(d) {
   const show = () => content.replaceChildren(scenePanel(d.ieee, Number(select.value)).node);
   select.onchange = show; node.append(select, content); show(); return { node, update() {} };
 }
-$("#scenesClose").onclick = () => $("#scenesDlg").close();
+const scenesDialog = $("#scenesDlg");
+closeOnBackdrop(scenesDialog);
 function openGroupScenes(g) {
+  if (scenesDialog.open) return;
   $("#scenesTitle").textContent = `${g.name} · Scenes`;
   $("#scenesPanel").replaceChildren(scenePanel(`group:${g.id}`).node);
-  $("#scenesDlg").showModal();
+  openDialog(scenesDialog);
 }
 
 // ---- Groups ----
@@ -1545,10 +1761,8 @@ function buildGroupCard(g) {
   const card = el("div", { className: "card" });
   const name = el("div", { className: "name" });
   const sub = el("div", { className: "sub" });
-  const toggle = el("input", { type: "checkbox" });
-  const switchNode = el("label", { className: "switch" }, toggle, el("span"));
-  toggle.onchange = () => run(setGroup(id, "on", toggle.checked).catch(e => { toggle.checked = !toggle.checked; throw e; }));
-  card.append(el("div", { className: "top" }, el("div", { className: "names" }, name, sub), switchNode));
+  const power = powerSwitch(value => setGroup(id, "on", value));
+  card.append(el("div", { className: "top" }, el("div", { className: "names" }, name, sub), power.node));
 
   const level = el("input", { type: "range", min: 1, max: 254 });
   const levelText = el("span");
@@ -1564,7 +1778,14 @@ function buildGroupCard(g) {
 
   const sceneButton = el("button", { textContent: "Scenes" });
   sceneButton.onclick = () => openGroupScenes(current);
-  card.append(el("div", { className: "actions" }, sceneButton));
+  const identifyButton = el("button", { textContent: "Identify", hidden: true,
+    title: "Identify the group's supported devices for 3 seconds" });
+  identifyButton.onclick = () => {
+    identifyButton.disabled = true;
+    run(setGroup(id, "identify", "identify").then(() => toast("Identify command sent"))
+      .finally(() => { identifyButton.disabled = false; }));
+  };
+  card.append(el("div", { className: "actions" }, sceneButton, identifyButton));
 
   // Members and management
   const memberList = el("div");
@@ -1606,15 +1827,16 @@ function buildGroupCard(g) {
     card,
     update(g) {
       current = g;
+      identifyButton.hidden = !g.members.some(m => devices.get(m.ieee)?.features.some(f => f.key === "identify"));
       sceneButton.hidden = !g.members.length || !g.members.every(m => devices.get(m.ieee)?.endpoints.some(ep => ep.id === m.ep && ep.in_clusters.includes(5)));
       const v = groupView(g);
       name.textContent = g.name;
       sub.textContent = `${g.members.length} member${g.members.length === 1 ? "" : "s"}`;
       summary.textContent = `Members (${g.members.length})`;
-      switchNode.hidden = v.on == null;
+      power.node.hidden = v.on == null;
       matterRow.hidden = !hubSettings.matter?.enabled;
       matter.checked = !!g.matter;
-      if (v.on != null && !focused(toggle)) toggle.checked = v.on;
+      power.update(v.on);
       levelRow.hidden = v.level == null;
       if (v.level != null) {
         Object.assign(level, { min: v.levelRange[0], max: v.levelRange[1] });
@@ -1880,6 +2102,7 @@ async function loadNetworkHealth() {
     ["Offline devices", `${health.offline_devices} / ${health.total_devices}`],
   ]);
   $("#mapHealth").hidden = $("#loginDlg").open;
+  setPageStatus("map", "ready");
 }
 
 // ---- Settings page ----
@@ -1888,9 +2111,41 @@ let page = "devices";
 
 const PAGES = { devices: "Devices", groups: "Groups", map: "Network map", settings: "Settings", logs: "Logs" };
 
+const pageStatus = new Map();
+
+function renderPageStatus() {
+  const status = pageStatus.get(page);
+  const ready = status === "ready";
+  $(".content").toggleAttribute("data-page-ready", ready);
+  $("#pageStatus").hidden = status !== "error";
+}
+
+function setPageStatus(key, status) {
+  if (pageStatus.get(key) === "ready") return;
+  pageStatus.set(key, status);
+  if (page === key) renderPageStatus();
+}
+
+function loadPage(key, fetchPage) {
+  setPageStatus(key, "loading");
+  return fetchPage().catch(error => {
+    setPageStatus(key, "error");
+    if (key !== "logs" && page === key && pageStatus.get(key) === "ready") toast(error.message);
+  });
+}
+
+$("#pageRetry").onclick = () => {
+  if (page === "devices" || page === "groups") {
+    setPageStatus(page, "loading");
+    run(load());
+  } else {
+    showPage();
+  }
+};
+
 function showPage() {
   const wanted = location.hash.slice(1);
-  page = PAGES[wanted] ? wanted : "devices";
+  page = Object.hasOwn(PAGES, wanted) ? wanted : "devices";
   $("#pageDevices").hidden = page !== "devices";
   $("#pageSettings").hidden = page !== "settings";
   $("#pageLogs").hidden = page !== "logs";
@@ -1899,8 +2154,9 @@ function showPage() {
   $("#pageTitle").textContent = PAGES[page];
   for (const a of document.querySelectorAll("#menu a")) a.classList.toggle("active", a.dataset.page === page);
   document.body.classList.remove("menu-open");
-  if (page === "map") run(loadNetworkHealth());
-  if (page === "settings" || page === "logs") run(loadSettings());
+  renderPageStatus();
+  if (page === "map") loadPage("map", loadNetworkHealth);
+  if (page === "settings" || page === "logs") loadPage("settings", loadSettings);
   pollLogs();
 }
 
@@ -2017,6 +2273,7 @@ async function loadSettings() {
   const options = LOG_LEVELS.some(([v]) => v === info.log_level) ? LOG_LEVELS : [[info.log_level, info.log_level], ...LOG_LEVELS];
   select.replaceChildren(...options.map(([v, t]) => el("option", { value: v, textContent: t })));
   select.value = info.log_level;
+  setPageStatus("settings", "ready");
   render();
 }
 
@@ -2109,6 +2366,75 @@ $("#mqttCleanup").onclick = () => {
     : "Nothing to clean up")).finally(() => { button.disabled = false; }));
 };
 
+// Download a fresh archive and inspect a selected ZIP before offering restore.
+const backupDownload = $("#backupDownload");
+const backupFile = $("#backupFile");
+const backupStatus = $("#backupStatus");
+const backupRestore = $("#backupRestore");
+let inspectedBackup = null;
+
+async function backupRequest(path, file) {
+  const response = await fetch(path, file ? {
+    method: "POST", headers: { "Content-Type": "application/zip" }, body: file,
+  } : {});
+  if (!response.ok) {
+    const data = await response.json().catch(() => ({}));
+    if (response.status === 401 && data.auth) showLogin();
+    throw new Error(data.error || response.statusText);
+  }
+  return response;
+}
+
+backupDownload.onclick = () => {
+  backupDownload.disabled = true;
+  run(backupRequest("/api/backup").then(async response => {
+    const url = URL.createObjectURL(await response.blob());
+    const date = new Date().toISOString().slice(0, 10);
+    const link = el("a", { href: url, download: `zhub-backup-${date}.zip` });
+    document.body.append(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }).finally(() => { backupDownload.disabled = false; }));
+};
+
+backupFile.onchange = async () => {
+  const file = backupFile.files[0];
+  inspectedBackup = null;
+  backupRestore.hidden = true;
+  backupStatus.hidden = !file;
+  if (!file) return;
+  backupStatus.textContent = "Checking backup…";
+  try {
+    const summary = await (await backupRequest("/api/backup/inspect", file)).json();
+    if (backupFile.files[0] !== file) return;
+    inspectedBackup = file;
+    const date = new Date(summary.created_at * 1000).toLocaleString();
+    const contents = `${summary.devices} devices, ${summary.groups} groups, ${summary.scenes} scenes`;
+    backupStatus.textContent = `${date} · ${contents} · ${summary.includes_matter ? "Matter records included" : "Zigbee only"}`;
+    backupRestore.hidden = false;
+  } catch (error) {
+    if (backupFile.files[0] === file) backupStatus.textContent = error.message;
+  }
+};
+
+backupRestore.onclick = async () => {
+  if (!inspectedBackup || inspectedBackup !== backupFile.files[0]) return;
+  if (!confirm("Restore the selected backup and restart zhub? The hub will save a copy of its current state first.")) return;
+  backupRestore.disabled = backupFile.disabled = true;
+  try {
+    await backupRequest("/api/backup/restore", inspectedBackup);
+    backupStatus.textContent = "Restore scheduled. Wait for zhub to restart.";
+    backupRestore.hidden = true;
+    backupFile.value = "";
+    inspectedBackup = null;
+  } catch (error) {
+    backupStatus.textContent = error.message;
+  } finally {
+    backupRestore.disabled = backupFile.disabled = false;
+  }
+};
+
 $("#restart").onclick = () => {
   if (confirm("Restart the hub?")) run(api("/api/hub/restart").then(() => toast("Restarting; the page reconnects in about 10 s.")));
 };
@@ -2119,6 +2445,7 @@ const LOG_KEEP = 500;
 
 async function fetchLogs() {
   const { lines } = await api(`/api/logs?after=${logAfter}`, null, "GET");
+  setPageStatus("logs", "ready");
   if (!lines.length) return;
   const box = $("#log");
   const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 30;
@@ -2140,11 +2467,20 @@ function pollLogs() {
   if (page !== "logs") return;
   const next = () => { logTimer = setTimeout(pollLogs, 2000); };
   if ($("#logPause").checked) { next(); return; }
-  fetchLogs().then(() => { $("#logNote").textContent = ""; }, () => { $("#logNote").textContent = "not reachable"; }).finally(next);
+  loadPage("logs", async () => {
+    try { await fetchLogs(); $("#logNote").textContent = ""; }
+    catch (error) { $("#logNote").textContent = "Not reachable"; throw error; }
+  }).finally(next);
 }
 
 async function load() {
-  const state = await api("/api/state", null, "GET");
+  let state;
+  try { state = await api("/api/state", null, "GET"); }
+  catch (error) {
+    setPageStatus("devices", "error");
+    setPageStatus("groups", "error");
+    throw error;
+  }
   devices.clear();
   for (const d of state.devices) devices.set(d.ieee, d);
   for (const ieee of [...cards.keys()]) if (!devices.has(ieee)) cards.delete(ieee);
@@ -2152,24 +2488,45 @@ async function load() {
   if (state.settings) hubSettings = state.settings;
   groups = state.groups || [];
   render();
-  $("#deviceList").hidden = $("#loginDlg").open;
+  setPageStatus("devices", "ready");
+  setPageStatus("groups", "ready");
   if (page === "settings" || page === "logs") run(loadSettings());
   renderPermit();
 }
 
 function connect() {
   const source = new EventSource("/api/events");
+  // Status events may arrive before the initial device list. Establish the
+  // baseline first, so an existing device is not announced as a new join.
+  let pendingEvents = [];
   source.onopen = () => {
+    const pending = pendingEvents = [];
     $("#conn").textContent = "connected";
     $("#conn").classList.remove("off");
-    run(load());
+    load().then(() => {
+      if (pendingEvents !== pending) return;
+      pendingEvents = null;
+      for (const event of pending) handleEvent(event);
+    }).catch(e => {
+      if (pendingEvents !== pending) return;
+      toast(e.message);
+      source.close();
+      source.onerror();
+      setTimeout(connect, 2000);
+    });
   };
   source.onerror = () => {
+    pendingEvents = [];
     $("#conn").textContent = "disconnected, retrying…";
     $("#conn").classList.add("off");
   };
   source.onmessage = (msg) => {
     const event = JSON.parse(msg.data);
+    if (pendingEvents) pendingEvents.push(event);
+    else handleEvent(event);
+  };
+
+  function handleEvent(event) {
     if (event.type === "device") {
       const d = event.device, before = devices.get(d.ieee);
       if (!before) toast(`New device joined: ${d.name}`);
@@ -2193,7 +2550,7 @@ function connect() {
     } else if (event.type === "settings") {
       run(load());
     }
-  };
+  }
 }
 
 setInterval(() => {

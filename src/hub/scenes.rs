@@ -22,10 +22,14 @@ impl Target {
 impl Hub {
     fn scene_target(&self, name: &str, ep: Option<u8>, group_id: Option<u16>) -> Result<Target> {
         let data = self.data.lock().unwrap();
-        let device = data
-            .devices
-            .values()
-            .find(|d| d.ieee == name || crate::mqtt::topic_name(&d.name) == name);
+        let explicit_group = name.strip_prefix("group:").and_then(|id| id.parse::<u16>().ok());
+        let device = if explicit_group.is_some() {
+            None
+        } else {
+            data.devices.get(name).or_else(|| {
+                data.devices.values().find(|d| crate::mqtt::topic_name(&d.name) == name)
+            })
+        };
         if let Some(d) = device {
             let endpoint = d
                 .endpoints
@@ -55,7 +59,10 @@ impl Hub {
         let g = data
             .groups
             .iter()
-            .find(|g| crate::mqtt::topic_name(&g.name) == name || format!("group:{}", g.id) == name)
+            .find(|g| match explicit_group {
+                Some(id) => g.id == id,
+                None => crate::mqtt::topic_name(&g.name) == name,
+            })
             .context("no such device or group")?;
         ensure_scene(ep.is_none(), "choose an endpoint only for a device")?;
         ensure_scene(

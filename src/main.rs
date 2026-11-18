@@ -1,6 +1,8 @@
+mod backup;
+mod devices;
+mod firmware;
 mod hub;
 mod hue_reset;
-mod devices;
 mod logging;
 #[cfg(feature = "matter")]
 mod matter;
@@ -9,8 +11,8 @@ mod networkmap;
 mod radio;
 mod scenes;
 mod sniff;
-mod thermostat;
 mod store;
+mod thermostat;
 mod tuya;
 mod web;
 mod z2m_light;
@@ -36,8 +38,7 @@ struct Args {
     #[arg(long, default_value_t = 921_600)]
     baudrate: u32,
 
-    /// Serial flow control; it must match the RCP firmware build (`sw_flow` builds
-    /// signal with XON/XOFF)
+    /// Serial flow control must match the RCP build (software for sw_flow, hardware for hw_flow)
     #[arg(long, value_enum, default_value_t = radio::Flow::None)]
     flow_control: radio::Flow,
 
@@ -86,20 +87,73 @@ fn main() -> Result<()> {
 }
 
 async fn run(args: Args, logging: std::sync::Arc<logging::Logging>) -> Result<()> {
-    let hub = hub::Hub::start(hub::Options {
-        device: args.device,
+    backup::apply_pending(&args.state).context("cannot complete backup restore")?;
+    let mut saved = store::Persisted::load(&args.state)?;
+    if args.reset_ui_password && saved.settings.ui_auth.take().is_some() {
+        saved.save(&args.state)?;
+    }
+    let cli_serial = radio::SerialSettings {
         baudrate: args.baudrate,
         flow_control: args.flow_control,
-        state_path: args.state,
-        channel: args.channel,
-        tx_power: args.tx_power,
-        sniff: args.sniff,
-        logging,
-    })
+    };
+    let mut serial = saved
+        .radio_serial
+        .as_ref()
+        .filter(|saved| saved.device == args.device && saved.original_cli == cli_serial)
+        .map_or(cli_serial, |saved| saved.installed);
+    let mut terminate = signal(SignalKind::terminate())?;
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    let bind = || async {
+        tokio::net::TcpListener::bind(&args.listen)
+            .await
+            .with_context(|| format!("cannot listen on {}", args.listen))
+    };
+
+    let radio = match radio::open(&args.device, serial, args.sniff).await {
+        Ok(radio) => radio,
+        Err(error) => {
+            tracing::warn!("Radio setup required: {error:#}");
+            let (setup, receive) = firmware::Setup::new(
+                args.device.clone(),
+                format!("{error:#}"),
+                saved.settings.ui_auth.clone(),
+            );
+            let listener = bind().await?;
+            info!("Dongle firmware setup: http://{}", args.listen);
+            let server = axum::serve(listener, web::firmware_router(setup.clone()));
+            let (radio, connected_serial, uploaded) = tokio::select! {
+                result = server => return result.map_err(Into::into),
+                connected = setup.wait_for_radio(receive, serial, args.sniff) => connected,
+                _ = terminate.recv() => return Ok(()),
+                _ = interrupt.recv() => return Ok(()),
+            };
+            serial = connected_serial;
+            if uploaded {
+                saved.radio_serial = Some(radio::InstalledFirmwareSerial {
+                    device: args.device.clone(),
+                    original_cli: cli_serial,
+                    installed: serial,
+                });
+            }
+            radio
+        }
+    };
+
+    let hub = hub::Hub::start(
+        hub::Options {
+            device: args.device,
+            baudrate: serial.baudrate,
+            flow_control: serial.flow_control,
+            state_path: args.state,
+            channel: args.channel,
+            tx_power: args.tx_power,
+            sniff: args.sniff,
+            logging,
+        },
+        saved,
+        radio,
+    )
     .await?;
-    if args.reset_ui_password {
-        hub.set_ui_password(None)?;
-    }
 
     tokio::spawn(mqtt::run(hub.clone()));
     #[cfg(feature = "matter")]
@@ -107,13 +161,9 @@ async fn run(args: Args, logging: std::sync::Arc<logging::Logging>) -> Result<()
         matter::start(hub.clone(), hub.data_dir().join("matter"), commands);
     }
 
-    let listener = tokio::net::TcpListener::bind(&args.listen)
-        .await
-        .with_context(|| format!("cannot listen on {}", args.listen))?;
+    let listener = bind().await?;
     info!("Web UI: http://{}", args.listen);
 
-    let mut terminate = signal(SignalKind::terminate())?;
-    let mut interrupt = signal(SignalKind::interrupt())?;
     let server = axum::serve(listener, web::router(hub.clone()));
 
     tokio::select! {

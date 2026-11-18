@@ -72,7 +72,7 @@ pub async fn run(hub: Arc<Hub>) {
 
 /// MQTT topic levels cannot hold wildcards
 pub fn topic_name(name: &str) -> String {
-    name.replace(['+', '#'], "_")
+    name.replace(['+', '#', '/'], "_")
 }
 
 struct Bridge {
@@ -352,7 +352,7 @@ impl Bridge {
                     warn!("MQTT permit_join: {e:#}");
                 }
             }
-            "restart" => self.hub.request_restart(),
+            "restart" => self.hub.request_restart("MQTT"),
             "networkmap" => {
                 // "raw", or {"type": "raw", "routes": true, "transaction": …}
                 let text = String::from_utf8_lossy(payload).trim().trim_matches('"').to_owned();
@@ -1238,15 +1238,53 @@ fn light_target(views: &[&DeviceView]) -> Option<z2m_light::Target> {
 
 /// A command from MQTT: the device or group by name (or IEEE address). Light keys run as
 /// Zigbee2MQTT's light converters do, the other keys set the hub's features.
-pub async fn apply(hub: &Arc<Hub>, name: &str, mut command: Map<String, Json>) -> anyhow::Result<()> {
-    let scene_keys:Vec<_>=command.keys().filter(|k|crate::scenes::KEYS.contains(&k.as_str())).collect();
-    if !scene_keys.is_empty() {
-        anyhow::ensure!(command.len()==1, "send one scene operation per MQTT message, without other light commands");
-        return hub.scene_apply(name,scene_keys[0],&command[scene_keys[0]]).await;
+pub async fn apply(hub: &Arc<Hub>, name: &str, command: Map<String, Json>) -> anyhow::Result<()> {
+    apply_to(hub, ControlTarget::Topic(name), command).await
+}
+
+pub enum ControlTarget<'a> {
+    Topic(&'a str),
+    Device(&'a str),
+    Group(u16),
+}
+
+impl ControlTarget<'_> {
+    fn resolve<'a>(&self, hub: &Hub, devices: &'a [DeviceView]) -> anyhow::Result<(Option<&'a DeviceView>, Option<Group>)> {
+        match self {
+            Self::Device(ieee) => Ok((Some(devices.iter().find(|d| d.device.ieee == *ieee).context("device not found")?), None)),
+            Self::Group(id) => Ok((None, Some(hub.groups().into_iter().find(|g| g.id == *id).context("group not found")?))),
+            Self::Topic(name) => {
+                let mut matching_devices = devices.iter().filter(|d| topic_name(&d.device.name) == *name || d.device.ieee == *name);
+                let mut matching_groups = hub.groups().into_iter().filter(|g| topic_name(&g.name) == *name);
+                let device = matching_devices.next();
+                let group = matching_groups.next();
+                anyhow::ensure!(
+                    !(device.is_some() && group.is_some()) && matching_devices.next().is_none() && matching_groups.next().is_none(),
+                    "ambiguous MQTT target {name}; rename the device or group"
+                );
+                Ok((device, group))
+            }
+        }
     }
+}
+
+pub async fn apply_to(hub: &Arc<Hub>, destination: ControlTarget<'_>, mut command: Map<String, Json>) -> anyhow::Result<()> {
+    let name = match destination {
+        ControlTarget::Topic(name) | ControlTarget::Device(name) => name.to_owned(),
+        ControlTarget::Group(id) => format!("group:{id}"),
+    };
     let devices = hub.devices();
-    let target = devices.iter().find(|d| topic_name(&d.device.name) == name || d.device.ieee == name);
-    let group = hub.groups().into_iter().find(|g| topic_name(&g.name) == name);
+    let (target, group) = destination.resolve(hub, &devices)?;
+    let scene_keys: Vec<_> = command.keys().filter(|k| crate::scenes::KEYS.contains(&k.as_str())).collect();
+    if !scene_keys.is_empty() {
+        anyhow::ensure!(command.len() == 1, "send one scene operation per MQTT message, without other light commands");
+        let scene_target = match (&target, &group) {
+            (Some(device), _) => device.device.ieee.clone(),
+            (_, Some(group)) => format!("group:{}", group.id),
+            _ => anyhow::bail!("no device or group named {name}"),
+        };
+        return hub.scene_apply(&scene_target, scene_keys[0], &command[scene_keys[0]]).await;
+    }
     let (key, members): (String, Vec<&DeviceView>) = match (&target, &group) {
         (Some(d), _) => (d.device.ieee.clone(), vec![*d]),
         (None, Some(g)) => (
@@ -1410,8 +1448,7 @@ fn translate_rest(command: Map<String, Json>) -> Vec<(String, anyhow::Result<Jso
 /// `<name>/get`: reads what the keys stand for, then publishes the state
 async fn get(hub: &Arc<Hub>, name: &str, keys: Vec<String>) -> anyhow::Result<()> {
     let devices = hub.devices();
-    let target = devices.iter().find(|d| topic_name(&d.device.name) == name || d.device.ieee == name);
-    let group = hub.groups().into_iter().find(|g| topic_name(&g.name) == name);
+    let (target, group) = ControlTarget::Topic(name).resolve(hub, &devices)?;
     let reader = match (&target, &group) {
         (Some(d), _) => d.device.ieee.clone(),
         (None, Some(g)) => g.members.first().context("the group has no members")?.ieee.clone(),
@@ -1576,7 +1613,7 @@ mod tests {
 
     #[test]
     fn wildcards_leave_topic_names() {
-        assert_eq!(topic_name("Lamp #1 + 2"), "Lamp _1 _ 2");
+        assert_eq!(topic_name("Lamp #1 + 2/3"), "Lamp _1 _ 2_3");
     }
 
     #[test]
